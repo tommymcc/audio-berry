@@ -12,12 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-const CACHE_VERSION: &str = "2";
+const CACHE_VERSION: &str = "3";
 const MAX_TAKES: u64 = 5;
 /// New takes tried per chunk by `retake`.
 const MAX_RETAKES: u64 = 6;
-/// Audio frames generated per second of speech.
-const TOKENS_PER_SECOND: f32 = 7.5;
 const SPEECH_TARGET_DB: f32 = -21.0;
 const CHUNK_GAP_SECONDS: f32 = 0.35;
 const CHAPTER_GAP_SECONDS: f32 = 1.2;
@@ -32,6 +30,13 @@ fn fnv(bytes: &[u8], seed: u64) -> u64 {
     bytes.iter().fold(seed ^ 0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// Identifies a voice, including its transcript since that changes the speech.
+fn voice_hash(reference: &ReferenceAudio) -> u64 {
+    let mut bytes: Vec<u8> = reference.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    bytes.extend_from_slice(reference.transcript.as_deref().unwrap_or_default().as_bytes());
+    fnv(&bytes, 0)
 }
 
 fn plan(book: &Book, selected: &[usize], voice_hash: u64) -> Vec<Planned> {
@@ -101,19 +106,12 @@ fn render_take(
     out: &Path,
     take: u64,
 ) -> Result<Take, Box<dyn Error>> {
-    let characters = planned.text.chars().count();
     let base_seed = fnv(planned.text.as_bytes(), 1) >> 1;
-    // Stops runaway takes soon after they can no longer pass the length check.
-    let max_seconds = (characters as f32 / 9.0 + 4.0) * 1.25;
-    let max_tokens = (max_seconds * TOKENS_PER_SECOND) as usize;
     let candidate = out.join("chunks").join(format!("{}.take.wav", planned.hash));
     // SAFETY: nothing else reads or writes the environment during this
     // call, as the model is only used from this thread between requests.
-    unsafe { std::env::set_var("VIBEVOICE_SEED", (base_seed + take).to_string()) };
-    let request = SynthesisRequest::new(planned.text.as_str())
-        .with_reference_audio(reference.clone())
-        .with_cfg_scale(crate::CFG_SCALE)
-        .with_max_tokens(max_tokens);
+    unsafe { std::env::set_var("OMNIVOICE_SEED", (base_seed + take).to_string()) };
+    let request = SynthesisRequest::new(planned.text.as_str()).with_reference_audio(reference.clone());
     let audio = model.synthesize(&request)?;
     audio.save_wav(&candidate)?;
     let transcript = transcriber.transcribe(&candidate)?;
@@ -308,8 +306,7 @@ pub fn narrate(
     };
 
     let reference = crate::load_reference(voice)?;
-    let voice_bytes: Vec<u8> = reference.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let planned = plan(&book, &selected, fnv(&voice_bytes, 0));
+    let planned = plan(&book, &selected, voice_hash(&reference));
 
     fs::create_dir_all(out.join("chunks"))?;
     let text_dir = out.join("text");
@@ -328,7 +325,7 @@ pub fn narrate(
     println!("{} chunks, {pending} to generate", planned.len());
     if pending > 0 {
         let model = crate::load_narrator()?;
-        let mut transcriber = Transcriber::start()?;
+        let mut transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
         let started = Instant::now();
         let mut done = 0;
         for item in &planned {
@@ -377,8 +374,7 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
     let book = read_book(epub)?;
     let selected: Vec<usize> = (0..book.chapters.len()).collect();
     let reference = crate::load_reference(voice)?;
-    let voice_bytes: Vec<u8> = reference.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-    let planned = plan(&book, &selected, fnv(&voice_bytes, 0));
+    let planned = plan(&book, &selected, voice_hash(&reference));
 
     // A phrase must be heard in the new take, or it hasn't fixed what was asked.
     let mut wanted: Vec<(usize, Vec<&str>)> = Vec::new();
@@ -404,7 +400,7 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
     wanted.sort_by_key(|(index, _)| *index);
 
     let model = crate::load_narrator()?;
-    let mut transcriber = Transcriber::start()?;
+    let mut transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
     fs::create_dir_all(out.join("replaced"))?;
     for (position, (index, phrases)) in wanted.iter().enumerate() {
         let item = &planned[*index];

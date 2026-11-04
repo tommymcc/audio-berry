@@ -5,18 +5,26 @@ mod quality;
 mod text;
 mod transcribe;
 
+use transcribe::{Transcriber, VOICE_TRANSCRIPTION_MODEL};
+use any_tts::models::omnivoice::trim_long_audio;
 use any_tts::{ModelType, ReferenceAudio, SynthesisRequest, TtsConfig, TtsModel, load_model};
+use any_tts::AudioSamples;
 use std::error::Error;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 const SAMPLE_RATE: u32 = 24_000;
-/// Guidance strength. 2.0 followed the text more closely than 1.3 in testing.
-pub const CFG_SCALE: f64 = 2.0;
+/// OmniVoice recommends 3-10 seconds of reference and warns above 20, so longer
+/// samples are cut to 15 at a pause.
+const MAX_VOICE_SECONDS: f32 = 15.0;
+const MIN_VOICE_SECONDS: f32 = 3.0;
+const TRIM_VOICE_ABOVE_SECONDS: f32 = 20.0;
 
 /// Decodes any audio file ffmpeg understands into mono f32 PCM.
-pub fn load_reference(path: &Path) -> Result<ReferenceAudio, Box<dyn Error>> {
+fn decode_audio(path: &Path) -> Result<Vec<f32>, Box<dyn Error>> {
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(path)
@@ -30,12 +38,51 @@ pub fn load_reference(path: &Path) -> Result<ReferenceAudio, Box<dyn Error>> {
         )
         .into());
     }
-    let samples = output
+    Ok(output
         .stdout
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    Ok(ReferenceAudio::new(samples, SAMPLE_RATE))
+        .collect())
+}
+
+/// Loads a voice sample and what's said in it. The text lives in a `.txt` file
+/// beside the sample, written by transcribing it the first time, and can be
+/// corrected by hand.
+pub fn load_reference(path: &Path) -> Result<ReferenceAudio, Box<dyn Error>> {
+    let samples = trim_long_audio(
+        &decode_audio(path)?,
+        SAMPLE_RATE,
+        MAX_VOICE_SECONDS,
+        MIN_VOICE_SECONDS,
+        TRIM_VOICE_ABOVE_SECONDS,
+    );
+    let reference = ReferenceAudio::new(samples, SAMPLE_RATE);
+    println!("Voice sample: using {:.1}s", reference.duration_secs());
+
+    let transcript_path = path.with_extension("txt");
+    let existing = match fs::read_to_string(&transcript_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let existing = existing.trim();
+    if !existing.is_empty() {
+        return Ok(reference.with_transcript(existing));
+    }
+
+    let clip = transcript_path.with_extension("transcribing.wav");
+    AudioSamples::new(reference.samples.clone(), SAMPLE_RATE).save_wav(&clip)?;
+    let transcript = Transcriber::start(VOICE_TRANSCRIPTION_MODEL)
+        .and_then(|mut transcriber| transcriber.transcribe(&clip));
+    fs::remove_file(&clip)?;
+    let transcript = transcript?;
+    if transcript.is_empty() {
+        return Err(format!("heard no speech in {}", path.display()).into());
+    }
+    fs::write(&transcript_path, format!("{transcript}\n"))?;
+    println!("Heard in the voice sample: {transcript}");
+    println!("Saved to {}. Correct any mistakes there.", transcript_path.display());
+    Ok(reference.with_transcript(transcript))
 }
 
 const USAGE: &str = "usage:
@@ -48,7 +95,7 @@ const USAGE: &str = "usage:
 
 pub fn load_narrator() -> Result<Box<dyn TtsModel>, Box<dyn Error>> {
     let started = Instant::now();
-    let model = load_model(TtsConfig::new(ModelType::VibeVoice).with_preferred_runtime())?;
+    let model = load_model(TtsConfig::new(ModelType::OmniVoice).with_preferred_runtime())?;
     println!("Model loaded in {:.0}s", started.elapsed().as_secs_f32());
     Ok(model)
 }
@@ -89,14 +136,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn speak(voice: &str, text: &str, output: &str) -> Result<(), Box<dyn Error>> {
     let reference = load_reference(Path::new(voice))?;
-    println!("Reference: {:.1}s", reference.duration_secs());
 
     let model = load_narrator()?;
 
     let started = Instant::now();
-    let request = SynthesisRequest::new(text)
-        .with_reference_audio(reference)
-        .with_cfg_scale(CFG_SCALE);
+    let request = SynthesisRequest::new(text).with_reference_audio(reference);
     let audio = model.synthesize(&request)?;
     let elapsed = started.elapsed().as_secs_f32();
 

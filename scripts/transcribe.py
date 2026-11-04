@@ -1,7 +1,7 @@
 """Transcribes WAV files for audio-berry's accuracy checks, entirely locally.
 
 Reads one path per line on stdin and writes one line of text per path on stdout.
-Run with: uv run --no-project --with faster-whisper python scripts/transcribe.py
+Run with: uv run --no-project --with faster-whisper python scripts/transcribe.py <model>
 """
 
 import subprocess
@@ -10,7 +10,7 @@ import sys
 import numpy as np
 from faster_whisper import WhisperModel
 
-model = WhisperModel("base.en", device="cpu", compute_type="int8", cpu_threads=8)
+model = WhisperModel(sys.argv[1], device="cpu", compute_type="int8", cpu_threads=8)
 print("ready", flush=True)
 
 for line in sys.stdin:

@@ -11,6 +11,11 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 const MIN_RECALL: f32 = 0.92;
 const MAX_EXTRA: f32 = 0.12;
 
+/// Fast enough to check every take, at the cost of some misheard words.
+pub const CHECK_MODEL: &str = "base.en";
+/// A voice's transcript is only written once and every take depends on it.
+pub const VOICE_TRANSCRIPTION_MODEL: &str = "medium.en";
+
 const ONES: [&str; 20] = [
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
     "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
@@ -103,10 +108,10 @@ pub struct Transcriber {
 }
 
 impl Transcriber {
-    pub fn start() -> Result<Self, Box<dyn Error>> {
+    pub fn start(model: &str) -> Result<Self, Box<dyn Error>> {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/transcribe.py");
         let mut child = Command::new("uv")
-            .args(["run", "--no-project", "--with", "faster-whisper", "python", script])
+            .args(["run", "--no-project", "--with", "faster-whisper", "python", script, model])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

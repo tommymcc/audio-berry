@@ -1,17 +1,18 @@
 # audio-berry
 
 Narrates text in a cloned voice, entirely on your own machine, and plays the
-result on a Cast speaker. Speech runs on VibeVoice-1.5B through a patched copy
-of [`any-tts`](https://github.com/TM9657/any-tts). The only network access is
-downloading the model once (about 5.4 GB) and talking to speakers on your LAN.
+result on a Cast speaker. Speech runs on OmniVoice through a patched copy of
+[`any-tts`](https://github.com/TM9657/any-tts). The only network access is
+downloading the models once (about 3.3 GB for speech, plus the Whisper models
+for checking) and talking to speakers on your LAN.
 
 ## Requirements
 
 - Rust 1.85+ and `ffmpeg`
-- An NVIDIA GPU with about 8 GB of VRAM, with `nvidia-smi` working. The CUDA
-  build fails without it. Build with `--no-default-features` for CPU only, which
-  needs about 10 GB of RAM and ran at 0.06x realtime when last measured, before
-  the convolution fix.
+- [`uv`](https://docs.astral.sh/uv/) for the local Whisper transcriber
+- An NVIDIA GPU, with `nvidia-smi` working. A 25-second clip peaked at about
+  2.9 GB of VRAM on an 8 GB card. The CUDA build fails without a GPU. Build with
+  `--no-default-features` for CPU only, which hasn't been tested with OmniVoice.
 
 ```sh
 cargo build --release
@@ -25,14 +26,14 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    in the delivery you want for the narration. Aim for a normal level with no
    clipping.
 
-2. **Cut about 30 seconds of it.** This was the length tested for narration. 60
-   seconds also works but peaks at about 7.1 GB of VRAM, against about 6.2 GB
-   for 30 seconds. `voices/` is ignored by git, so recordings stay out of the
-   repo. To take 30 seconds starting 3 minutes in:
+2. **Cut about 10 seconds of it.** OmniVoice recommends 3-10 seconds, and 11.4
+   is what's been tested for narration. Over 20 seconds, the app uses up to the
+   first 15, ending at a pause. `voices/` is ignored by git, so recordings stay
+   out of the repo. To take 10 seconds starting 3 minutes in:
 
    ```sh
    mkdir -p voices
-   ffmpeg -ss 180 -t 30 -i recording.mp3 -ac 1 -ar 24000 voices/me.wav
+   ffmpeg -ss 180 -t 10 -i recording.mp3 -ac 1 -ar 24000 voices/me.wav
    ```
 
 3. **Check the levels.** `max_volume` should be below 0 dB. If it reads 0.0 dB,
@@ -51,11 +52,16 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ./target/release/audio-berry play kitchen output/test.wav
    ```
 
-Takes vary, and some pick up faint music-like background noise. If you hear it,
-render another take with a different seed before blaming the sample:
+OmniVoice also needs the words spoken in the sample. The first run transcribes
+it locally and saves the text beside it, as `voices/me.txt`. Read that file and
+correct any mistakes, since a wrong word no longer matches the audio. You can
+also write the file yourself before the first run.
+
+Takes vary, so if one sounds wrong, render another with a different seed before
+blaming the sample:
 
 ```sh
-VIBEVOICE_SEED=2 ./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav
+OMNIVOICE_SEED=2 ./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav
 ```
 
 ## Commands
@@ -89,8 +95,9 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
 - **Background noise:** the quietest 5% of the take must be below -55 dB.
 - **Length:** the duration must be plausible for the amount of text.
 - **Accuracy:** `scripts/transcribe.py` transcribes the take locally and compares
-  it with the text. This needs [`uv`](https://docs.astral.sh/uv/), which downloads
-  faster-whisper and a small model on first use.
+  it with the text. `uv` downloads faster-whisper and the models on first use.
+  Whisper mishears some correct speech, so treat a flag as a reason to listen,
+  not as proof of a mistake.
 
 If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
@@ -117,11 +124,19 @@ and the text as it was sent to the model in `text/`.
 
 `vendor/any-tts` is `any-tts` 0.2.0 with these changes:
 
+- **OmniVoice voice cloning:** adds reference encoding (HuBERT and DAC encoders
+  with residual quantization), preprocessing and post-processing, and fixes the
+  masking schedule and length estimates to match the Python package. Run at F32,
+  it picks the same tokens as Python given the same inputs and no random position
+  choice. `scripts/omnivoice_parity.py` and the ignored `matches_python_oracle`
+  test repeat that comparison.
+- **F16 by default:** OmniVoice defaults to F16 on CUDA, as BF16's first-step
+  logits were 8 times further from F32. `OMNIVOICE_DTYPE` overrides it.
 - **BF16 on CUDA:** VibeVoice crashed on dtype mismatches, because several
   tensors and scalars stayed F32 while the model was BF16.
 - **Depthwise convolutions:** `layers/conv.rs` runs them in one batch. candle
   makes one convolution call per channel, which made audio feedback take about
   1 s per frame. This took generation from 0.12x to about 1.48x realtime on an
   RTX 3070 Mobile.
-- **`VIBEVOICE_DIFFUSION_STEPS`:** overrides the diffusion step count. The
+- **`VIBEVOICE_DIFFUSION_STEPS`:** overrides VibeVoice's diffusion step count. The
   default of 20 is recommended, as lowering it saved almost no time.

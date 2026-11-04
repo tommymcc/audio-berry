@@ -8,13 +8,13 @@ default = ["cuda"]
 cuda = ["any-tts/cuda"]
 
 [dependencies]
-any-tts = { version = "0.2", default-features = false, features = ["vibevoice", "download"] }
+any-tts = { version = "0.2", default-features = false, features = ["omnivoice", "download"] }
 epub = "2"
 mdns-sd = "0.21"
 rust_cast = "0.21"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 scraper = "0.29.0"
 
-# Local fix: reference audio must be cast to the model dtype on CUDA (BF16).
+# Local changes: native OmniVoice voice cloning, matched against the Python package.
 [patch.crates-io]
 any-tts = { path = "vendor/any-tts" }
