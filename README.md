@@ -62,6 +62,9 @@ VIBEVOICE_SEED=2 ./target/release/audio-berry speak voices/me.wav "Twinkle, twin
 
 ```text
 audio-berry speak <voice-sample> <text> <output.wav>
+audio-berry chapters <book.epub>
+audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers]
+audio-berry retake <voice-sample> <book.epub> <output-dir> <words or chunk number>...
 audio-berry speakers
 audio-berry play <speaker> <file>...
 ```
@@ -69,6 +72,46 @@ audio-berry play <speaker> <file>...
 `play` matches part of a speaker's name, ignoring case, and needs exactly one
 match. It interrupts whatever the speaker is playing. While playing, it serves
 only the requested files to your LAN on a temporary port.
+
+## Narrating a book
+
+```sh
+./target/release/audio-berry chapters book.epub
+./target/release/audio-berry book voices/me.wav book.epub output/book
+```
+
+Chapter numbers come from `chapters`. Add them to `book` to narrate only those.
+The book must be DRM-free, and each spine document becomes one chapter.
+
+The model sometimes adds background noise, skips words, runs on or says fluent
+nonsense, so every take is checked and retried up to 5 times with a new seed:
+
+- **Background noise:** the quietest 5% of the take must be below -55 dB.
+- **Length:** the duration must be plausible for the amount of text.
+- **Accuracy:** `scripts/transcribe.py` transcribes the take locally and compares
+  it with the text. This needs [`uv`](https://docs.astral.sh/uv/), which downloads
+  faster-whisper and a small model on first use.
+
+If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
+its text, transcript and chunk file so you can listen to it. Finished chunks are
+cached in `chunks/`, so rerunning the same command resumes an interrupted book.
+
+To fix a slip you hear, give `retake` words from the book, or a chunk number from
+`report.tsv`, then rerun `book` to rebuild the M4B:
+
+```sh
+./target/release/audio-berry retake voices/me.wav book.epub output/book "took a watch out"
+./target/release/audio-berry book voices/me.wav book.epub output/book
+```
+
+`retake` tries up to 6 new seeds per chunk. It keeps a new take only if it beats
+the current one and, given words, if those words are heard. Replaced audio moves
+to `replaced/`. It also records any chunk with no audio, such as one whose text
+has changed, and it leaves the M4B alone. A short phrase can match several chunks,
+and each one gets new takes.
+
+The output directory holds a chaptered `.m4b`, one WAV per chapter in `chapters/`,
+and the text as it was sent to the model in `text/`.
 
 ## The patched any-tts
 

@@ -1,7 +1,8 @@
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use rust_cast::channels::media::{IdleReason, Media, MediaResponse, PlayerState, StreamType};
+use rust_cast::channels::connection::ConnectionResponse;
 use rust_cast::channels::heartbeat::HeartbeatResponse;
-use rust_cast::channels::receiver::CastDeviceApp;
+use rust_cast::channels::receiver::{CastDeviceApp, ReceiverResponse};
 use rust_cast::{CastDevice, ChannelMessage};
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
@@ -101,10 +102,37 @@ fn wav_duration(path: &Path) -> Option<f32> {
     (content_type(path) == "audio/wav").then(|| bytes as f32 / 48_000.0)
 }
 
+/// Reads `bytes=start-end` into the inclusive range to send, if it's satisfiable.
+fn parse_range(header: &str, size: usize) -> Option<(usize, usize)> {
+    let (start, end) = header.trim().strip_prefix("bytes=")?.split_once('-')?;
+    let last = size.checked_sub(1)?;
+    if start.is_empty() {
+        let suffix = end.parse::<usize>().ok().filter(|&suffix| suffix > 0)?;
+        return Some((size.saturating_sub(suffix), last));
+    }
+    let start = start.parse::<usize>().ok().filter(|&start| start <= last)?;
+    let end = if end.is_empty() { last } else { end.parse::<usize>().ok()?.min(last) };
+    (start <= end).then_some((start, end))
+}
+
 /// Answers each `GET /<index>` with that file, so nothing else can be fetched.
+/// Honours byte ranges, which speakers use to seek within a file.
 fn handle_request(mut stream: TcpStream, files: &[PathBuf]) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    reader.read_line(&mut line)?;
+    let mut range = None;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 || header.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.eq_ignore_ascii_case("range") {
+                range = Some(value.trim().to_string());
+            }
+        }
+    }
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let file = parts
@@ -117,14 +145,31 @@ fn handle_request(mut stream: TcpStream, files: &[PathBuf]) -> std::io::Result<(
         return stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     };
     let body = std::fs::read(file)?;
+    let size = body.len();
+    let (status, extra, sent) = match range {
+        Some(range) => match parse_range(&range, size) {
+            Some((start, end)) => (
+                "206 Partial Content",
+                format!("Content-Range: bytes {start}-{end}/{size}\r\n"),
+                &body[start..=end],
+            ),
+            None => {
+                return write!(
+                    stream,
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{size}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        },
+        None => ("200 OK", String::new(), &body[..]),
+    };
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n{extra}Connection: close\r\n\r\n",
         content_type(file),
-        body.len()
+        sent.len()
     )?;
     if method == "GET" {
-        stream.write_all(&body)?;
+        stream.write_all(sent)?;
     }
     Ok(())
 }
@@ -175,7 +220,7 @@ pub fn play(speaker: &Speaker, files: Vec<PathBuf>) -> Result<(), Box<dyn Error>
         device
             .media
             .load(app.transport_id.as_str(), app.session_id.as_str(), &media)?;
-        wait_until_finished(&device, wav_duration(file))
+        wait_until_finished(&device, app.session_id.as_str(), wav_duration(file))
     });
 
     let _ = device.receiver.stop_app(app.session_id.as_str());
@@ -184,6 +229,7 @@ pub fn play(speaker: &Speaker, files: Vec<PathBuf>) -> Result<(), Box<dyn Error>
 
 fn wait_until_finished(
     device: &CastDevice<'_>,
+    session_id: &str,
     duration: Option<f32>,
 ) -> Result<(), Box<dyn Error>> {
     let limit = Duration::from_secs_f32(duration.unwrap_or(4.0 * 3600.0) + 60.0);
@@ -206,6 +252,16 @@ fn wait_until_finished(
                     }
                 }
             }
+            // Stopping from the speaker or an app closes the session, often
+            // without a final media status.
+            ChannelMessage::Connection(ConnectionResponse::Close) => {
+                return Err("playback was stopped on the speaker".into());
+            }
+            ChannelMessage::Receiver(ReceiverResponse::Status(status))
+                if !status.applications.iter().any(|app| app.session_id == session_id) =>
+            {
+                return Err("playback was stopped on the speaker".into());
+            }
             ChannelMessage::Media(MediaResponse::LoadFailed(_)) => {
                 return Err("the speaker failed to load the file".into());
             }
@@ -213,4 +269,20 @@ fn wait_until_finished(
         }
     }
     Err("timed out waiting for playback to finish".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges_are_clamped_to_the_file() {
+        assert_eq!(parse_range("bytes=0-", 10), Some((0, 9)));
+        assert_eq!(parse_range("bytes=2-4", 10), Some((2, 4)));
+        assert_eq!(parse_range("bytes=8-99", 10), Some((8, 9)));
+        assert_eq!(parse_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_range("bytes=10-", 10), None);
+        assert_eq!(parse_range("bytes=5-2", 10), None);
+        assert_eq!(parse_range("bytes=0-", 0), None);
+    }
 }
