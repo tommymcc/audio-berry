@@ -1,0 +1,12 @@
+/target
+/vendor/any-tts/target
+/output
+/voices
+
+# Voice recordings and books stay out of git.
+*.flac
+*.mp3
+*.wav
+*.m4a
+*.m4b
+*.epub
