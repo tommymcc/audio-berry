@@ -27,13 +27,13 @@ fn voice_hash(reference: &ReferenceAudio) -> u64 {
     fnv(&bytes, 0)
 }
 
-fn open_store(book: &Book, reference: &ReferenceAudio, out: &Path) -> Result<NarrationStore, Box<dyn Error>> {
+fn open_store(book: &Book, reference: &ReferenceAudio, out: &Path, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
     let chapters: Vec<Vec<String>> = book
         .chapters
         .iter()
         .map(|chapter| chunk(&chapter.paragraphs, MAX_CHUNK_CHARS))
         .collect();
-    NarrationStore::open(out, &book.title, &chapters, voice_hash(reference), &RenderSettings::from_env())
+    NarrationStore::open(out, &book.title, &chapters, voice_hash(reference), &RenderSettings::from_env(speed))
 }
 
 /// Prints each chapter's number, title and size.
@@ -57,11 +57,12 @@ struct Take {
     audio: AudioSamples,
     quality: Quality,
     accuracy: Accuracy,
+    speed: f64,
 }
 
 impl Take {
     fn plausible(&self, characters: usize) -> bool {
-        quality::plausible_length(characters, self.quality.seconds)
+        quality::plausible_length_at(characters, self.quality.seconds, self.speed)
     }
 
     fn clean(&self) -> bool {
@@ -93,7 +94,10 @@ fn render_take(
     // SAFETY: nothing else reads or writes the environment during this
     // call, as the model is only used from this thread between requests.
     unsafe { std::env::set_var("OMNIVOICE_SEED", (base_seed + take).to_string()) };
-    let request = SynthesisRequest::new(item.text.as_str()).with_reference_audio(reference.clone());
+    let mut request = SynthesisRequest::new(item.text.as_str()).with_reference_audio(reference.clone());
+    if store.speed() != 1.0 {
+        request = request.with_speed(store.speed());
+    }
     let audio = model.synthesize(&request)?;
     audio.save_wav(&candidate)?;
     let transcript = transcriber.transcribe(&candidate)?;
@@ -102,6 +106,7 @@ fn render_take(
         quality: quality::measure(&audio.samples, audio.sample_rate),
         accuracy: transcribe::compare(&item.text, &transcript),
         audio,
+        speed: store.speed(),
     })
 }
 
@@ -233,7 +238,7 @@ fn write_report(book: &Book, store: &NarrationStore, out: &Path) -> Result<usize
         let accuracy = transcribe::compare(&item.text, &check.transcript);
         let characters = item.text.chars().count();
         let pass = quality.clean()
-            && quality::plausible_length(characters, quality.seconds)
+            && quality::plausible_length_at(characters, quality.seconds, store.speed())
             && accuracy.acceptable();
         flagged += usize::from(!pass);
         writeln!(
@@ -266,6 +271,7 @@ pub fn narrate(
     epub: &Path,
     out: &Path,
     chapters: Option<Vec<usize>>,
+    speed: Option<f64>,
 ) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
     let selected: Vec<usize> = match chapters {
@@ -279,7 +285,7 @@ pub fn narrate(
     };
 
     let reference = crate::load_reference(voice)?;
-    let store = open_store(&book, &reference, out)?;
+    let store = open_store(&book, &reference, out, speed)?;
 
     let text_dir = out.join("text");
     fs::create_dir_all(&text_dir)?;
@@ -339,7 +345,7 @@ fn print_missing(store: &NarrationStore) {
 pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
     let reference = crate::load_reference(voice)?;
-    let store = open_store(&book, &reference, out)?;
+    let store = open_store(&book, &reference, out, None)?;
     let wanted = store.select(targets)?;
 
     let model = crate::load_narrator()?;
@@ -360,6 +366,7 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
                 quality: quality::measure(&audio.samples, audio.sample_rate),
                 accuracy: transcribe::compare(&item.text, &check.transcript),
                 audio,
+                speed: store.speed(),
             };
             let (plausible, clean, score) = current.rank(characters);
             (check.takes, Some((plausible, clean, heard_all(&check.transcript), score)))

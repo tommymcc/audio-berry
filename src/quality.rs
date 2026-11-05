@@ -66,6 +66,11 @@ pub fn plausible_length(characters: usize, seconds: f32) -> bool {
     seconds >= characters / 30.0 && seconds <= characters / 9.0 + 4.0
 }
 
+/// The same check for narration at a chosen speed.
+pub fn plausible_length_at(characters: usize, seconds: f32, speed: f64) -> bool {
+    plausible_length(characters, seconds * speed as f32)
+}
+
 /// Removes leading and trailing silence, so gaps between chunks are consistent.
 pub fn trim_silence(samples: &[f32], sample_rate: u32) -> &[f32] {
     let size = ((sample_rate as f32 * FRAME_SECONDS) as usize).max(1);
@@ -92,6 +97,15 @@ pub fn gain_for(quality: &Quality, target_db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plausible_length_follows_the_speed() {
+        // 300 characters at the usual 18 per second takes about 16.7 seconds.
+        assert!(!plausible_length_at(300, 8.3, 1.0));
+        assert!(plausible_length_at(300, 8.3, 2.0));
+        assert!(!plausible_length_at(300, 42.0, 1.0));
+        assert!(plausible_length_at(300, 42.0, 0.5));
+    }
 
     fn tone(seconds: f32, level: f32) -> Vec<f32> {
         (0..(24_000.0 * seconds) as usize)

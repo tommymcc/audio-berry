@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 const CACHE_VERSION: &str = "3";
 const DEFAULT_PRECISION: &str = "f16";
+const NORMAL_SPEED: f64 = 1.0;
 const MANIFEST: &str = "narration.txt";
 
 pub fn fnv(bytes: &[u8], seed: u64) -> u64 {
@@ -20,21 +21,24 @@ pub fn fnv(bytes: &[u8], seed: u64) -> u64 {
 }
 
 /// Settings that change a chunk's audio.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RenderSettings {
     pub precision: String,
+    /// `None` uses what the folder saved, or normal speed in a new folder.
+    pub speed: Option<f64>,
 }
 
 impl RenderSettings {
-    pub fn from_env() -> Self {
-        Self::from_dtype(std::env::var("OMNIVOICE_DTYPE").ok().as_deref())
+    pub fn from_env(speed: Option<f64>) -> Self {
+        let dtype = std::env::var("OMNIVOICE_DTYPE").ok();
+        Self { speed, ..Self::from_dtype(dtype.as_deref()) }
     }
 
     /// Mirrors the model, which ignores values it doesn't recognise.
     fn from_dtype(value: Option<&str>) -> Self {
         let value = value.unwrap_or_default().trim().to_ascii_lowercase();
         let precision = if matches!(value.as_str(), "f32" | "bf16") { value } else { DEFAULT_PRECISION.into() };
-        Self { precision }
+        Self { precision, speed: None }
     }
 }
 
@@ -62,6 +66,14 @@ pub struct Check {
     pub transcript: String,
 }
 
+fn read_manifest(out: &Path) -> Result<Option<Manifest>, Box<dyn Error>> {
+    match fs::read_to_string(out.join(MANIFEST)) {
+        Ok(text) => Ok(Some(Manifest::parse(&text)?)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Reads a chunk number such as `3.12` as its chapter and position.
 fn parse_number(target: &str) -> Option<(usize, usize)> {
     let (chapter, position) = target.split_once('.')?;
@@ -83,11 +95,15 @@ struct Manifest {
     book: String,
     voice: String,
     precision: String,
+    speed: f64,
 }
 
 impl Manifest {
     fn render(&self) -> String {
-        format!("book={}\nvoice={}\nprecision={}\n", self.book, self.voice, self.precision)
+        format!(
+            "book={}\nvoice={}\nprecision={}\nspeed={}\n",
+            self.book, self.voice, self.precision, self.speed
+        )
     }
 
     fn parse(text: &str) -> Result<Self, Box<dyn Error>> {
@@ -97,7 +113,12 @@ impl Manifest {
                 .map(str::to_string)
                 .ok_or_else(|| format!("{MANIFEST} has no {name}"))
         };
-        Ok(Self { book: field("book")?, voice: field("voice")?, precision: field("precision")? })
+        Ok(Self {
+            book: field("book")?,
+            voice: field("voice")?,
+            precision: field("precision")?,
+            speed: field("speed").map_or(Ok(NORMAL_SPEED), |speed| speed.parse())?,
+        })
     }
 
     fn require(&self, wanted: &Self, out: &Path) -> Result<(), Box<dyn Error>> {
@@ -105,6 +126,7 @@ impl Manifest {
             ("book", &self.book, &wanted.book),
             ("voice", &self.voice, &wanted.voice),
             ("precision", &self.precision, &wanted.precision),
+            ("speed", &self.speed.to_string(), &wanted.speed.to_string()),
         ];
         for (name, saved, asked) in fields {
             if saved != asked {
@@ -122,6 +144,7 @@ impl Manifest {
 pub struct NarrationStore {
     out: PathBuf,
     chunks: Vec<Chunk>,
+    speed: f64,
 }
 
 impl NarrationStore {
@@ -132,10 +155,14 @@ impl NarrationStore {
         voice: u64,
         settings: &RenderSettings,
     ) -> Result<Self, Box<dyn Error>> {
+        let saved = read_manifest(out)?;
+        let speed = settings.speed.or(saved.as_ref().map(|saved| saved.speed)).unwrap_or(NORMAL_SPEED);
+        // Normal speed keeps the original key, so older chunks stay valid.
+        let speed_key = if speed == NORMAL_SPEED { String::new() } else { format!("speed={speed}\n") };
         let mut chunks = Vec::new();
         for (chapter, texts) in chapters.iter().enumerate() {
             for (position, text) in texts.iter().enumerate() {
-                let key = format!("{CACHE_VERSION}\n{voice:x}\n{text}");
+                let key = format!("{CACHE_VERSION}\n{voice:x}\n{speed_key}{text}");
                 chunks.push(Chunk {
                     chapter,
                     position,
@@ -145,22 +172,23 @@ impl NarrationStore {
             }
         }
         fs::create_dir_all(out.join("chunks"))?;
-        let store = Self { out: out.to_path_buf(), chunks };
-        store.remember(&Manifest {
+        let store = Self { out: out.to_path_buf(), chunks, speed };
+        let wanted = Manifest {
             book: book_title.replace('\n', " "),
             voice: format!("{voice:x}"),
             precision: settings.precision.clone(),
-        })?;
+            speed,
+        };
+        store.remember(saved, &wanted)?;
         Ok(store)
     }
 
     /// Saves what this folder narrates on first use, and refuses anything else later.
-    fn remember(&self, wanted: &Manifest) -> Result<(), Box<dyn Error>> {
+    fn remember(&self, saved: Option<Manifest>, wanted: &Manifest) -> Result<(), Box<dyn Error>> {
         let path = self.out.join(MANIFEST);
-        let saved = match fs::read_to_string(&path) {
-            Ok(text) => Some(Manifest::parse(&text)?),
-            Err(error) if error.kind() == ErrorKind::NotFound => self.older_manifest(wanted)?,
-            Err(error) => return Err(error.into()),
+        let saved = match saved {
+            Some(saved) => Some(saved),
+            None => self.older_manifest(wanted)?,
         };
         if let Some(saved) = &saved {
             saved.require(wanted, &self.out)?;
@@ -175,7 +203,7 @@ impl NarrationStore {
 
     /// Older versions saved nothing, so a folder with chunks can only be trusted
     /// if some of them belong to this narration. They always used the default
-    /// precision unless overridden for testing.
+    /// precision unless overridden for testing, and normal speed.
     fn older_manifest(&self, wanted: &Manifest) -> Result<Option<Manifest>, Box<dyn Error>> {
         let has_audio = fs::read_dir(self.out.join("chunks"))?
             .filter_map(Result::ok)
@@ -190,7 +218,7 @@ impl NarrationStore {
             )
             .into());
         }
-        Ok(Some(Manifest { precision: DEFAULT_PRECISION.into(), ..wanted.clone() }))
+        Ok(Some(Manifest { precision: DEFAULT_PRECISION.into(), speed: NORMAL_SPEED, ..wanted.clone() }))
     }
 
     /// Finds what `targets` name: chunk numbers, or words from the book. Each audio
@@ -242,6 +270,11 @@ impl NarrationStore {
             numbers.join(", ")
         )
         .into())
+    }
+
+    /// The speaking speed this folder narrates at.
+    pub fn speed(&self) -> f64 {
+        self.speed
     }
 
     /// Every chunk in the book, whichever chapters have been rendered.
@@ -332,7 +365,6 @@ impl NarrationStore {
 mod tests {
     use super::*;
     use std::fs;
-use std::io::ErrorKind;
 
     /// A directory that's removed when the test ends.
     struct TempDir(PathBuf);
@@ -353,7 +385,7 @@ use std::io::ErrorKind;
     }
 
     fn settings() -> RenderSettings {
-        RenderSettings { precision: "f16".into() }
+        RenderSettings { precision: "f16".into(), speed: None }
     }
 
     fn chapters(texts: &[&[&str]]) -> Vec<Vec<String>> {
@@ -369,7 +401,7 @@ use std::io::ErrorKind;
     }
 
     fn open_as(dir: &TempDir, title: &str, voice: u64, precision: &str) -> Result<NarrationStore, Box<dyn Error>> {
-        let settings = RenderSettings { precision: precision.into() };
+        let settings = RenderSettings { precision: precision.into(), speed: None };
         NarrationStore::open(&dir.0, title, &chapters(&[&["a"]]), voice, &settings)
     }
 
@@ -446,6 +478,59 @@ use std::io::ErrorKind;
         let dir = TempDir::new("select-order");
         let store = open(&dir, &[&["a"], &["b"]]);
         assert_eq!(numbers(&store.select(&["2.1", "1.1"]).unwrap()), ["1.1", "2.1"]);
+    }
+
+    fn open_at(dir: &TempDir, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
+        let settings = RenderSettings { speed, ..settings() };
+        NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings)
+    }
+
+    #[test]
+    fn a_new_speed_gets_its_own_cache_key() {
+        // Worked out independently with FNV-1a of "3\nabc\nspeed=0.9\nHello there.".
+        let dir = TempDir::new("speed-key");
+        let store = open_at(&dir, Some(0.9)).unwrap();
+        assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "6c7ca5b9cb1c27dd.wav");
+    }
+
+    #[test]
+    fn normal_speed_keeps_the_existing_cache_key() {
+        let dir = TempDir::new("speed-normal");
+        let store = open_at(&dir, Some(1.0)).unwrap();
+        assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "026926e6f4d06f3e.wav");
+    }
+
+    #[test]
+    fn leaving_out_the_speed_uses_the_saved_one() {
+        let dir = TempDir::new("speed-saved");
+        open_at(&dir, Some(0.9)).unwrap();
+        let store = open_at(&dir, None).unwrap();
+        assert_eq!(store.speed(), 0.9);
+        assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "6c7ca5b9cb1c27dd.wav");
+    }
+
+    #[test]
+    fn a_different_speed_is_refused_by_name() {
+        let dir = TempDir::new("speed-refused");
+        open_at(&dir, Some(0.9)).unwrap();
+        let error = open_at(&dir, Some(1.1)).err().unwrap().to_string();
+        assert!(error.contains("speed"), "{error}");
+    }
+
+    #[test]
+    fn an_older_folder_is_normal_speed() {
+        let dir = TempDir::new("speed-older");
+        fs::create_dir_all(dir.0.join("chunks")).unwrap();
+        fs::write(dir.0.join("chunks").join("026926e6f4d06f3e.wav"), "audio").unwrap();
+        assert_eq!(open_at(&dir, None).unwrap().speed(), 1.0);
+        assert!(open_at(&dir, Some(0.9)).is_err());
+    }
+
+    #[test]
+    fn a_folder_from_before_speed_was_saved_is_normal_speed() {
+        let dir = TempDir::new("speed-manifest");
+        fs::write(dir.0.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\n").unwrap();
+        assert_eq!(open_at(&dir, None).unwrap().speed(), 1.0);
     }
 
     #[test]

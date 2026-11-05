@@ -86,10 +86,13 @@ pub fn load_reference(path: &Path) -> Result<ReferenceAudio, Box<dyn Error>> {
     Ok(reference.with_transcript(transcript))
 }
 
+/// Beyond this, the length checks and Whisper haven't been tried.
+const SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=2.0;
+
 const USAGE: &str = "usage:
-  audio-berry speak <voice-sample> <text> <output.wav>
+  audio-berry speak <voice-sample> <text> <output.wav> [--speed <factor>]
   audio-berry chapters <book.epub>
-  audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers, e.g. 2 3 7]
+  audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers, e.g. 2 3 7] [--speed <factor>]
   audio-berry retake <voice-sample> <book.epub> <output-dir> <words from the book, or a chunk number like 3.12>...
   audio-berry speakers
   audio-berry play <speaker> <file>...";
@@ -102,9 +105,12 @@ pub fn load_narrator() -> Result<Box<dyn TtsModel>, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (args, speed) = take_speed(std::env::args().skip(1).collect())?;
+    if speed.is_some() && !matches!(args.first().map(String::as_str), Some("speak" | "book")) {
+        return Err("--speed only works with speak and book; retake uses the speed the folder saved".into());
+    }
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["speak", voice, text, output] => speak(voice, text, output),
+        ["speak", voice, text, output] => speak(voice, text, output, speed),
         ["chapters", book] => book::list_chapters(Path::new(book)),
         ["book", voice, book, output, chapters @ ..] => {
             let chapters = if chapters.is_empty() {
@@ -113,9 +119,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let numbers = chapters.iter().map(|number| number.parse::<usize>());
                 Some(numbers.collect::<Result<Vec<_>, _>>().map_err(|_| USAGE)?)
             };
-            book::narrate(Path::new(voice), Path::new(book), Path::new(output), chapters)
+            book::narrate(Path::new(voice), Path::new(book), Path::new(output), chapters, speed)
         }
-        ["retake", voice, book, output, targets @ ..] if !targets.is_empty() => {
+        ["retake", voice, book, output, targets @ ..]
+            if !targets.is_empty() && !targets.iter().any(|target| target.starts_with("--")) =>
+        {
             book::retake(Path::new(voice), Path::new(book), Path::new(output), targets)
         }
         ["speakers"] => {
@@ -135,13 +143,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn speak(voice: &str, text: &str, output: &str) -> Result<(), Box<dyn Error>> {
+/// Takes `--speed <factor>` out of the arguments, wherever it appears.
+fn take_speed(mut args: Vec<String>) -> Result<(Vec<String>, Option<f64>), Box<dyn Error>> {
+    let Some(flag) = args.iter().position(|arg| arg == "--speed") else {
+        return Ok((args, None));
+    };
+    let value = args.get(flag + 1).ok_or("--speed needs a factor, such as 0.9")?;
+    let speed = value.parse::<f64>().ok().filter(|speed| SPEED_RANGE.contains(speed));
+    let speed = speed.ok_or_else(|| {
+        format!("--speed must be from {} to {}, not {value}", SPEED_RANGE.start(), SPEED_RANGE.end())
+    })?;
+    args.drain(flag..=flag + 1);
+    Ok((args, Some(speed)))
+}
+
+fn speak(voice: &str, text: &str, output: &str, speed: Option<f64>) -> Result<(), Box<dyn Error>> {
     let reference = load_reference(Path::new(voice))?;
 
     let model = load_narrator()?;
 
     let started = Instant::now();
-    let request = SynthesisRequest::new(text).with_reference_audio(reference);
+    let mut request = SynthesisRequest::new(text).with_reference_audio(reference);
+    if let Some(speed) = speed {
+        request = request.with_speed(speed);
+    }
     let audio = model.synthesize(&request)?;
     let elapsed = started.elapsed().as_secs_f32();
 
@@ -152,4 +177,36 @@ fn speak(voice: &str, text: &str, output: &str) -> Result<(), Box<dyn Error>> {
         audio.duration_secs() / elapsed
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn speed_is_taken_from_any_position() {
+        let (rest, speed) = take_speed(args(&["book", "--speed", "0.9", "v", "b", "o", "3"])).unwrap();
+        assert_eq!(rest, args(&["book", "v", "b", "o", "3"]));
+        assert_eq!(speed, Some(0.9));
+        let (rest, speed) = take_speed(args(&["book", "v", "b", "o", "--speed", "1.2"])).unwrap();
+        assert_eq!(rest, args(&["book", "v", "b", "o"]));
+        assert_eq!(speed, Some(1.2));
+    }
+
+    #[test]
+    fn no_flag_means_no_speed() {
+        assert_eq!(take_speed(args(&["chapters", "b"])).unwrap().1, None);
+    }
+
+    #[test]
+    fn a_missing_or_silly_speed_is_an_error() {
+        for bad in ["0", "-1", "0.4", "2.1", "fast", "NaN"] {
+            assert!(take_speed(args(&["book", "--speed", bad])).is_err(), "{bad}");
+        }
+        assert!(take_speed(args(&["book", "--speed"])).is_err());
+    }
 }
