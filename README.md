@@ -78,6 +78,9 @@ audio-berry play <speaker> <file>...
 match. It interrupts whatever the speaker is playing. While playing, it serves
 only the requested files to your LAN on a temporary port.
 
+Pausing on the speaker doesn't count towards `play`'s time limit, which is the
+length the speaker reports plus a minute. Leave `play` running until playback ends.
+
 ## Narrating a book
 
 ```sh

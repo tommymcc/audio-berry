@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 const DISCOVERY_TIME: Duration = Duration::from_secs(4);
 const RECEIVER: &str = "receiver-0";
+/// How long past the file's length a speaker can go before playback is given up on.
+const PLAYBACK_MARGIN: Duration = Duration::from_secs(60);
 
 pub struct Speaker {
     pub name: String,
@@ -94,12 +96,6 @@ fn content_type(path: &Path) -> &'static str {
         Some("flac") => "audio/flac",
         _ => "audio/wav",
     }
-}
-
-fn wav_duration(path: &Path) -> Option<f32> {
-    let bytes = std::fs::metadata(path).ok()?.len();
-    // Good enough for a playback timeout: mono 16-bit at the model's rate.
-    (content_type(path) == "audio/wav").then(|| bytes as f32 / 48_000.0)
 }
 
 /// Reads `bytes=start-end` into the inclusive range to send, if it's satisfiable.
@@ -220,26 +216,66 @@ pub fn play(speaker: &Speaker, files: Vec<PathBuf>) -> Result<(), Box<dyn Error>
         device
             .media
             .load(app.transport_id.as_str(), app.session_id.as_str(), &media)?;
-        wait_until_finished(&device, app.session_id.as_str(), wav_duration(file))
+        wait_until_finished(&device, app.session_id.as_str())
     });
 
     let _ = device.receiver.stop_app(app.session_id.as_str());
     outcome
 }
 
+/// Decides when a speaker has gone quiet for too long. Only time spent not paused
+/// counts, and there's no limit until the speaker reports the file's length.
+struct PlaybackClock {
+    counted: Duration,
+    since: Instant,
+    paused: bool,
+    length: Option<Duration>,
+}
+
+impl PlaybackClock {
+    fn new(now: Instant) -> Self {
+        Self { counted: Duration::ZERO, since: now, paused: false, length: None }
+    }
+
+    fn counted_at(&self, now: Instant) -> Duration {
+        if self.paused {
+            self.counted
+        } else {
+            self.counted + now.saturating_duration_since(self.since)
+        }
+    }
+
+    /// Records a status from the speaker.
+    fn observe(&mut self, now: Instant, paused: bool, length: Option<f32>) {
+        self.counted = self.counted_at(now);
+        self.since = now;
+        self.paused = paused;
+        if let Some(length) = length.and_then(|seconds| Duration::try_from_secs_f32(seconds).ok()) {
+            self.length = Some(length);
+        }
+    }
+
+    fn timed_out(&self, now: Instant) -> bool {
+        self.length.is_some_and(|length| self.counted_at(now) > length + PLAYBACK_MARGIN)
+    }
+}
+
 fn wait_until_finished(
     device: &CastDevice<'_>,
     session_id: &str,
-    duration: Option<f32>,
 ) -> Result<(), Box<dyn Error>> {
-    let limit = Duration::from_secs_f32(duration.unwrap_or(4.0 * 3600.0) + 60.0);
-    let started = Instant::now();
+    let mut clock = PlaybackClock::new(Instant::now());
     let mut session_seen = false;
-    while started.elapsed() < limit {
+    while !clock.timed_out(Instant::now()) {
         match device.receive()? {
             ChannelMessage::Heartbeat(HeartbeatResponse::Ping) => device.heartbeat.pong()?,
             ChannelMessage::Media(MediaResponse::Status(status)) => {
                 for entry in status.entries {
+                    clock.observe(
+                        Instant::now(),
+                        entry.player_state == PlayerState::Paused,
+                        entry.media.as_ref().and_then(|media| media.duration),
+                    );
                     if entry.player_state != PlayerState::Idle {
                         continue;
                     }
@@ -279,6 +315,46 @@ fn wait_until_finished(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn after(start: Instant, minutes: u64) -> Instant {
+        start + Duration::from_secs(minutes * 60)
+    }
+
+    #[test]
+    fn an_unknown_length_never_times_out() {
+        let start = Instant::now();
+        let clock = PlaybackClock::new(start);
+        assert!(!clock.timed_out(after(start, 100 * 60)));
+    }
+
+    #[test]
+    fn a_known_length_times_out_a_minute_after_it_should_have_ended() {
+        let start = Instant::now();
+        let mut clock = PlaybackClock::new(start);
+        clock.observe(start, false, Some(600.0));
+        assert!(!clock.timed_out(after(start, 10)));
+        assert!(clock.timed_out(after(start, 12)));
+    }
+
+    #[test]
+    fn a_book_longer_than_four_hours_plays_to_its_end() {
+        let start = Instant::now();
+        let mut clock = PlaybackClock::new(start);
+        clock.observe(start, false, Some(6.0 * 3600.0));
+        assert!(!clock.timed_out(after(start, 6 * 60)));
+    }
+
+    #[test]
+    fn time_spent_paused_does_not_count() {
+        let start = Instant::now();
+        let mut clock = PlaybackClock::new(start);
+        clock.observe(start, false, Some(600.0));
+        clock.observe(after(start, 5), true, None);
+        assert!(!clock.timed_out(after(start, 5 * 60)));
+        clock.observe(after(start, 5 * 60), false, None);
+        assert!(!clock.timed_out(after(start, 5 * 60 + 5)));
+        assert!(clock.timed_out(after(start, 5 * 60 + 7)));
+    }
 
     #[test]
     fn ranges_are_clamped_to_the_file() {
