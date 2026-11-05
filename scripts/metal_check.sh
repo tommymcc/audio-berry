@@ -58,7 +58,7 @@ check() {
     uname -srm
     if [ "$(uname -s)" = Darwin ]; then
         sw_vers -productVersion
-        sysctl -n machine.cpu.brand_string
+        sysctl -n machdep.cpu.brand_string
         echo "memory bytes: $(sysctl -n hw.memsize)"
     fi
     rustc --version
