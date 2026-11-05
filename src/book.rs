@@ -2,6 +2,7 @@
 
 use crate::epub::{Book, read_book};
 use crate::quality::{self, Quality};
+use crate::store::{Chunk, NarrationStore, RenderSettings, fnv};
 use crate::text::{MAX_CHUNK_CHARS, chunk};
 use crate::transcribe::{self, Accuracy, Transcriber};
 use any_tts::{AudioSamples, ReferenceAudio, SynthesisRequest, TtsModel};
@@ -12,25 +13,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-const CACHE_VERSION: &str = "3";
 const MAX_TAKES: u64 = 5;
 /// New takes tried per chunk by `retake`.
 const MAX_RETAKES: u64 = 6;
 const SPEECH_TARGET_DB: f32 = -21.0;
 const CHUNK_GAP_SECONDS: f32 = 0.35;
 const CHAPTER_GAP_SECONDS: f32 = 1.2;
-
-struct Planned {
-    chapter: usize,
-    text: String,
-    hash: String,
-}
-
-fn fnv(bytes: &[u8], seed: u64) -> u64 {
-    bytes.iter().fold(seed ^ 0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-    })
-}
 
 /// Identifies a voice, including its transcript since that changes the speech.
 fn voice_hash(reference: &ReferenceAudio) -> u64 {
@@ -39,19 +27,13 @@ fn voice_hash(reference: &ReferenceAudio) -> u64 {
     fnv(&bytes, 0)
 }
 
-fn plan(book: &Book, selected: &[usize], voice_hash: u64) -> Vec<Planned> {
-    let mut planned = Vec::new();
-    for &chapter in selected {
-        for text in chunk(&book.chapters[chapter].paragraphs, MAX_CHUNK_CHARS) {
-            let key = format!("{CACHE_VERSION}\n{voice_hash:x}\n{text}");
-            planned.push(Planned {
-                chapter,
-                hash: format!("{:016x}", fnv(key.as_bytes(), 0)),
-                text,
-            });
-        }
-    }
-    planned
+fn open_store(book: &Book, reference: &ReferenceAudio, out: &Path) -> Result<NarrationStore, Box<dyn Error>> {
+    let chapters: Vec<Vec<String>> = book
+        .chapters
+        .iter()
+        .map(|chapter| chunk(&chapter.paragraphs, MAX_CHUNK_CHARS))
+        .collect();
+    NarrationStore::open(out, &book.title, &chapters, voice_hash(reference), &RenderSettings::from_env())
 }
 
 /// Prints each chapter's number, title and size.
@@ -102,23 +84,23 @@ fn render_take(
     model: &dyn TtsModel,
     transcriber: &mut Transcriber,
     reference: &ReferenceAudio,
-    planned: &Planned,
-    out: &Path,
+    store: &NarrationStore,
+    item: &Chunk,
     take: u64,
 ) -> Result<Take, Box<dyn Error>> {
-    let base_seed = fnv(planned.text.as_bytes(), 1) >> 1;
-    let candidate = out.join("chunks").join(format!("{}.take.wav", planned.hash));
+    let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
+    let candidate = store.scratch_path(item);
     // SAFETY: nothing else reads or writes the environment during this
     // call, as the model is only used from this thread between requests.
     unsafe { std::env::set_var("OMNIVOICE_SEED", (base_seed + take).to_string()) };
-    let request = SynthesisRequest::new(planned.text.as_str()).with_reference_audio(reference.clone());
+    let request = SynthesisRequest::new(item.text.as_str()).with_reference_audio(reference.clone());
     let audio = model.synthesize(&request)?;
     audio.save_wav(&candidate)?;
     let transcript = transcriber.transcribe(&candidate)?;
     fs::remove_file(&candidate)?;
     Ok(Take {
         quality: quality::measure(&audio.samples, audio.sample_rate),
-        accuracy: transcribe::compare(&planned.text, &transcript),
+        accuracy: transcribe::compare(&item.text, &transcript),
         audio,
     })
 }
@@ -128,13 +110,13 @@ fn render(
     model: &dyn TtsModel,
     transcriber: &mut Transcriber,
     reference: &ReferenceAudio,
-    planned: &Planned,
-    out: &Path,
+    store: &NarrationStore,
+    item: &Chunk,
 ) -> Result<(Take, u64), Box<dyn Error>> {
-    let characters = planned.text.chars().count();
+    let characters = item.text.chars().count();
     let mut best: Option<Take> = None;
     for take in 0..MAX_TAKES {
-        let current = render_take(model, transcriber, reference, planned, out, take)?;
+        let current = render_take(model, transcriber, reference, store, item, take)?;
         if current.acceptable(characters) {
             return Ok((current, take + 1));
         }
@@ -157,16 +139,6 @@ fn render(
     Ok((best, MAX_TAKES))
 }
 
-/// Saves a chunk and its check file, replacing the audio in one step.
-fn store_take(path: &Path, take: &Take, count: u64) -> Result<(), Box<dyn Error>> {
-    let transcript = take.accuracy.transcript.replace(['\n', '\t'], " ");
-    fs::write(path.with_extension("check"), format!("{count}\n{transcript}"))?;
-    let temporary = path.with_extension("tmp");
-    take.audio.save_wav(&temporary)?;
-    fs::rename(&temporary, path)?;
-    Ok(())
-}
-
 fn safe_name(title: &str) -> String {
     let name: String = title
         .chars()
@@ -186,8 +158,8 @@ fn metadata_escape(value: &str) -> String {
     out
 }
 
-/// Joins chunks into one WAV per chapter and a chaptered M4B.
-fn assemble(book: &Book, planned: &[Planned], selected: &[usize], out: &Path) -> Result<PathBuf, Box<dyn Error>> {
+/// Joins every complete chapter into one WAV each and a chaptered M4B.
+fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let chapter_dir = out.join("chapters");
     fs::create_dir_all(&chapter_dir)?;
     let mut sample_rate = 24_000;
@@ -197,10 +169,11 @@ fn assemble(book: &Book, planned: &[Planned], selected: &[usize], out: &Path) ->
         writeln!(metadata, "artist={}", metadata_escape(author))?;
     }
 
-    for (position, &chapter) in selected.iter().enumerate() {
+    let chapters = store.complete_chapters();
+    for (position, &chapter) in chapters.iter().enumerate() {
         let mut samples = Vec::new();
-        for item in planned.iter().filter(|item| item.chapter == chapter) {
-            let audio = AudioSamples::from_wav_file(chunk_path(out, &item.hash))?;
+        for item in store.chunks().iter().filter(|item| item.chapter == chapter) {
+            let audio = AudioSamples::from_wav_file(store.audio_path(item))?;
             sample_rate = audio.sample_rate;
             let trimmed = quality::trim_silence(&audio.samples, sample_rate);
             let gain = quality::gain_for(&quality::measure(trimmed, sample_rate), SPEECH_TARGET_DB);
@@ -221,7 +194,7 @@ fn assemble(book: &Book, planned: &[Planned], selected: &[usize], out: &Path) ->
             "[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle={}\n",
             metadata_escape(title)
         )?;
-        if position + 1 < selected.len() {
+        if position + 1 < chapters.len() {
             all.resize(all.len() + (CHAPTER_GAP_SECONDS * sample_rate as f32) as usize, 0.0);
         }
     }
@@ -246,22 +219,18 @@ fn assemble(book: &Book, planned: &[Planned], selected: &[usize], out: &Path) ->
     Ok(m4b)
 }
 
-fn chunk_path(out: &Path, hash: &str) -> PathBuf {
-    out.join("chunks").join(format!("{hash}.wav"))
-}
-
-/// Writes one row per chunk, so weak spots can be found and listened to.
-fn write_report(book: &Book, planned: &[Planned], out: &Path) -> Result<usize, Box<dyn Error>> {
+/// Writes one row per chunk with audio, so weak spots can be found and listened to.
+fn write_report(book: &Book, store: &NarrationStore, out: &Path) -> Result<usize, Box<dyn Error>> {
     let mut report = String::from(
         "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\n",
     );
     let mut flagged = 0;
-    for (index, item) in planned.iter().enumerate() {
-        let audio = AudioSamples::from_wav_file(chunk_path(out, &item.hash))?;
+    for item in store.chunks().iter().filter(|item| store.has_audio(item)) {
+        let path = store.audio_path(item);
+        let audio = AudioSamples::from_wav_file(&path)?;
         let quality = quality::measure(&audio.samples, audio.sample_rate);
-        let sidecar = fs::read_to_string(chunk_path(out, &item.hash).with_extension("check"))?;
-        let (takes, transcript) = sidecar.split_once('\n').ok_or("malformed chunk check file")?;
-        let accuracy = transcribe::compare(&item.text, transcript);
+        let check = store.check(item)?;
+        let accuracy = transcribe::compare(&item.text, &check.transcript);
         let characters = item.text.chars().count();
         let pass = quality.clean()
             && quality::plausible_length(characters, quality.seconds)
@@ -269,9 +238,11 @@ fn write_report(book: &Book, planned: &[Planned], out: &Path) -> Result<usize, B
         flagged += usize::from(!pass);
         writeln!(
             report,
-            "{}\t{index}\t{}.wav\t{takes}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{transcript}",
+            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}",
             book.chapters[item.chapter].title,
-            item.hash,
+            item.number(),
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            check.takes,
             quality.floor_db,
             quality.speech_db,
             quality.seconds,
@@ -280,6 +251,7 @@ fn write_report(book: &Book, planned: &[Planned], out: &Path) -> Result<usize, B
             accuracy.extra,
             if pass { "" } else { "CHECK" },
             item.text,
+            check.transcript,
         )?;
     }
     fs::write(out.join("report.tsv"), report)?;
@@ -287,7 +259,8 @@ fn write_report(book: &Book, planned: &[Planned], out: &Path) -> Result<usize, B
 }
 
 /// Narrates the selected chapters (or all of them) into `out`. Finished chunks
-/// are cached, so an interrupted run picks up where it stopped.
+/// are cached, so an interrupted run picks up where it stopped. The report and
+/// M4B cover every chapter rendered there so far.
 pub fn narrate(
     voice: &Path,
     epub: &Path,
@@ -306,13 +279,13 @@ pub fn narrate(
     };
 
     let reference = crate::load_reference(voice)?;
-    let planned = plan(&book, &selected, voice_hash(&reference));
+    let store = open_store(&book, &reference, out)?;
 
-    fs::create_dir_all(out.join("chunks"))?;
     let text_dir = out.join("text");
     fs::create_dir_all(&text_dir)?;
     for &chapter in &selected {
-        let text = planned
+        let text = store
+            .chunks()
             .iter()
             .filter(|item| item.chapter == chapter)
             .map(|item| item.text.as_str())
@@ -321,115 +294,90 @@ pub fn narrate(
         fs::write(text_dir.join(format!("{:02}.txt", chapter + 1)), text)?;
     }
 
-    let pending = planned.iter().filter(|item| !chunk_path(out, &item.hash).exists()).count();
-    println!("{} chunks, {pending} to generate", planned.len());
-    if pending > 0 {
+    let pending = store.pending(&selected);
+    let total = store.chunks().iter().filter(|item| selected.contains(&item.chapter)).count();
+    println!("{total} chunks, {} to generate", pending.len());
+    if !pending.is_empty() {
         let model = crate::load_narrator()?;
         let mut transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
         let started = Instant::now();
         let mut done = 0;
-        for item in &planned {
-            let path = chunk_path(out, &item.hash);
-            if path.exists() {
-                continue;
-            }
-            let (take, count) = render(model.as_ref(), &mut transcriber, &reference, item, out)?;
-            store_take(&path, &take, count)?;
+        for item in &pending {
+            let (take, count) = render(model.as_ref(), &mut transcriber, &reference, &store, item)?;
+            store.store(item, &take.audio, &take.accuracy.transcript, count)?;
             done += 1;
             let elapsed = started.elapsed().as_secs_f32();
             println!(
-                "[{done}/{pending}] {:.0}s of audio, take {count}, recall {:.2}, {:.0} min elapsed, about {:.0} min left",
+                "[{done}/{}] {:.0}s of audio, take {count}, recall {:.2}, {:.0} min elapsed, about {:.0} min left",
+                pending.len(),
                 take.audio.duration_secs(),
                 take.accuracy.recall,
                 elapsed / 60.0,
-                elapsed / done as f32 * (pending - done) as f32 / 60.0,
+                elapsed / done as f32 * (pending.len() - done) as f32 / 60.0,
             );
         }
     }
 
-    let flagged = write_report(&book, &planned, out)?;
-    let m4b = assemble(&book, &planned, &selected, out)?;
+    let flagged = write_report(&book, &store, out)?;
+    let m4b = assemble(&book, &store, out)?;
     println!("Wrote {}", m4b.display());
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
+    print_missing(&store);
     Ok(())
 }
 
-/// Finds the chunks a target names: a report chunk number, or words from the book.
-fn matching_chunks(planned: &[Planned], target: &str) -> Vec<usize> {
-    if let Ok(number) = target.parse::<usize>() {
-        return if number < planned.len() { vec![number] } else { Vec::new() };
+fn print_missing(store: &NarrationStore) {
+    let missing = store.missing_count();
+    if missing > 0 {
+        println!("{missing} chunks in this book have no audio; `book` records them");
     }
-    planned
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| transcribe::contains_phrase(&item.text, target))
-        .map(|(index, _)| index)
-        .collect()
 }
 
-/// Records new takes of the chunks that `targets` name, keeping a new take only
-/// if it beats the current one. The old audio moves to `replaced/`. This leaves
+/// Records new takes of only the chunks that `targets` name, keeping a new take
+/// only if it beats the current one. The old audio moves to `replaced/`. This leaves
 /// the M4B alone, so it's safe during playback; `book` rebuilds it afterwards.
 pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
-    let selected: Vec<usize> = (0..book.chapters.len()).collect();
     let reference = crate::load_reference(voice)?;
-    let planned = plan(&book, &selected, voice_hash(&reference));
-
-    // A phrase must be heard in the new take, or it hasn't fixed what was asked.
-    let mut wanted: Vec<(usize, Vec<&str>)> = Vec::new();
-    for target in targets {
-        let found = matching_chunks(&planned, target);
-        if found.is_empty() {
-            return Err(format!("nothing in the book matches \"{target}\"").into());
-        }
-        let phrase = target.parse::<usize>().is_err().then_some(*target);
-        for index in found {
-            match wanted.iter_mut().find(|(existing, _)| *existing == index) {
-                Some((_, phrases)) => phrases.extend(phrase),
-                None => wanted.push((index, phrase.into_iter().collect())),
-            }
-        }
-    }
-    // Text changes can leave chunks with no audio at all, which need recording too.
-    for (index, item) in planned.iter().enumerate() {
-        if !chunk_path(out, &item.hash).exists() && !wanted.iter().any(|(existing, _)| *existing == index) {
-            wanted.push((index, Vec::new()));
-        }
-    }
-    wanted.sort_by_key(|(index, _)| *index);
+    let store = open_store(&book, &reference, out)?;
+    let wanted = store.select(targets)?;
 
     let model = crate::load_narrator()?;
     let mut transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
-    fs::create_dir_all(out.join("replaced"))?;
-    for (position, (index, phrases)) in wanted.iter().enumerate() {
-        let item = &planned[*index];
-        let path = chunk_path(out, &item.hash);
+    for (position, selected) in wanted.iter().enumerate() {
+        let item = selected.chunk;
+        let phrases = &selected.phrases;
+        let path = store.audio_path(item);
         let characters = item.text.chars().count();
         let heard_all = |transcript: &str| {
             phrases.iter().all(|phrase| transcribe::contains_phrase(transcript, phrase))
         };
         // The check file holds the take count, so seeds already tried are skipped.
-        let (first_take, mut best_rank) = if path.exists() {
-            let sidecar = fs::read_to_string(path.with_extension("check"))?;
-            let (takes, transcript) = sidecar.split_once('\n').ok_or("malformed chunk check file")?;
+        let (first_take, mut best_rank) = if store.has_audio(item) {
+            let check = store.check(item)?;
             let audio = AudioSamples::from_wav_file(&path)?;
             let current = Take {
                 quality: quality::measure(&audio.samples, audio.sample_rate),
-                accuracy: transcribe::compare(&item.text, transcript),
+                accuracy: transcribe::compare(&item.text, &check.transcript),
                 audio,
             };
             let (plausible, clean, score) = current.rank(characters);
-            (takes.parse::<u64>()?, Some((plausible, clean, heard_all(transcript), score)))
+            (check.takes, Some((plausible, clean, heard_all(&check.transcript), score)))
         } else {
             (0, None)
         };
-        println!("[{}/{}] chunk {index}: {}", position + 1, wanted.len(), item.text.chars().take(60).collect::<String>());
+        println!(
+            "[{}/{}] chunk {}: {}",
+            position + 1,
+            wanted.len(),
+            selected.numbers.join(", "),
+            item.text.chars().take(60).collect::<String>()
+        );
 
         let mut best: Option<Take> = None;
         let mut count = first_take;
         for take in first_take..first_take + MAX_RETAKES {
-            let current = render_take(model.as_ref(), &mut transcriber, &reference, item, out, take)?;
+            let current = render_take(model.as_ref(), &mut transcriber, &reference, &store, item, take)?;
             count = take + 1;
             let (plausible, clean, score) = current.rank(characters);
             let heard = heard_all(&current.accuracy.transcript);
@@ -450,26 +398,23 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
         }
         match best {
             Some(take) => {
-                if path.exists() {
-                    let old = out.join("replaced").join(format!("{}-{first_take}.wav", item.hash));
-                    fs::rename(&path, &old)?;
-                    fs::rename(path.with_extension("check"), old.with_extension("check"))?;
+                if store.has_audio(item) {
+                    store.retire(item)?;
                 }
-                store_take(&path, &take, count)?;
+                store.store(item, &take.audio, &take.accuracy.transcript, count)?;
                 println!("  replaced: {}", take.accuracy.transcript);
             }
             None => {
                 // Still counts the tried seeds, so the next retake tries new ones.
-                let sidecar = fs::read_to_string(path.with_extension("check"))?;
-                let transcript = sidecar.split_once('\n').map_or("", |(_, transcript)| transcript);
-                fs::write(path.with_extension("check"), format!("{count}\n{transcript}"))?;
+                store.record_tried(item, count)?;
                 println!("  kept the current take; none was better");
             }
         }
     }
 
-    let flagged = write_report(&book, &planned, out)?;
+    let flagged = write_report(&book, &store, out)?;
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
+    print_missing(&store);
     println!("Run `book` with the same arguments to rebuild the M4B.");
     Ok(())
 }

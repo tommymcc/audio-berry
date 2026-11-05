@@ -90,7 +90,7 @@ const USAGE: &str = "usage:
   audio-berry speak <voice-sample> <text> <output.wav>
   audio-berry chapters <book.epub>
   audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers, e.g. 2 3 7]
-  audio-berry retake <voice-sample> <book.epub> <output-dir> <words from the book, or a chunk number>...
+  audio-berry retake <voice-sample> <book.epub> <output-dir> <words from the book, or a chunk number like 3.12>...
   audio-berry speakers
   audio-berry play <speaker> <file>...";
 
