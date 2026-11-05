@@ -91,6 +91,12 @@ length the speaker reports plus a minute. Leave `play` running until playback en
 Chapter numbers come from `chapters`. Add them to `book` to narrate only those.
 The book must be DRM-free, and each spine document becomes one chapter.
 
+To try it on a free book, download
+[Alice's Adventures in Wonderland](https://www.gutenberg.org/ebooks/11.epub3.images)
+from Project Gutenberg. Its last chapter is Project Gutenberg's license, so name
+chapters 1 to 13 if you don't want that narrated. This isn't the edition used in the
+benchmarks below, which splits chapter 3 into 30 chunks rather than 29.
+
 The model sometimes adds background noise, skips words, runs on or says fluent
 nonsense, so every take is checked and retried up to 5 times with a new seed:
 
