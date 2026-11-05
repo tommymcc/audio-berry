@@ -9,7 +9,6 @@ for checking) and talking to speakers on your LAN.
 ## Requirements
 
 - Rust 1.85+ and `ffmpeg`
-- [`uv`](https://docs.astral.sh/uv/) for the local Whisper transcriber
 - An NVIDIA GPU, with `nvidia-smi` working. A 25-second clip peaked at about
   2.9 GB of VRAM on an 8 GB card. The CUDA build fails without a GPU. Build with
   `--no-default-features` for CPU only, which hasn't been tested with OmniVoice.
@@ -94,8 +93,9 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
 
 - **Background noise:** the quietest 5% of the take must be below -55 dB.
 - **Length:** the duration must be plausible for the amount of text.
-- **Accuracy:** `scripts/transcribe.py` transcribes the take locally and compares
-  it with the text. `uv` downloads faster-whisper and the models on first use.
+- **Accuracy:** Whisper, running on candle like OmniVoice, transcribes the take
+  locally and compares it with the text. The models download on first use:
+  `base.en` (290 MB) for checks and `medium.en` (3 GB) for voice samples.
   Whisper mishears some correct speech, so treat a flag as a reason to listen,
   not as proof of a mistake.
 

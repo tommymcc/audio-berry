@@ -24,11 +24,11 @@ const MIN_VOICE_SECONDS: f32 = 3.0;
 const TRIM_VOICE_ABOVE_SECONDS: f32 = 20.0;
 
 /// Decodes any audio file ffmpeg understands into mono f32 PCM.
-fn decode_audio(path: &Path) -> Result<Vec<f32>, Box<dyn Error>> {
+pub fn decode_audio(path: &Path, sample_rate: u32) -> Result<Vec<f32>, Box<dyn Error>> {
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(path)
-        .args(["-ac", "1", "-ar", &SAMPLE_RATE.to_string(), "-f", "f32le", "-"])
+        .args(["-ac", "1", "-ar", &sample_rate.to_string(), "-f", "f32le", "-"])
         .output()?;
     if !output.status.success() {
         return Err(format!(
@@ -50,7 +50,7 @@ fn decode_audio(path: &Path) -> Result<Vec<f32>, Box<dyn Error>> {
 /// corrected by hand.
 pub fn load_reference(path: &Path) -> Result<ReferenceAudio, Box<dyn Error>> {
     let samples = trim_long_audio(
-        &decode_audio(path)?,
+        &decode_audio(path, SAMPLE_RATE)?,
         SAMPLE_RATE,
         MAX_VOICE_SECONDS,
         MIN_VOICE_SECONDS,
