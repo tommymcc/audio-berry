@@ -221,3 +221,11 @@ Speech uses the `integration` branch of
 The branch also has VibeVoice fixes and faster depthwise convolutions, which
 audio-berry doesn't use. The `vibevoice-support` branch has those on their own, in
 case VibeVoice comes back as an option.
+
+## License
+
+The source code in this repository is MIT licensed. See [LICENSE](LICENSE).
+
+It depends on the [`epub`](https://crates.io/crates/epub) crate, which is licensed
+under GPL-3.0-or-later. Compiled binaries include that crate, so anyone distributing
+a binary has to follow the GPL for the whole program.
