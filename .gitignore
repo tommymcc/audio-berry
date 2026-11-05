@@ -9,3 +9,6 @@
 *.m4a
 *.m4b
 *.epub
+
+# Test fixtures, written for the tests rather than taken from a real book.
+!/tests/fixtures/*.epub

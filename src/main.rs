@@ -104,7 +104,19 @@ pub fn load_narrator() -> Result<Box<dyn TtsModel>, Box<dyn Error>> {
     Ok(model)
 }
 
+/// Rust ignores SIGPIPE, so printing to a reader that has gone, such as `head`, panics.
+/// Restoring the default makes the program stop quietly like other Unix tools.
+#[cfg(unix)]
+fn stop_quietly_when_output_closes() {
+    // SAFETY: runs first in main, before any other threads exist.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+}
+
+#[cfg(not(unix))]
+fn stop_quietly_when_output_closes() {}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    stop_quietly_when_output_closes();
     let (args, speed) = take_speed(std::env::args().skip(1).collect())?;
     if speed.is_some() && !matches!(args.first().map(String::as_str), Some("speak" | "book")) {
         return Err("--speed only works with speak and book; retake uses the speed saved in the output directory".into());

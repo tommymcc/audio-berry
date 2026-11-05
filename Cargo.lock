@@ -83,6 +83,7 @@ dependencies = [
  "candle-transformers",
  "epub",
  "flate2",
+ "libc",
  "mdns-sd",
  "rust_cast",
  "rustls",
