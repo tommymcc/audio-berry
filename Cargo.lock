@@ -40,6 +40,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "any-tts"
 version = "0.2.0"
+source = "git+https://github.com/tommymcc/any-tts?rev=d92eef45315791ef67f0e896ecb776488fdc93bd#d92eef45315791ef67f0e896ecb776488fdc93bd"
 dependencies = [
  "base64 0.22.1",
  "candle-core",

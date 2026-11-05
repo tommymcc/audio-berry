@@ -1,8 +1,8 @@
 # audio-berry
 
 Narrates text in a cloned voice, entirely on your own machine, and plays the
-result on a Cast speaker. Speech runs on OmniVoice through a patched copy of
-[`any-tts`](https://github.com/TM9657/any-tts). The only network access is
+result on a Cast speaker. Speech runs on OmniVoice through a fork of
+[`any-tts`](https://github.com/tommymcc/any-tts). The only network access is
 downloading the models once (about 3.3 GB for speech, plus the Whisper models
 for checking) and talking to speakers on your LAN.
 
@@ -196,28 +196,28 @@ Tried and not kept:
 - **Rank 3 for the attention output's reshape:** 0.05 s faster on a 15 s clip, not
   worth a separate path.
 
-## The patched any-tts
+## The any-tts fork
 
-`vendor/any-tts` is `any-tts` 0.2.0 with these changes:
+Speech uses the `integration` branch of
+[`tommymcc/any-tts`](https://github.com/tommymcc/any-tts), pinned to a commit in
+`Cargo.toml`. It's `any-tts` 0.2.0 with these changes, each on its own branch:
 
 - **OmniVoice voice cloning:** adds reference encoding (HuBERT and DAC encoders
-  with residual quantization), preprocessing and post-processing, and fixes the
-  masking schedule and length estimates to match the Python package. Run at F32,
-  it picks the same tokens as Python given the same inputs and no random position
-  choice. `scripts/omnivoice_parity.py` and the ignored `matches_python_oracle`
-  test repeat that comparison.
+  with residual quantization). Run at F32, it picks the same tokens as Python given
+  the same inputs and no random position choice. `scripts/omnivoice_parity.py` and
+  the ignored `matches_python_oracle` test in the fork repeat that comparison.
+- **Matching the Python package:** the masking schedule, length estimate, silence
+  removal, fade-out and F32 audio codec.
 - **Speaking speed:** `request.speed` divides the estimated audio length, as the
   Python package does. The original crate rejected it.
-- **F16 by default:** OmniVoice defaults to F16 on CUDA, as BF16's first-step
-  logits were 8 times further from F32. `OMNIVOICE_DTYPE` overrides it.
-- **BF16 on CUDA:** VibeVoice crashed on dtype mismatches, because several
-  tensors and scalars stayed F32 while the model was BF16.
-- **Depthwise convolutions:** `layers/conv.rs` runs them in one batch. candle
-  makes one convolution call per channel, which made audio feedback take about
-  1 s per frame. This took generation from 0.12x to about 1.48x realtime on an
-  RTX 3070 Mobile.
+- **Running on CUDA:** OmniVoice crashed at the original default of BF16. It now
+  runs, and defaults to F16, as BF16's first-step logits were 8 times further from
+  F32. `OMNIVOICE_DTYPE` overrides it.
+- **Seed mixing:** nearby values of `OMNIVOICE_SEED` now give unrelated takes.
 - **Fewer strided operations:** attention expands K and V with `broadcast_as` instead
   of `repeat`, and `RmsNorm` works at rank 2. Strided operations are slow on CUDA, as
   they upload their layout and index each element by rank. The audio is byte-identical.
-- **`VIBEVOICE_DIFFUSION_STEPS`:** overrides VibeVoice's diffusion step count. The
-  default of 20 is recommended, as lowering it saved almost no time.
+
+The branch also has VibeVoice fixes and faster depthwise convolutions, which
+audio-berry doesn't use. The `vibevoice-support` branch has those on their own, in
+case VibeVoice comes back as an option.

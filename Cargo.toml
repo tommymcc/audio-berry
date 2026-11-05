@@ -8,7 +8,8 @@ default = ["cuda"]
 cuda = ["any-tts/cuda"]
 
 [dependencies]
-any-tts = { version = "0.2", default-features = false, features = ["omnivoice", "download"] }
+# The integration branch of the fork, which has native OmniVoice voice cloning.
+any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "d92eef45315791ef67f0e896ecb776488fdc93bd", default-features = false, features = ["omnivoice", "download"] }
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
@@ -20,7 +21,3 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 scraper = "0.29.0"
 serde_json = "1"
 tokenizers = "0.22.2"
-
-# Local changes: native OmniVoice voice cloning, matched against the Python package.
-[patch.crates-io]
-any-tts = { path = "vendor/any-tts" }
