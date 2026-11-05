@@ -145,6 +145,7 @@ pub struct NarrationStore {
     out: PathBuf,
     chunks: Vec<Chunk>,
     speed: f64,
+    manifest: Manifest,
 }
 
 impl NarrationStore {
@@ -172,30 +173,35 @@ impl NarrationStore {
             }
         }
         fs::create_dir_all(out.join("chunks"))?;
-        let store = Self { out: out.to_path_buf(), chunks, speed };
-        let wanted = Manifest {
+        let manifest = Manifest {
             book: book_title.replace('\n', " "),
             voice: format!("{voice:x}"),
             precision: settings.precision.clone(),
             speed,
         };
-        store.remember(saved, &wanted)?;
+        let store = Self { out: out.to_path_buf(), chunks, speed, manifest };
+        store.require_same(saved)?;
         Ok(store)
     }
 
-    /// Saves what this folder narrates on first use, and refuses anything else later.
-    fn remember(&self, saved: Option<Manifest>, wanted: &Manifest) -> Result<(), Box<dyn Error>> {
-        let path = self.out.join(MANIFEST);
-        let saved = match saved {
-            Some(saved) => Some(saved),
-            None => self.older_manifest(wanted)?,
-        };
-        if let Some(saved) = &saved {
-            saved.require(wanted, &self.out)?;
+    /// Refuses anything other than what this folder has already rendered.
+    fn require_same(&self, saved: Option<Manifest>) -> Result<(), Box<dyn Error>> {
+        if let Some(saved) = saved {
+            return saved.require(&self.manifest, &self.out);
         }
+        if let Some(older) = self.older_manifest(&self.manifest)? {
+            older.require(&self.manifest, &self.out)?;
+            self.save_manifest()?;
+        }
+        Ok(())
+    }
+
+    /// Saves what this folder narrates, once it has audio to go with it.
+    fn save_manifest(&self) -> Result<(), Box<dyn Error>> {
+        let path = self.out.join(MANIFEST);
         if !path.exists() {
             let temporary = path.with_extension("tmp");
-            fs::write(&temporary, wanted.render())?;
+            fs::write(&temporary, self.manifest.render())?;
             fs::rename(&temporary, &path)?;
         }
         Ok(())
@@ -210,6 +216,14 @@ impl NarrationStore {
             .any(|entry| entry.path().extension().is_some_and(|extension| extension == "wav"));
         if !has_audio {
             return Ok(None);
+        }
+        if wanted.speed != NORMAL_SPEED {
+            return Err(format!(
+                "{} was rendered at normal speed, not {}. Use a new output directory.",
+                self.out.display(),
+                wanted.speed
+            )
+            .into());
         }
         if !self.chunks.iter().any(|chunk| self.has_audio(chunk)) {
             return Err(format!(
@@ -320,8 +334,30 @@ impl NarrationStore {
         complete
     }
 
+    /// Chapters with audio for some of their chunks but not all, in book order.
+    pub fn partly_rendered_chapters(&self) -> Vec<usize> {
+        let complete = self.complete_chapters();
+        let mut partly: Vec<usize> = self
+            .chunks
+            .iter()
+            .filter(|chunk| self.has_audio(chunk) && !complete.contains(&chunk.chapter))
+            .map(|chunk| chunk.chapter)
+            .collect();
+        partly.dedup();
+        partly
+    }
+
+    /// How many chapters can't be in the M4B yet, because a chunk has no audio.
+    pub fn incomplete_chapter_count(&self) -> usize {
+        let mut incomplete: Vec<usize> =
+            self.chunks.iter().filter(|chunk| !self.has_audio(chunk)).map(|chunk| chunk.chapter).collect();
+        incomplete.dedup();
+        incomplete.len()
+    }
+
     /// Saves a chunk's audio and check file, replacing the audio in one step.
     pub fn store(&self, chunk: &Chunk, audio: &AudioSamples, transcript: &str, takes: u64) -> Result<(), Box<dyn Error>> {
+        self.save_manifest()?;
         let path = self.audio_path(chunk);
         let transcript = transcript.replace(['\n', '\t'], " ");
         fs::write(path.with_extension("check"), format!("{takes}\n{transcript}"))?;
@@ -398,6 +434,46 @@ mod tests {
 
     fn tone() -> AudioSamples {
         AudioSamples::new(vec![0.1; 240], 24_000)
+    }
+
+    /// Opens a folder and stores a take, which is when it saves its settings.
+    fn render_as(dir: &TempDir, title: &str, voice: u64, precision: &str) {
+        let store = open_as(dir, title, voice, precision).unwrap();
+        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+    }
+
+    fn render_at(dir: &TempDir, speed: Option<f64>) {
+        let store = open_at(dir, speed).unwrap();
+        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+    }
+
+    #[test]
+    fn opening_a_folder_saves_nothing_until_a_take_is_stored() {
+        let dir = TempDir::new("nothing-yet");
+        open_at(&dir, None).unwrap();
+        assert!(!dir.0.join(MANIFEST).exists());
+        assert!(open_at(&dir, Some(0.9)).is_ok(), "nothing has been rendered yet");
+        render_at(&dir, Some(0.9));
+        assert!(open_at(&dir, Some(1.1)).is_err());
+    }
+
+    #[test]
+    fn speed_on_an_older_folder_is_refused_by_name() {
+        let dir = TempDir::new("older-speed-name");
+        fs::create_dir_all(dir.0.join("chunks")).unwrap();
+        fs::write(dir.0.join("chunks").join("026926e6f4d06f3e.wav"), "audio").unwrap();
+        let error = open_at(&dir, Some(0.9)).err().unwrap().to_string();
+        assert!(error.contains("at normal speed"), "{error}");
+    }
+
+    #[test]
+    fn partly_rendered_chapters_are_named_and_missing_ones_counted() {
+        let dir = TempDir::new("partial");
+        let store = open(&dir, &[&["a", "b"], &["c"], &[], &["d"], &["e"]]);
+        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+        store.store(&store.chunks()[3], &tone(), "d", 1).unwrap();
+        assert_eq!(store.partly_rendered_chapters(), [0]);
+        assert_eq!(store.incomplete_chapter_count(), 3);
     }
 
     fn open_as(dir: &TempDir, title: &str, voice: u64, precision: &str) -> Result<NarrationStore, Box<dyn Error>> {
@@ -503,7 +579,7 @@ mod tests {
     #[test]
     fn leaving_out_the_speed_uses_the_saved_one() {
         let dir = TempDir::new("speed-saved");
-        open_at(&dir, Some(0.9)).unwrap();
+        render_at(&dir, Some(0.9));
         let store = open_at(&dir, None).unwrap();
         assert_eq!(store.speed(), 0.9);
         assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "6c7ca5b9cb1c27dd.wav");
@@ -512,9 +588,9 @@ mod tests {
     #[test]
     fn a_different_speed_is_refused_by_name() {
         let dir = TempDir::new("speed-refused");
-        open_at(&dir, Some(0.9)).unwrap();
+        render_at(&dir, Some(0.9));
         let error = open_at(&dir, Some(1.1)).err().unwrap().to_string();
-        assert!(error.contains("speed"), "{error}");
+        assert!(error.contains("with speed"), "{error}");
     }
 
     #[test]
@@ -536,31 +612,31 @@ mod tests {
     #[test]
     fn a_folder_reopens_with_the_same_voice_and_settings() {
         let dir = TempDir::new("same");
-        open_as(&dir, "A Book", 1, "f16").unwrap();
+        render_as(&dir, "A Book", 1, "f16");
         assert!(open_as(&dir, "A Book", 1, "f16").is_ok());
     }
 
     #[test]
     fn a_different_voice_is_refused_by_name() {
         let dir = TempDir::new("voice");
-        open_as(&dir, "A Book", 1, "f16").unwrap();
+        render_as(&dir, "A Book", 1, "f16");
         let error = open_as(&dir, "A Book", 2, "f16").err().unwrap().to_string();
-        assert!(error.contains("voice"), "{error}");
+        assert!(error.contains("with voice"), "{error}");
         assert!(error.contains("new output directory"), "{error}");
     }
 
     #[test]
     fn a_different_precision_is_refused_by_name() {
         let dir = TempDir::new("precision");
-        open_as(&dir, "A Book", 1, "f16").unwrap();
+        render_as(&dir, "A Book", 1, "f16");
         let error = open_as(&dir, "A Book", 1, "f32").err().unwrap().to_string();
-        assert!(error.contains("precision"), "{error}");
+        assert!(error.contains("with precision"), "{error}");
     }
 
     #[test]
     fn a_different_book_is_refused_by_name() {
         let dir = TempDir::new("book");
-        open_as(&dir, "A Book", 1, "f16").unwrap();
+        render_as(&dir, "A Book", 1, "f16");
         let error = open_as(&dir, "Another Book", 1, "f16").err().unwrap().to_string();
         assert!(error.contains("Another Book"), "{error}");
     }

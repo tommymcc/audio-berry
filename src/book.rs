@@ -332,10 +332,33 @@ pub fn narrate(
     Ok(())
 }
 
+/// The `book` command that rebuilds the M4B without rendering anything new, or
+/// `None` if no chapter is complete. Naming only complete chapters is what stops
+/// it rendering whatever else is missing.
+fn rebuild_command(voice: &Path, epub: &Path, out: &Path, complete: &[usize], missing: usize) -> Option<String> {
+    if complete.is_empty() {
+        return None;
+    }
+    let mut command = format!("audio-berry book {} {} {}", voice.display(), epub.display(), out.display());
+    if missing > 0 {
+        for chapter in complete {
+            write!(command, " {}", chapter + 1).ok()?;
+        }
+    }
+    Some(command)
+}
+
 fn print_missing(store: &NarrationStore) {
     let missing = store.missing_count();
     if missing > 0 {
-        println!("{missing} chunks in this book have no audio; `book` records them");
+        println!(
+            "{missing} chunks in {} chapters have no audio, so those chapters aren't in the M4B",
+            store.incomplete_chapter_count()
+        );
+    }
+    let partly: Vec<String> = store.partly_rendered_chapters().iter().map(|chapter| (chapter + 1).to_string()).collect();
+    if !partly.is_empty() {
+        println!("Only partly rendered: chapter {}", partly.join(", "));
     }
 }
 
@@ -422,6 +445,33 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
     let flagged = write_report(&book, &store, out)?;
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
     print_missing(&store);
-    println!("Run `book` with the same arguments to rebuild the M4B.");
+    match rebuild_command(voice, epub, out, &store.complete_chapters(), store.missing_count()) {
+        Some(command) => println!("To rebuild the M4B and chapter WAVs, run:\n  {command}"),
+        None => println!("No chapter is complete yet, so there's no M4B to rebuild."),
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(complete: &[usize], missing: usize) -> Option<String> {
+        rebuild_command(Path::new("v.wav"), Path::new("b.epub"), Path::new("out"), complete, missing)
+    }
+
+    #[test]
+    fn a_partly_rendered_folder_rebuilds_by_naming_complete_chapters() {
+        assert_eq!(command(&[2, 3], 40).unwrap(), "audio-berry book v.wav b.epub out 3 4");
+    }
+
+    #[test]
+    fn a_finished_book_rebuilds_without_naming_chapters() {
+        assert_eq!(command(&[0, 1], 0).unwrap(), "audio-berry book v.wav b.epub out");
+    }
+
+    #[test]
+    fn nothing_rebuilds_with_no_complete_chapter() {
+        assert_eq!(command(&[], 40), None);
+    }
 }

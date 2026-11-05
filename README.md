@@ -108,8 +108,12 @@ cached in `chunks/`, so rerunning the same command resumes an interrupted book.
 
 The M4B and `report.tsv` cover every chapter rendered in that output directory so
 far, so rendering chapter 3 and then chapter 4 builds up one audiobook. The M4B
-holds only complete chapters, and the command prints how many chunks in the book
-have no audio.
+holds only complete chapters, and the command prints how many chunks and chapters
+have no audio. For one chapter on its own, use its WAV in `chapters/`.
+
+`book` with no chapter numbers renders everything still missing, which in a
+partly rendered directory can take a long time. To rebuild without rendering,
+name chapters that are already complete.
 
 ## Speed
 
@@ -124,7 +128,7 @@ faster. Actual lengths won't change by exactly that factor, so judge it by ear:
 ## One output directory, one narration
 
 An output directory holds one book in one voice, with one speed and model
-precision (`OMNIVOICE_DTYPE`). It saves them in `narration.txt` on first use, and
+precision (`OMNIVOICE_DTYPE`). It saves them in `narration.txt` with its first take, and
 later runs reuse the saved speed, so you don't have to repeat `--speed`. A run
 with a different book, voice, speed or precision stops with an error rather than
 rendering everything again, so use a new directory for those. Correcting a voice's
@@ -136,16 +140,16 @@ least one of their chunks matches. If none match, the run stops with an error.
 
 Chunks are numbered by chapter and position, so `3.12` is the twelfth chunk of
 chapter 3. To fix a slip you hear, give `retake` words from the book, or a chunk
-number from `report.tsv`, then rerun `book` to rebuild the M4B:
+number from `report.tsv`. It leaves the M4B and chapter WAVs as they were, and ends
+by printing the `book` command that rebuilds them:
 
 ```sh
 ./target/release/audio-berry retake voices/me.wav book.epub output/book "took a watch out"
-./target/release/audio-berry book voices/me.wav book.epub output/book
 ```
 
 `retake` tries up to 6 new seeds per chunk. It keeps a new take only if it beats
 the current one and, given words, if those words are heard. Replaced audio moves
-to `replaced/`, and the M4B is left alone. A short phrase can match several chunks,
+to `replaced/`. A short phrase can match several chunks,
 and each one gets new takes. `retake` only records what you name: words only match
 chunks that already have audio, and a chunk with no audio has to be named by number.
 Only `book` fills gaps. Chunks with identical text share one audio file, so a retake

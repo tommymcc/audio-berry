@@ -107,7 +107,7 @@ pub fn load_narrator() -> Result<Box<dyn TtsModel>, Box<dyn Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     let (args, speed) = take_speed(std::env::args().skip(1).collect())?;
     if speed.is_some() && !matches!(args.first().map(String::as_str), Some("speak" | "book")) {
-        return Err("--speed only works with speak and book; retake uses the speed the folder saved".into());
+        return Err("--speed only works with speak and book; retake uses the speed saved in the output directory".into());
     }
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["speak", voice, text, output] => speak(voice, text, output, speed),
