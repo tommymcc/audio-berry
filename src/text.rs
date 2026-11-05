@@ -275,10 +275,11 @@ fn split_long(sentence: &str, max: usize) -> Vec<String> {
             .nth(max)
             .map_or(rest.len(), |(index, _)| index);
         let head = &rest[..limit];
+        let in_second_half = |index: &usize| *index > limit / 2;
         let cut = head
             .rfind(|c| ";:".contains(c))
-            .or_else(|| head.rfind(','))
-            .filter(|&index| index > limit / 2)
+            .filter(in_second_half)
+            .or_else(|| head.rfind(',').filter(in_second_half))
             .map(|index| index + 1)
             .or_else(|| head.rfind(' '))
             .unwrap_or(limit);
@@ -347,6 +348,13 @@ mod tests {
             text: text.to_string(),
             heading: true,
         }
+    }
+
+    #[test]
+    fn long_sentences_fall_back_to_a_comma_after_an_early_semicolon() {
+        let sentence = format!("Early clause; {} late clause, and some more words here", "word ".repeat(10));
+        let parts = split_long(&sentence, 90);
+        assert!(parts[0].ends_with("late clause,"), "{parts:?}");
     }
 
     #[test]
