@@ -32,6 +32,12 @@ the CPU. On the RTX 3070, F32 peaked at 4379 MiB against 3203 MiB for F16 on the
 chapter, so expect to need more memory than the figures below. The Mac's own figure
 hasn't been measured. Audio from a Mac won't be byte-identical to audio from CUDA.
 
+To build, narrate a short test and collect the results in one report:
+
+```sh
+scripts/metal_check.sh voices/me.wav
+```
+
 ## Adding a voice
 
 Only clone your own voice, or the voice of someone who has agreed to it.
