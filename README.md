@@ -6,31 +6,81 @@ result on a Cast speaker. Speech runs on OmniVoice through a fork of
 downloading the models once (about 3.3 GB for speech, plus the Whisper models
 for checking) and talking to speakers on your LAN.
 
+## Make an audiobook
+
+You need a DRM-free EPUB, a recording of the voice you want, and either an NVIDIA GPU
+or an Apple Silicon Mac. Only clone your own voice, or the voice of someone who has
+agreed to it. To try it on a free book, download
+[Alice's Adventures in Wonderland](https://www.gutenberg.org/ebooks/11.epub3.images)
+from Project Gutenberg.
+
+1. **Build it.** Install Rust 1.85+ and `ffmpeg`, then run one of these in this
+   folder:
+
+   ```sh
+   cargo build --release                                         # NVIDIA GPU
+   cargo build --release --no-default-features --features metal  # Apple Silicon Mac
+   ```
+
+2. **Cut 10 seconds of the voice.** Choose a stretch with one person speaking and
+   no music. This takes 10 seconds starting 3 minutes into `recording.mp3`:
+
+   ```sh
+   mkdir -p voices
+   ffmpeg -ss 180 -t 10 -i recording.mp3 -ac 1 -ar 24000 voices/me.wav
+   ```
+
+3. **Test the voice.** The first run downloads the models (about 6.3 GB) and
+   writes down what's said in the sample as `voices/me.txt`. Correct any wrong
+   words in that file, then listen to `output/test.wav`:
+
+   ```sh
+   mkdir -p output
+   ./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav
+   ```
+
+4. **List the chapters:**
+
+   ```sh
+   ./target/release/audio-berry chapters book.epub
+   ```
+
+5. **Narrate the book.** This narrates every chapter. To narrate only some, add
+   their numbers from the list, such as `2 3 4`. If it stops, run the same command
+   again and it carries on where it left off.
+
+   ```sh
+   ./target/release/audio-berry book voices/me.wav book.epub output/my-book
+   ```
+
+6. **Listen.** The audiobook is the `.m4b` file in `output/my-book`, with chapter
+   markers, ready for any audiobook player. The text is narrated in chunks of a few
+   sentences, and each chunk is checked as it's made. Any chunk that still fails
+   after 5 takes is marked `CHECK` in `output/my-book/report.tsv`.
+   [Narrating a book](#narrating-a-book) explains the checks and how to fix a chunk
+   with `retake`.
+
+On an RTX 3070 Laptop GPU, narration takes about half as long as the audio it makes.
+On the one Apple Silicon Mac tested, a short chapter took about 4 times as long. For Alice, name
+chapters 1 to 13, since chapter 14 is Project Gutenberg's license.
+
 ## Requirements
 
 - Rust 1.85+ and `ffmpeg`
 - An NVIDIA GPU, with `nvidia-smi` working. A 25-second clip peaked at about
   2.9 GB of VRAM on an 8 GB card. The CUDA build fails without a GPU. Build with
   `--no-default-features` for CPU only, which hasn't been tested with OmniVoice.
+- Or an Apple Silicon Mac, built with `--no-default-features --features metal`.
 
-```sh
-cargo build --release
-```
+### Apple Silicon
 
-### Apple Silicon (untested)
+Metal has been tested on one Mac with 32 GB of memory, narrating 62 seconds of
+audio from Alice. All 7 chunks passed their checks on the first take, and it took
+230 s including loading the model. Its peak memory footprint was 7.4 GB. A full
+chapter, retrying a failed take, `retake` and `play` haven't been tried on a Mac.
 
-Metal support compiles but hasn't been run on a Mac yet, so it may fail or sound
-wrong. Install `ffmpeg` and Rust, then build without the default CUDA feature:
-
-```sh
-cargo build --release --no-default-features --features metal
-```
-
-The first line of output after loading says which device it's using, which should be
-`metal:0`. On Metal the model runs at F32, with the audio decoder and voice encoder on
-the CPU. On the RTX 3070, F32 peaked at 4379 MiB against 3203 MiB for F16 on the same
-chapter, so expect to need more memory than the figures below. The Mac's own figure
-hasn't been measured. Audio from a Mac won't be byte-identical to audio from CUDA.
+The `Model loaded` line says which device it's using, which should be `metal:0`. On Metal the model runs at F32, with the audio decoder and voice encoder on
+the CPU. Audio from a Mac won't be byte-identical to audio from CUDA.
 
 To build, narrate a short test and collect the results in one report:
 
@@ -112,10 +162,7 @@ length the speaker reports plus a minute. Leave `play` running until playback en
 Chapter numbers come from `chapters`. Add them to `book` to narrate only those.
 The book must be DRM-free, and each spine document becomes one chapter.
 
-To try it on a free book, download
-[Alice's Adventures in Wonderland](https://www.gutenberg.org/ebooks/11.epub3.images)
-from Project Gutenberg. Its last chapter is Project Gutenberg's license, so name
-chapters 1 to 13 if you don't want that narrated. This isn't the edition used in the
+The Project Gutenberg copy of Alice linked above isn't the edition used in the
 benchmarks below, which splits chapter 3 into 30 chunks rather than 29.
 
 The model sometimes adds background noise, skips words, runs on or says fluent
