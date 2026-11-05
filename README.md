@@ -161,6 +161,40 @@ the text as it was sent to the model in `text/`, and its saved settings in
 
 `GLOSSARY.md` defines the terms used here.
 
+## Benchmarks
+
+Narrating chapter 3 of `aliceDynamic.epub` (30 chunks, 536.8 s of audio) in a new
+output directory, on an RTX 3070 Laptop GPU and a Ryzen 9 5900HS. Each build ran 3
+times, taking turns. The times cover the whole command, including loading the model,
+checking every take with Whisper and building the M4B.
+
+| Build | Median | Range | Realtime |
+|---|---|---|---|
+| Before | 302.9 s | 302.7-303.1 s | 1.77x |
+| Now | 282.8 s | 282.7-283.9 s | 1.90x |
+
+That's 6.6% faster. All 30 chunks are byte-identical to the takes from before, in
+every run, so the audio is unchanged. Every chunk passed on its first take, so a
+chapter that needs retakes will take longer. Peak GPU memory stayed at 3.2 GB.
+
+To repeat it:
+
+```sh
+time ./target/release/audio-berry book output/tommy2_ref.wav aliceDynamic.epub <new-dir> 3
+```
+
+On the slower build, a run with timers spent 255 s of its 312 s in the model's forward
+passes, 21 s in the audio decoder and 16 s in Whisper.
+
+Tried and not kept:
+
+- **Fat LTO:** no faster, and the build took over 3 minutes.
+- **One matmul per KV head, with no K and V copies:** 286 s when used alone, but
+  rounding changed enough to give different takes on 4 of the 30 chunks.
+- **RoPE by index selection, and output logits for target frames only:** no faster.
+- **Rank 3 for the attention output's reshape:** 0.05 s faster on a 15 s clip, not
+  worth a separate path.
+
 ## The patched any-tts
 
 `vendor/any-tts` is `any-tts` 0.2.0 with these changes:
@@ -181,5 +215,8 @@ the text as it was sent to the model in `text/`, and its saved settings in
   makes one convolution call per channel, which made audio feedback take about
   1 s per frame. This took generation from 0.12x to about 1.48x realtime on an
   RTX 3070 Mobile.
+- **Fewer strided operations:** attention expands K and V with `broadcast_as` instead
+  of `repeat`, and `RmsNorm` works at rank 2. Strided operations are slow on CUDA, as
+  they upload their layout and index each element by rank. The audio is byte-identical.
 - **`VIBEVOICE_DIFFUSION_STEPS`:** overrides VibeVoice's diffusion step count. The
   default of 20 is recommended, as lowering it saved almost no time.
