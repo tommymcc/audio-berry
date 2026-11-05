@@ -66,9 +66,9 @@ OMNIVOICE_SEED=2 ./target/release/audio-berry speak voices/me.wav "Twinkle, twin
 ## Commands
 
 ```text
-audio-berry speak <voice-sample> <text> <output.wav>
+audio-berry speak <voice-sample> <text> <output.wav> [--speed <factor>]
 audio-berry chapters <book.epub>
-audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers]
+audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers] [--speed <factor>]
 audio-berry retake <voice-sample> <book.epub> <output-dir> <words or chunk number>...
 audio-berry speakers
 audio-berry play <speaker> <file>...
@@ -103,8 +103,37 @@ If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
 cached in `chunks/`, so rerunning the same command resumes an interrupted book.
 
-To fix a slip you hear, give `retake` words from the book, or a chunk number from
-`report.tsv`, then rerun `book` to rebuild the M4B:
+The M4B and `report.tsv` cover every chapter rendered in that output directory so
+far, so rendering chapter 3 and then chapter 4 builds up one audiobook. The M4B
+holds only complete chapters, and the command prints how many chunks in the book
+have no audio.
+
+## Speed
+
+`--speed` sets the speaking speed from 0.5 to 2.0, where 0.8 is slower and 1.25 is
+faster. Actual lengths won't change by exactly that factor, so judge it by ear:
+
+```sh
+./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav --speed 0.9
+./target/release/audio-berry book voices/me.wav book.epub output/book-slow --speed 0.9
+```
+
+## One output directory, one narration
+
+An output directory holds one book in one voice, with one speed and model
+precision (`OMNIVOICE_DTYPE`). It saves them in `narration.txt` on first use, and
+later runs reuse the saved speed, so you don't have to repeat `--speed`. A run
+with a different book, voice, speed or precision stops with an error rather than
+rendering everything again, so use a new directory for those. Correcting a voice's
+`.txt` file counts as a different voice.
+
+Directories made before this was added have no `narration.txt`. They're treated as
+normal speed and default precision, and they adopt the voice you give them if at
+least one of their chunks matches. If none match, the run stops with an error.
+
+Chunks are numbered by chapter and position, so `3.12` is the twelfth chunk of
+chapter 3. To fix a slip you hear, give `retake` words from the book, or a chunk
+number from `report.tsv`, then rerun `book` to rebuild the M4B:
 
 ```sh
 ./target/release/audio-berry retake voices/me.wav book.epub output/book "took a watch out"
@@ -113,12 +142,17 @@ To fix a slip you hear, give `retake` words from the book, or a chunk number fro
 
 `retake` tries up to 6 new seeds per chunk. It keeps a new take only if it beats
 the current one and, given words, if those words are heard. Replaced audio moves
-to `replaced/`. It also records any chunk with no audio, such as one whose text
-has changed, and it leaves the M4B alone. A short phrase can match several chunks,
-and each one gets new takes.
+to `replaced/`, and the M4B is left alone. A short phrase can match several chunks,
+and each one gets new takes. `retake` only records what you name: words only match
+chunks that already have audio, and a chunk with no audio has to be named by number.
+Only `book` fills gaps. Chunks with identical text share one audio file, so a retake
+changes all of them, and it prints each chunk number affected.
 
 The output directory holds a chaptered `.m4b`, one WAV per chapter in `chapters/`,
-and the text as it was sent to the model in `text/`.
+the text as it was sent to the model in `text/`, and its saved settings in
+`narration.txt`.
+
+`GLOSSARY.md` defines the terms used here.
 
 ## The patched any-tts
 
@@ -130,6 +164,8 @@ and the text as it was sent to the model in `text/`.
   it picks the same tokens as Python given the same inputs and no random position
   choice. `scripts/omnivoice_parity.py` and the ignored `matches_python_oracle`
   test repeat that comparison.
+- **Speaking speed:** `request.speed` divides the estimated audio length, as the
+  Python package does. The original crate rejected it.
 - **F16 by default:** OmniVoice defaults to F16 on CUDA, as BF16's first-step
   logits were 8 times further from F32. `OMNIVOICE_DTYPE` overrides it.
 - **BF16 on CUDA:** VibeVoice crashed on dtype mismatches, because several
