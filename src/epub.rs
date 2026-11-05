@@ -23,7 +23,20 @@ pub struct Chapter {
 pub struct Book {
     pub title: String,
     pub author: Option<String>,
+    /// A JPEG or PNG, the formats both M4B players and Cast displays show.
+    pub cover: Option<Vec<u8>>,
     pub chapters: Vec<Chapter>,
+}
+
+/// The MIME type and file extension of a JPEG or PNG, judged by its first bytes.
+pub fn image_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(("image/jpeg", "jpg"))
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(("image/png", "png"))
+    } else {
+        None
+    }
 }
 
 /// Inlines entities declared in the DOCTYPE and removes it. HTML parsers don't
@@ -178,6 +191,10 @@ pub fn read_book(path: &Path) -> Result<Book, Box<dyn Error>> {
         .mdata("creator")
         .map(|item| item.value.clone())
         .or_else(|| dublin_core(&package, "creator"));
+    let cover = doc
+        .get_cover()
+        .map(|(bytes, _)| bytes)
+        .filter(|bytes| image_type(bytes).is_some());
     let mut toc = Vec::new();
     flatten(&doc.toc, &mut toc);
 
@@ -222,6 +239,7 @@ pub fn read_book(path: &Path) -> Result<Book, Box<dyn Error>> {
     Ok(Book {
         title,
         author,
+        cover,
         chapters,
     })
 }

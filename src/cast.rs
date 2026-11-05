@@ -1,5 +1,8 @@
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use rust_cast::channels::media::{IdleReason, Media, MediaResponse, PlayerState, StreamType};
+use crate::epub::image_type;
+use rust_cast::channels::media::{
+    IdleReason, Image, Media, MediaResponse, Metadata, MusicTrackMediaMetadata, PlayerState, StreamType,
+};
 use rust_cast::channels::connection::ConnectionResponse;
 use rust_cast::channels::heartbeat::HeartbeatResponse;
 use rust_cast::channels::receiver::{CastDeviceApp, ReceiverResponse};
@@ -7,7 +10,9 @@ use rust_cast::{CastDevice, ChannelMessage};
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,6 +103,105 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
+/// What a display shows while a file plays.
+#[derive(Debug, Default, PartialEq)]
+struct Track {
+    title: String,
+    artist: Option<String>,
+    album: Option<String>,
+    number: Option<u32>,
+    cover: Option<Vec<u8>>,
+}
+
+/// Turns a name like `03-The_Pool` into track 3, "The Pool".
+fn track_from_name(path: &Path) -> Track {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let (number, rest) = match stem.split_once('-') {
+        Some((digits, rest)) if !rest.is_empty() => match digits.parse::<u32>() {
+            Ok(number) => (Some(number), rest),
+            Err(_) => (None, stem.as_ref()),
+        },
+        _ => (None, stem.as_ref()),
+    };
+    let title = rest.replace('_', " ").trim().to_string();
+    Track { title, number, ..Track::default() }
+}
+
+/// Reads a file's title, artist and album tags, if ffprobe can.
+fn read_tags(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format_tags", "-of", "json"])
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    json.get("format")?.get("tags")?.as_object().cloned()
+}
+
+/// A picture inside the file, such as an M4B's cover, or else a `cover.jpg` or
+/// `cover.png` beside it or one folder up, where `book` saves one.
+fn find_cover(path: &Path) -> Option<Vec<u8>> {
+    let embedded = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-c", "copy", "-frames:v", "1", "-f", "image2pipe", "-"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout);
+    let folder = path.parent()?;
+    let beside = [folder, folder.parent().unwrap_or(folder)]
+        .into_iter()
+        .flat_map(|dir| ["cover.jpg", "cover.png"].map(|name| dir.join(name)))
+        .filter_map(|cover| std::fs::read(cover).ok());
+    embedded.into_iter().chain(beside).find(|bytes| image_type(bytes).is_some())
+}
+
+/// Describes a file from its tags, falling back on its name. Missing details only
+/// leave the display emptier, so they never stop playback.
+fn describe(path: &Path) -> Track {
+    let mut track = track_from_name(path);
+    let tags = read_tags(path).unwrap_or_default();
+    let tag = |name: &str| {
+        tags.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .and_then(|(_, value)| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+    };
+    if let Some(title) = tag("title") {
+        track.title = title;
+    }
+    track.artist = tag("artist");
+    track.album = tag("album");
+    track.cover = find_cover(path);
+    track
+}
+
+/// Something the speaker can fetch: an audio file, or a cover held in memory.
+enum Resource {
+    File(PathBuf),
+    Image(Vec<u8>),
+}
+
+impl Resource {
+    fn content_type(&self) -> &'static str {
+        match self {
+            Resource::File(path) => content_type(path),
+            Resource::Image(bytes) => image_type(bytes).map_or("application/octet-stream", |(mime, _)| mime),
+        }
+    }
+
+    fn body(&self) -> std::io::Result<Cow<'_, [u8]>> {
+        match self {
+            Resource::File(path) => std::fs::read(path).map(Cow::Owned),
+            Resource::Image(bytes) => Ok(Cow::Borrowed(bytes)),
+        }
+    }
+}
+
 /// Reads `bytes=start-end` into the inclusive range to send, if it's satisfiable.
 fn parse_range(header: &str, size: usize) -> Option<(usize, usize)> {
     let (start, end) = header.trim().strip_prefix("bytes=")?.split_once('-')?;
@@ -111,9 +215,9 @@ fn parse_range(header: &str, size: usize) -> Option<(usize, usize)> {
     (start <= end).then_some((start, end))
 }
 
-/// Answers each `GET /<index>` with that file, so nothing else can be fetched.
+/// Answers each `GET /<index>` with that resource, so nothing else can be fetched.
 /// Honours byte ranges, which speakers use to seek within a file.
-fn handle_request(mut stream: TcpStream, files: &[PathBuf]) -> std::io::Result<()> {
+fn handle_request(mut stream: TcpStream, files: &[Resource]) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -140,7 +244,7 @@ fn handle_request(mut stream: TcpStream, files: &[PathBuf]) -> std::io::Result<(
     let Some(file) = file else {
         return stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     };
-    let body = std::fs::read(file)?;
+    let body = file.body()?;
     let size = body.len();
     let (status, extra, sent) = match range {
         Some(range) => match parse_range(&range, size) {
@@ -161,7 +265,7 @@ fn handle_request(mut stream: TcpStream, files: &[PathBuf]) -> std::io::Result<(
     write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n{extra}Connection: close\r\n\r\n",
-        content_type(file),
+        file.content_type(),
         sent.len()
     )?;
     if method == "GET" {
@@ -171,7 +275,7 @@ fn handle_request(mut stream: TcpStream, files: &[PathBuf]) -> std::io::Result<(
 }
 
 /// Serves `files` on a temporary port for as long as the process runs.
-fn serve(speaker: &Speaker, files: Vec<PathBuf>) -> Result<String, Box<dyn Error>> {
+fn serve(speaker: &Speaker, files: Vec<Resource>) -> Result<String, Box<dyn Error>> {
     // The address the speaker can reach us on is whichever routes towards it.
     let probe = UdpSocket::bind("0.0.0.0:0")?;
     probe.connect((speaker.ip, speaker.port))?;
@@ -196,7 +300,27 @@ fn serve(speaker: &Speaker, files: Vec<PathBuf>) -> Result<String, Box<dyn Error
 pub fn play(speaker: &Speaker, files: Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
     // Dependencies enable two TLS backends, so rustls needs telling which to use.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let base = serve(speaker, files.clone())?;
+    // Covers are served after the audio, each picture once.
+    let tracks: Vec<Track> = files.iter().map(|file| describe(file)).collect();
+    let mut covers: Vec<&[u8]> = Vec::new();
+    let cover_index: Vec<Option<usize>> = tracks
+        .iter()
+        .map(|track| {
+            let cover = track.cover.as_deref()?;
+            let position = covers.iter().position(|seen| *seen == cover).unwrap_or_else(|| {
+                covers.push(cover);
+                covers.len() - 1
+            });
+            Some(files.len() + position)
+        })
+        .collect();
+    let resources = files
+        .iter()
+        .cloned()
+        .map(Resource::File)
+        .chain(covers.iter().map(|cover| Resource::Image(cover.to_vec())))
+        .collect();
+    let base = serve(speaker, resources)?;
     let device =
         CastDevice::connect_without_host_verification(speaker.ip.to_string(), speaker.port)?;
     device.connection.connect(RECEIVER)?;
@@ -205,12 +329,23 @@ pub fn play(speaker: &Speaker, files: Vec<PathBuf>) -> Result<(), Box<dyn Error>
     device.connection.connect(app.transport_id.as_str())?;
 
     let outcome = files.iter().enumerate().try_for_each(|(index, file)| {
-        println!("Playing {} on {}", file.display(), speaker.name);
+        let track = &tracks[index];
+        println!("Playing {} ({}) on {}", track.title, file.display(), speaker.name);
         let media = Media {
             content_id: format!("{base}/{index}"),
             stream_type: StreamType::Buffered,
             content_type: content_type(file).to_string(),
-            metadata: None,
+            metadata: Some(Metadata::MusicTrack(MusicTrackMediaMetadata {
+                title: Some(track.title.clone()),
+                artist: track.artist.clone(),
+                album_name: track.album.clone(),
+                track_number: track.number,
+                images: cover_index[index]
+                    .map(|cover| Image::new(format!("{base}/{cover}")))
+                    .into_iter()
+                    .collect(),
+                ..MusicTrackMediaMetadata::default()
+            })),
             duration: None,
         };
         device
@@ -354,6 +489,16 @@ mod tests {
         clock.observe(after(start, 5 * 60), false, None);
         assert!(!clock.timed_out(after(start, 5 * 60 + 5)));
         assert!(clock.timed_out(after(start, 5 * 60 + 7)));
+    }
+
+    #[test]
+    fn a_chapter_file_name_gives_its_number_and_title() {
+        let track = track_from_name(Path::new("out/chapters/03-The_Pool_of_Tears.wav"));
+        assert_eq!(track.number, Some(3));
+        assert_eq!(track.title, "The Pool of Tears");
+        let track = track_from_name(Path::new("Alice-in-Wonderland.m4b"));
+        assert_eq!(track.number, None);
+        assert_eq!(track.title, "Alice-in-Wonderland");
     }
 
     #[test]

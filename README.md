@@ -147,7 +147,13 @@ audio-berry play <speaker> <file>...
 
 `play` matches part of a speaker's name, ignoring case, and needs exactly one
 match. It interrupts whatever the speaker is playing. While playing, it serves
-only the requested files to your LAN on a temporary port.
+only the requested files and their covers to your LAN on a temporary port.
+
+Speakers with a screen show each file's title, author, book and cover. `play`
+reads these from the file's tags. `book` writes them into the M4B and each chapter
+WAV, and saves the EPUB's cover as `cover.jpg` or `cover.png` in the output
+folder. The M4B holds its cover. For a WAV, `play` looks for a cover in the WAV's
+folder and the folder above. A file with no tags shows its file name.
 
 Pausing on the speaker doesn't count towards `play`'s time limit, which is the
 length the speaker reports plus a minute. Leave `play` running until playback ends.
