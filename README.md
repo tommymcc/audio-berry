@@ -17,6 +17,21 @@ for checking) and talking to speakers on your LAN.
 cargo build --release
 ```
 
+### Apple Silicon (untested)
+
+Metal support compiles but hasn't been run on a Mac yet, so it may fail or sound
+wrong. Install `ffmpeg` and Rust, then build without the default CUDA feature:
+
+```sh
+cargo build --release --no-default-features --features metal
+```
+
+The first line of output after loading says which device it's using, which should be
+`metal:0`. On Metal the model runs at F32, with the audio decoder and voice encoder on
+the CPU. On the RTX 3070, F32 peaked at 4379 MiB against 3203 MiB for F16 on the same
+chapter, so expect to need more memory than the figures below. The Mac's own figure
+hasn't been measured. Audio from a Mac won't be byte-identical to audio from CUDA.
+
 ## Adding a voice
 
 Only clone your own voice, or the voice of someone who has agreed to it.

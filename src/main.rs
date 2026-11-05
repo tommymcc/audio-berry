@@ -7,7 +7,7 @@ mod text;
 mod transcribe;
 
 use transcribe::{Transcriber, VOICE_TRANSCRIPTION_MODEL};
-use any_tts::models::omnivoice::trim_long_audio;
+use any_tts::models::omnivoice::{preferred_runtime_choice, trim_long_audio};
 use any_tts::{ModelType, ReferenceAudio, SynthesisRequest, TtsConfig, TtsModel, load_model};
 use any_tts::AudioSamples;
 use std::error::Error;
@@ -100,7 +100,7 @@ const USAGE: &str = "usage:
 pub fn load_narrator() -> Result<Box<dyn TtsModel>, Box<dyn Error>> {
     let started = Instant::now();
     let model = load_model(TtsConfig::new(ModelType::OmniVoice).with_preferred_runtime())?;
-    println!("Model loaded in {:.0}s", started.elapsed().as_secs_f32());
+    println!("Model loaded in {:.0}s on {}", started.elapsed().as_secs_f32(), preferred_runtime_choice().device.label());
     Ok(model)
 }
 

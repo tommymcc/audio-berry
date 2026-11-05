@@ -2,7 +2,8 @@
 //! of render settings. Owns chunk numbering, the cache key and the files.
 
 use crate::transcribe::contains_phrase;
-use any_tts::AudioSamples;
+use any_tts::{AudioSamples, DeviceSelection};
+use any_tts::models::omnivoice::{OmniVoiceRuntimeChoice, preferred_runtime_choice};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
@@ -31,13 +32,18 @@ pub struct RenderSettings {
 impl RenderSettings {
     pub fn from_env(speed: Option<f64>) -> Self {
         let dtype = std::env::var("OMNIVOICE_DTYPE").ok();
-        Self { speed, ..Self::from_dtype(dtype.as_deref()) }
+        Self { speed, ..Self::from_dtype(dtype.as_deref(), preferred_runtime_choice()) }
     }
 
-    /// Mirrors the model, which ignores values it doesn't recognise.
-    fn from_dtype(value: Option<&str>) -> Self {
+    /// Mirrors the model, which ignores values it doesn't recognise and can't run
+    /// BF16 on the CPU or Metal.
+    fn from_dtype(value: Option<&str>, runtime: OmniVoiceRuntimeChoice) -> Self {
         let value = value.unwrap_or_default().trim().to_ascii_lowercase();
-        let precision = if matches!(value.as_str(), "f32" | "bf16") { value } else { DEFAULT_PRECISION.into() };
+        let precision = match (value.as_str(), runtime.device) {
+            ("bf16", DeviceSelection::Cpu | DeviceSelection::Metal(_)) => "f32".into(),
+            ("f32" | "f16" | "bf16", _) => value,
+            _ => runtime.dtype_label().into(),
+        };
         Self { precision, speed: None }
     }
 }
@@ -400,6 +406,7 @@ impl NarrationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use any_tts::config::DType;
     use std::fs;
 
     /// A directory that's removed when the test ends.
@@ -418,6 +425,10 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn runtime(device: DeviceSelection, dtype: DType) -> OmniVoiceRuntimeChoice {
+        OmniVoiceRuntimeChoice { device, dtype }
     }
 
     fn settings() -> RenderSettings {
@@ -675,9 +686,22 @@ mod tests {
 
     #[test]
     fn precision_comes_from_the_environment_value_or_defaults() {
-        assert_eq!(RenderSettings::from_dtype(None).precision, "f16");
-        assert_eq!(RenderSettings::from_dtype(Some(" BF16 ")).precision, "bf16");
-        assert_eq!(RenderSettings::from_dtype(Some("nonsense")).precision, "f16");
+        let cuda = runtime(DeviceSelection::Cuda(0), DType::F16);
+        assert_eq!(RenderSettings::from_dtype(None, cuda).precision, "f16");
+        assert_eq!(RenderSettings::from_dtype(Some(" BF16 "), cuda).precision, "bf16");
+        assert_eq!(RenderSettings::from_dtype(Some("nonsense"), cuda).precision, "f16");
+    }
+
+    /// The expected values are the rules in OmniVoiceModel::load.
+    #[test]
+    fn precision_is_what_the_model_runs_on_metal_and_cpu() {
+        for device in [DeviceSelection::Metal(0), DeviceSelection::Cpu] {
+            let choice = runtime(device, DType::F32);
+            assert_eq!(RenderSettings::from_dtype(None, choice).precision, "f32");
+            assert_eq!(RenderSettings::from_dtype(Some("f16"), choice).precision, "f16");
+            assert_eq!(RenderSettings::from_dtype(Some("bf16"), choice).precision, "f32");
+            assert_eq!(RenderSettings::from_dtype(Some("nonsense"), choice).precision, "f32");
+        }
     }
 
     #[test]

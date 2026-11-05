@@ -7,6 +7,7 @@ license = "MIT"
 [features]
 default = ["cuda"]
 cuda = ["any-tts/cuda"]
+metal = ["any-tts/metal"]
 
 [dependencies]
 # The integration branch of the fork, which has native OmniVoice voice cloning.
