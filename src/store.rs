@@ -1,0 +1,601 @@
+//! An output directory: one narration of one book, in one voice, with one set
+//! of render settings. Owns chunk numbering, the cache key and the files.
+
+use crate::transcribe::contains_phrase;
+use any_tts::AudioSamples;
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+
+const CACHE_VERSION: &str = "3";
+const DEFAULT_PRECISION: &str = "f16";
+const MANIFEST: &str = "narration.txt";
+
+pub fn fnv(bytes: &[u8], seed: u64) -> u64 {
+    bytes.iter().fold(seed ^ 0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Settings that change a chunk's audio.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderSettings {
+    pub precision: String,
+}
+
+impl RenderSettings {
+    pub fn from_env() -> Self {
+        Self::from_dtype(std::env::var("OMNIVOICE_DTYPE").ok().as_deref())
+    }
+
+    /// Mirrors the model, which ignores values it doesn't recognise.
+    fn from_dtype(value: Option<&str>) -> Self {
+        let value = value.unwrap_or_default().trim().to_ascii_lowercase();
+        let precision = if matches!(value.as_str(), "f32" | "bf16") { value } else { DEFAULT_PRECISION.into() };
+        Self { precision }
+    }
+}
+
+/// A piece of a chapter's text, narrated as one piece of audio.
+pub struct Chunk {
+    /// Zero-based position of the chapter in the book.
+    pub chapter: usize,
+    position: usize,
+    pub text: String,
+    hash: String,
+}
+
+impl Chunk {
+    /// The chapter number and position in the chapter, such as `3.12`.
+    pub fn number(&self) -> String {
+        format!("{}.{}", self.chapter + 1, self.position + 1)
+    }
+}
+
+/// What's known about a stored take without loading its audio.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Check {
+    /// Seeds tried so far, so the next retake tries new ones.
+    pub takes: u64,
+    pub transcript: String,
+}
+
+/// Reads a chunk number such as `3.12` as its chapter and position.
+fn parse_number(target: &str) -> Option<(usize, usize)> {
+    let (chapter, position) = target.split_once('.')?;
+    Some((chapter.parse().ok()?, position.parse().ok()?))
+}
+
+/// A chunk that a retake should record.
+pub struct Selected<'a> {
+    pub chunk: &'a Chunk,
+    /// Words that must be heard in a new take.
+    pub phrases: Vec<String>,
+    /// Every chunk number that shares this audio.
+    pub numbers: Vec<String>,
+}
+
+/// What a folder narrates, saved on first use.
+#[derive(Clone)]
+struct Manifest {
+    book: String,
+    voice: String,
+    precision: String,
+}
+
+impl Manifest {
+    fn render(&self) -> String {
+        format!("book={}\nvoice={}\nprecision={}\n", self.book, self.voice, self.precision)
+    }
+
+    fn parse(text: &str) -> Result<Self, Box<dyn Error>> {
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+                .map(str::to_string)
+                .ok_or_else(|| format!("{MANIFEST} has no {name}"))
+        };
+        Ok(Self { book: field("book")?, voice: field("voice")?, precision: field("precision")? })
+    }
+
+    fn require(&self, wanted: &Self, out: &Path) -> Result<(), Box<dyn Error>> {
+        let fields = [
+            ("book", &self.book, &wanted.book),
+            ("voice", &self.voice, &wanted.voice),
+            ("precision", &self.precision, &wanted.precision),
+        ];
+        for (name, saved, asked) in fields {
+            if saved != asked {
+                return Err(format!(
+                    "{} was rendered with {name} {saved}, not {asked}. Use a new output directory.",
+                    out.display()
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct NarrationStore {
+    out: PathBuf,
+    chunks: Vec<Chunk>,
+}
+
+impl NarrationStore {
+    pub fn open(
+        out: &Path,
+        book_title: &str,
+        chapters: &[Vec<String>],
+        voice: u64,
+        settings: &RenderSettings,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut chunks = Vec::new();
+        for (chapter, texts) in chapters.iter().enumerate() {
+            for (position, text) in texts.iter().enumerate() {
+                let key = format!("{CACHE_VERSION}\n{voice:x}\n{text}");
+                chunks.push(Chunk {
+                    chapter,
+                    position,
+                    hash: format!("{:016x}", fnv(key.as_bytes(), 0)),
+                    text: text.clone(),
+                });
+            }
+        }
+        fs::create_dir_all(out.join("chunks"))?;
+        let store = Self { out: out.to_path_buf(), chunks };
+        store.remember(&Manifest {
+            book: book_title.replace('\n', " "),
+            voice: format!("{voice:x}"),
+            precision: settings.precision.clone(),
+        })?;
+        Ok(store)
+    }
+
+    /// Saves what this folder narrates on first use, and refuses anything else later.
+    fn remember(&self, wanted: &Manifest) -> Result<(), Box<dyn Error>> {
+        let path = self.out.join(MANIFEST);
+        let saved = match fs::read_to_string(&path) {
+            Ok(text) => Some(Manifest::parse(&text)?),
+            Err(error) if error.kind() == ErrorKind::NotFound => self.older_manifest(wanted)?,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(saved) = &saved {
+            saved.require(wanted, &self.out)?;
+        }
+        if !path.exists() {
+            let temporary = path.with_extension("tmp");
+            fs::write(&temporary, wanted.render())?;
+            fs::rename(&temporary, &path)?;
+        }
+        Ok(())
+    }
+
+    /// Older versions saved nothing, so a folder with chunks can only be trusted
+    /// if some of them belong to this narration. They always used the default
+    /// precision unless overridden for testing.
+    fn older_manifest(&self, wanted: &Manifest) -> Result<Option<Manifest>, Box<dyn Error>> {
+        let has_audio = fs::read_dir(self.out.join("chunks"))?
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|extension| extension == "wav"));
+        if !has_audio {
+            return Ok(None);
+        }
+        if !self.chunks.iter().any(|chunk| self.has_audio(chunk)) {
+            return Err(format!(
+                "{} has audio from a different voice or text. Use a new output directory.",
+                self.out.display()
+            )
+            .into());
+        }
+        Ok(Some(Manifest { precision: DEFAULT_PRECISION.into(), ..wanted.clone() }))
+    }
+
+    /// Finds what `targets` name: chunk numbers, or words from the book. Each audio
+    /// file appears once, in book order, with every chunk number that shares it.
+    /// Words only match chunks with audio, as they're for fixing what's been heard.
+    pub fn select(&self, targets: &[&str]) -> Result<Vec<Selected<'_>>, Box<dyn Error>> {
+        let mut wanted: HashMap<&str, Vec<String>> = HashMap::new();
+        for target in targets {
+            if let Some(number) = parse_number(target) {
+                let chunk = self.chunks.iter().find(|chunk| (chunk.chapter + 1, chunk.position + 1) == number);
+                let chunk = chunk.ok_or_else(|| format!("no chunk {target} in this book"))?;
+                wanted.entry(&chunk.hash).or_default();
+            } else {
+                for chunk in self.chunks_with_words(target)? {
+                    let phrases = wanted.entry(&chunk.hash).or_default();
+                    if !phrases.iter().any(|phrase| phrase == target) {
+                        phrases.push((*target).to_string());
+                    }
+                }
+            }
+        }
+
+        let mut selected: Vec<Selected> = Vec::new();
+        for chunk in &self.chunks {
+            if let Some(phrases) = wanted.remove(chunk.hash.as_str()) {
+                let numbers = self.chunks.iter().filter(|other| other.hash == chunk.hash).map(Chunk::number).collect();
+                selected.push(Selected { chunk, phrases, numbers });
+            }
+        }
+        Ok(selected)
+    }
+
+    fn chunks_with_words(&self, words: &str) -> Result<Vec<&Chunk>, Box<dyn Error>> {
+        let (with_audio, without): (Vec<&Chunk>, Vec<&Chunk>) = self
+            .chunks
+            .iter()
+            .filter(|chunk| contains_phrase(&chunk.text, words))
+            .partition(|chunk| self.has_audio(chunk));
+        if !with_audio.is_empty() {
+            return Ok(with_audio);
+        }
+        if without.is_empty() {
+            let hint = if words.parse::<usize>().is_ok() { "; chunk numbers look like 3.12, see report.tsv" } else { "" };
+            return Err(format!("nothing in the book matches \"{words}\"{hint}").into());
+        }
+        let numbers: Vec<String> = without.iter().map(|chunk| chunk.number()).collect();
+        Err(format!(
+            "\"{words}\" is only in chunks with no audio: {}. Name them by number to record them.",
+            numbers.join(", ")
+        )
+        .into())
+    }
+
+    /// Every chunk in the book, whichever chapters have been rendered.
+    pub fn chunks(&self) -> &[Chunk] {
+        &self.chunks
+    }
+
+    pub fn audio_path(&self, chunk: &Chunk) -> PathBuf {
+        self.out.join("chunks").join(format!("{}.wav", chunk.hash))
+    }
+
+    /// Where a take can wait while it's checked.
+    pub fn scratch_path(&self, chunk: &Chunk) -> PathBuf {
+        self.out.join("chunks").join(format!("{}.take.wav", chunk.hash))
+    }
+
+    pub fn has_audio(&self, chunk: &Chunk) -> bool {
+        self.audio_path(chunk).exists()
+    }
+
+    /// Chunks in the chapters that still need audio, once for each audio file.
+    pub fn pending(&self, chapters: &[usize]) -> Vec<&Chunk> {
+        let mut seen = HashSet::new();
+        self.chunks
+            .iter()
+            .filter(|chunk| chapters.contains(&chunk.chapter))
+            .filter(|chunk| !self.has_audio(chunk) && seen.insert(&chunk.hash))
+            .collect()
+    }
+
+    /// How many chunks in the whole book have no audio.
+    pub fn missing_count(&self) -> usize {
+        self.chunks.iter().filter(|chunk| !self.has_audio(chunk)).count()
+    }
+
+    /// Chapters with audio for every chunk, in book order.
+    pub fn complete_chapters(&self) -> Vec<usize> {
+        let mut complete: Vec<usize> = self.chunks.iter().map(|chunk| chunk.chapter).collect();
+        complete.dedup();
+        complete.retain(|&chapter| {
+            self.chunks.iter().filter(|chunk| chunk.chapter == chapter).all(|chunk| self.has_audio(chunk))
+        });
+        complete
+    }
+
+    /// Saves a chunk's audio and check file, replacing the audio in one step.
+    pub fn store(&self, chunk: &Chunk, audio: &AudioSamples, transcript: &str, takes: u64) -> Result<(), Box<dyn Error>> {
+        let path = self.audio_path(chunk);
+        let transcript = transcript.replace(['\n', '\t'], " ");
+        fs::write(path.with_extension("check"), format!("{takes}\n{transcript}"))?;
+        let temporary = path.with_extension("tmp");
+        audio.save_wav(&temporary)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    }
+
+    /// Reads the stored check for a chunk that has audio.
+    pub fn check(&self, chunk: &Chunk) -> Result<Check, Box<dyn Error>> {
+        let sidecar = fs::read_to_string(self.audio_path(chunk).with_extension("check"))?;
+        let (takes, transcript) = sidecar.split_once('\n').ok_or("malformed chunk check file")?;
+        Ok(Check { takes: takes.parse()?, transcript: transcript.to_string() })
+    }
+
+    /// Records more tried seeds without changing the audio.
+    pub fn record_tried(&self, chunk: &Chunk, takes: u64) -> Result<(), Box<dyn Error>> {
+        let transcript = self.check(chunk)?.transcript;
+        let path = self.audio_path(chunk).with_extension("check");
+        let temporary = path.with_extension("check.tmp");
+        fs::write(&temporary, format!("{takes}\n{transcript}"))?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    }
+
+    /// Moves a chunk's audio and check file to `replaced/`, ready for a new take.
+    pub fn retire(&self, chunk: &Chunk) -> Result<(), Box<dyn Error>> {
+        let takes = self.check(chunk)?.takes;
+        let replaced = self.out.join("replaced");
+        fs::create_dir_all(&replaced)?;
+        let path = self.audio_path(chunk);
+        let old = replaced.join(format!("{}-{takes}.wav", chunk.hash));
+        fs::rename(&path, &old)?;
+        fs::rename(path.with_extension("check"), old.with_extension("check"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+use std::io::ErrorKind;
+
+    /// A directory that's removed when the test ends.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("audio-berry-store-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn settings() -> RenderSettings {
+        RenderSettings { precision: "f16".into() }
+    }
+
+    fn chapters(texts: &[&[&str]]) -> Vec<Vec<String>> {
+        texts.iter().map(|chapter| chapter.iter().map(|text| text.to_string()).collect()).collect()
+    }
+
+    fn open(dir: &TempDir, texts: &[&[&str]]) -> NarrationStore {
+        NarrationStore::open(&dir.0, "A Book", &chapters(texts), 0xabc, &settings()).unwrap()
+    }
+
+    fn tone() -> AudioSamples {
+        AudioSamples::new(vec![0.1; 240], 24_000)
+    }
+
+    fn open_as(dir: &TempDir, title: &str, voice: u64, precision: &str) -> Result<NarrationStore, Box<dyn Error>> {
+        let settings = RenderSettings { precision: precision.into() };
+        NarrationStore::open(&dir.0, title, &chapters(&[&["a"]]), voice, &settings)
+    }
+
+    fn numbers(selected: &[Selected]) -> Vec<String> {
+        selected.iter().map(|item| item.chunk.number()).collect()
+    }
+
+    #[test]
+    fn a_number_selects_that_chunk_even_with_no_audio() {
+        let dir = TempDir::new("select-number");
+        let store = open(&dir, &[&["one"], &["two", "three"]]);
+        let selected = store.select(&["2.2"]).unwrap();
+        assert_eq!(numbers(&selected), ["2.2"]);
+        assert!(selected[0].phrases.is_empty());
+    }
+
+    #[test]
+    fn selecting_never_adds_chunks_that_were_not_named() {
+        let dir = TempDir::new("select-only");
+        let store = open(&dir, &[&["one"], &["two"], &["three"]]);
+        store.store(&store.chunks()[0], &tone(), "one", 1).unwrap();
+        assert_eq!(numbers(&store.select(&["1.1"]).unwrap()), ["1.1"]);
+    }
+
+    #[test]
+    fn a_number_outside_the_book_is_an_error() {
+        let dir = TempDir::new("select-range");
+        let store = open(&dir, &[&["one"]]);
+        for target in ["1.2", "2.1", "0.1", "1.0"] {
+            let error = store.select(&[target]).err().unwrap().to_string();
+            assert!(error.contains(target), "{error}");
+        }
+    }
+
+    #[test]
+    fn words_select_only_chunks_with_audio() {
+        let dir = TempDir::new("select-words");
+        let store = open(&dir, &[&["the white rabbit"], &["a white hat"]]);
+        store.store(&store.chunks()[0], &tone(), "x", 1).unwrap();
+        let selected = store.select(&["white"]).unwrap();
+        assert_eq!(numbers(&selected), ["1.1"]);
+        assert_eq!(selected[0].phrases, ["white"]);
+    }
+
+    #[test]
+    fn words_matching_only_missing_chunks_ask_for_a_number() {
+        let dir = TempDir::new("select-missing");
+        let store = open(&dir, &[&["the white rabbit"]]);
+        let error = store.select(&["white"]).err().unwrap().to_string();
+        assert!(error.contains("1.1"), "{error}");
+    }
+
+    #[test]
+    fn a_bare_number_that_matches_nothing_shows_the_new_form() {
+        let dir = TempDir::new("select-bare");
+        let store = open(&dir, &[&["one"]]);
+        let error = store.select(&["32"]).err().unwrap().to_string();
+        assert!(error.contains("3.12"), "{error}");
+    }
+
+    #[test]
+    fn shared_audio_is_selected_once_with_every_number() {
+        let dir = TempDir::new("select-shared");
+        let store = open(&dir, &[&["same line", "other"], &["same line"]]);
+        store.store(&store.chunks()[0], &tone(), "same line", 1).unwrap();
+        let selected = store.select(&["same line", "2.1"]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].numbers, ["1.1", "2.1"]);
+        assert_eq!(selected[0].phrases, ["same line"]);
+    }
+
+    #[test]
+    fn selections_come_back_in_book_order() {
+        let dir = TempDir::new("select-order");
+        let store = open(&dir, &[&["a"], &["b"]]);
+        assert_eq!(numbers(&store.select(&["2.1", "1.1"]).unwrap()), ["1.1", "2.1"]);
+    }
+
+    #[test]
+    fn a_folder_reopens_with_the_same_voice_and_settings() {
+        let dir = TempDir::new("same");
+        open_as(&dir, "A Book", 1, "f16").unwrap();
+        assert!(open_as(&dir, "A Book", 1, "f16").is_ok());
+    }
+
+    #[test]
+    fn a_different_voice_is_refused_by_name() {
+        let dir = TempDir::new("voice");
+        open_as(&dir, "A Book", 1, "f16").unwrap();
+        let error = open_as(&dir, "A Book", 2, "f16").err().unwrap().to_string();
+        assert!(error.contains("voice"), "{error}");
+        assert!(error.contains("new output directory"), "{error}");
+    }
+
+    #[test]
+    fn a_different_precision_is_refused_by_name() {
+        let dir = TempDir::new("precision");
+        open_as(&dir, "A Book", 1, "f16").unwrap();
+        let error = open_as(&dir, "A Book", 1, "f32").err().unwrap().to_string();
+        assert!(error.contains("precision"), "{error}");
+    }
+
+    #[test]
+    fn a_different_book_is_refused_by_name() {
+        let dir = TempDir::new("book");
+        open_as(&dir, "A Book", 1, "f16").unwrap();
+        let error = open_as(&dir, "Another Book", 1, "f16").err().unwrap().to_string();
+        assert!(error.contains("Another Book"), "{error}");
+    }
+
+    /// Makes a folder as older versions left it: chunks, but no saved settings.
+    fn older_folder(dir: &TempDir, voice: u64) {
+        let scratch = TempDir::new(&format!("older-of-{}", dir.0.display()).replace('/', "-"));
+        let store = open_as(&scratch, "A Book", voice, "f16").unwrap();
+        let name = store.audio_path(&store.chunks()[0]);
+        fs::create_dir_all(dir.0.join("chunks")).unwrap();
+        fs::write(dir.0.join("chunks").join(name.file_name().unwrap()), "audio").unwrap();
+    }
+
+    #[test]
+    fn an_older_folder_with_matching_chunks_adopts_the_voice() {
+        let dir = TempDir::new("adopt");
+        older_folder(&dir, 1);
+        open_as(&dir, "A Book", 1, "f16").unwrap();
+        assert!(open_as(&dir, "A Book", 2, "f16").is_err(), "the adopted voice should now be saved");
+    }
+
+    #[test]
+    fn an_older_folder_with_no_matching_chunks_is_refused() {
+        let dir = TempDir::new("mismatch");
+        older_folder(&dir, 1);
+        let error = open_as(&dir, "A Book", 2, "f16").err().unwrap().to_string();
+        assert!(error.contains("new output directory"), "{error}");
+    }
+
+    #[test]
+    fn an_older_folder_is_assumed_to_be_the_default_precision() {
+        let dir = TempDir::new("older-precision");
+        older_folder(&dir, 1);
+        assert!(open_as(&dir, "A Book", 1, "f32").is_err());
+    }
+
+    #[test]
+    fn precision_comes_from_the_environment_value_or_defaults() {
+        assert_eq!(RenderSettings::from_dtype(None).precision, "f16");
+        assert_eq!(RenderSettings::from_dtype(Some(" BF16 ")).precision, "bf16");
+        assert_eq!(RenderSettings::from_dtype(Some("nonsense")).precision, "f16");
+    }
+
+    #[test]
+    fn a_stored_take_can_be_read_back() {
+        let dir = TempDir::new("roundtrip");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        assert!(!store.has_audio(chunk));
+        store.store(chunk, &tone(), "heard\tthis\nline", 2).unwrap();
+        assert!(store.has_audio(chunk));
+        assert_eq!(store.check(chunk).unwrap(), Check { takes: 2, transcript: "heard this line".into() });
+    }
+
+    #[test]
+    fn a_malformed_check_file_is_an_error() {
+        let dir = TempDir::new("malformed");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        store.store(chunk, &tone(), "heard", 1).unwrap();
+        fs::write(store.audio_path(chunk).with_extension("check"), "no newline").unwrap();
+        assert!(store.check(chunk).is_err());
+    }
+
+    #[test]
+    fn recording_tried_seeds_keeps_the_transcript() {
+        let dir = TempDir::new("tried");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        store.store(chunk, &tone(), "heard", 1).unwrap();
+        store.record_tried(chunk, 7).unwrap();
+        assert_eq!(store.check(chunk).unwrap(), Check { takes: 7, transcript: "heard".into() });
+    }
+
+    #[test]
+    fn retiring_a_take_keeps_it_in_replaced() {
+        let dir = TempDir::new("retire");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        store.store(chunk, &tone(), "heard", 3).unwrap();
+        store.retire(chunk).unwrap();
+        assert!(!store.has_audio(chunk));
+        let name = store.audio_path(chunk).file_stem().unwrap().to_str().unwrap().to_string();
+        assert!(dir.0.join("replaced").join(format!("{name}-3.wav")).exists());
+        assert_eq!(fs::read_to_string(dir.0.join("replaced").join(format!("{name}-3.check"))).unwrap(), "3\nheard");
+    }
+
+    #[test]
+    fn pending_lists_only_the_chapters_asked_for_and_shared_audio_once() {
+        let dir = TempDir::new("pending");
+        let store = open(&dir, &[&["a", "b", "a"], &["c"]]);
+        store.store(&store.chunks()[1], &tone(), "b", 1).unwrap();
+        let numbers: Vec<String> = store.pending(&[0]).iter().map(|chunk| chunk.number()).collect();
+        assert_eq!(numbers, ["1.1"]);
+    }
+
+    #[test]
+    fn only_chapters_with_all_their_audio_are_complete() {
+        let dir = TempDir::new("complete");
+        let store = open(&dir, &[&["a", "b"], &["c"], &[], &["d"]]);
+        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+        store.store(&store.chunks()[3], &tone(), "d", 1).unwrap();
+        assert_eq!(store.complete_chapters(), [3]);
+        assert_eq!(store.missing_count(), 2);
+    }
+
+    #[test]
+    fn chunk_numbers_count_from_one_within_each_chapter() {
+        let dir = TempDir::new("numbers");
+        let store = open(&dir, &[&["a", "b"], &["c"]]);
+        let numbers: Vec<String> = store.chunks().iter().map(Chunk::number).collect();
+        assert_eq!(numbers, ["1.1", "1.2", "2.1"]);
+    }
+
+    #[test]
+    fn chunk_files_keep_the_existing_cache_key() {
+        // Worked out independently with FNV-1a of "3\nabc\nHello there.".
+        let dir = TempDir::new("key");
+        let store = open(&dir, &[&["Hello there."]]);
+        let path = store.audio_path(&store.chunks()[0]);
+        assert_eq!(path.file_name().unwrap(), "026926e6f4d06f3e.wav");
+    }
+}

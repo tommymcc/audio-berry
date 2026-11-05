@@ -2,6 +2,7 @@ mod book;
 mod cast;
 mod epub;
 mod quality;
+mod store;
 mod text;
 mod transcribe;
 
