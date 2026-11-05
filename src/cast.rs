@@ -234,6 +234,7 @@ fn wait_until_finished(
 ) -> Result<(), Box<dyn Error>> {
     let limit = Duration::from_secs_f32(duration.unwrap_or(4.0 * 3600.0) + 60.0);
     let started = Instant::now();
+    let mut session_seen = false;
     while started.elapsed() < limit {
         match device.receive()? {
             ChannelMessage::Heartbeat(HeartbeatResponse::Ping) => device.heartbeat.pong()?,
@@ -257,10 +258,14 @@ fn wait_until_finished(
             ChannelMessage::Connection(ConnectionResponse::Close) => {
                 return Err("playback was stopped on the speaker".into());
             }
-            ChannelMessage::Receiver(ReceiverResponse::Status(status))
-                if !status.applications.iter().any(|app| app.session_id == session_id) =>
-            {
-                return Err("playback was stopped on the speaker".into());
+            // A display can report no apps just after a launch, so a session
+            // can only have stopped once it has been seen running.
+            ChannelMessage::Receiver(ReceiverResponse::Status(status)) => {
+                let running = status.applications.iter().any(|app| app.session_id == session_id);
+                if session_seen && !running {
+                    return Err("playback was stopped on the speaker".into());
+                }
+                session_seen |= running;
             }
             ChannelMessage::Media(MediaResponse::LoadFailed(_)) => {
                 return Err("the speaker failed to load the file".into());
