@@ -175,7 +175,8 @@ checking every take with Whisper and building the M4B.
 
 That's 6.6% faster. All 30 chunks are byte-identical to the takes from before, in
 every run, so the audio is unchanged. Every chunk passed on its first take, so a
-chapter that needs retakes will take longer. Peak GPU memory stayed at 3.2 GB.
+chapter that needs retakes will take longer. Peak GPU memory stayed at 3203 MiB,
+sampled once a second.
 
 To repeat it:
 
