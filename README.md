@@ -157,6 +157,19 @@ it locally and saves the text beside it, as `voices/me.txt`. Read that file and
 correct any mistakes, since a wrong word no longer matches the audio. You can
 also write the file yourself before the first run.
 
+The first run also measures the sample's background, as a [floor](#noise-limit),
+since every take copies it. A quiet sample prints one line:
+
+```text
+Voice sample background: -66.6 dB, fine for the default noise limit.
+```
+
+Above about -50 dB, most takes will measure above the default noise limit of
+-55 dB and be rendered again. It then suggests keeping the sample and raising the
+noise limit, or cleaning with more reduction, which makes the clone less like the
+speaker. Above -40 dB, it suggests cleaning the recording with `clean` first. It
+only advises: the run carries on either way.
+
 Takes vary, so if one sounds wrong, render another with a different seed before
 blaming the sample:
 
@@ -266,8 +279,23 @@ It applies to `book` (whether a take passes), `retake` (which take wins) and the
 
 **When to raise it.** The model copies the sample's background, so a sample with
 faint room tone, such as a noisy recording cleaned with a denoiser, gives every
-take a little of it. You'll see most takes rejected on the floor alone, with
-good recall:
+take a little of it. The first run with a voice sample warns when its floor is
+above about -50 dB. On one speaker, takes came out a few dB quieter than the
+sample:
+
+| Reduction | Sample floor | Typical take floor | Voice ID |
+| --- | --- | --- | --- |
+| 15 dB | -45.3 dB | -53.6 dB | 0.85 |
+| 20 dB | -48.9 dB | -55.7 dB | 0.80 |
+| 30 dB | -58.0 dB | -59.3 dB | 0.75 |
+| 40 dB | -66.6 dB | -70.4 dB | 0.75 |
+| 100 dB (no limit) | -80.7 dB | -78.7 dB | 0.74 |
+
+The speaker's own recordings scored 0.91 against each other. So for a voice like
+this, keeping the 15 dB sample and raising the limit gives the closest likeness.
+
+With such a sample, you'll see most takes rejected on the floor alone, with good
+recall:
 
 ```text
   take 2 rejected: floor -51 dB, 19.2s, recall 0.94, extra 0.04
