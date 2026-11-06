@@ -83,8 +83,9 @@ audio from Alice. All 7 chunks passed their checks on the first take, and it too
 230 s including loading the model. Its peak memory footprint was 7.4 GB. A full
 chapter, retrying a failed take, `retake` and `play` haven't been tried on a Mac.
 
-The `Model loaded` line says which device it's using, which should be `metal:0`. On Metal the model runs at F32, with the audio decoder and voice encoder on
-the CPU. Audio from a Mac won't be byte-identical to audio from CUDA.
+The `Model loaded` line says which device it's using, which should be `metal:0`.
+On Metal the model runs at F32, with the audio decoder and voice encoder on the
+CPU. Audio from a Mac won't be byte-identical to audio from CUDA.
 
 To build, narrate a short test and collect the results in one report:
 
@@ -100,14 +101,9 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    in the delivery you want for the narration. Aim for a normal level with no
    clipping.
 
-2. **Cut about 10 seconds of it.** OmniVoice recommends 3-10 seconds, and 11.4
-   is what's been tested for narration. Over 20 seconds, the app uses up to the
-   first 15, ending at a pause. `voices/` is ignored by git, so recordings stay
-   out of the repo.
-
-   To find the best stretches, `sections` suggests them, best first, each
-   with the `clean` command that makes it. Add a number to get more or fewer
-   than 3:
+2. **Find the best stretches.** `sections` suggests stretches of the recording
+   to use as a voice sample, best first, each with the `clean` command that
+   makes it. Add a number to get more or fewer than 3:
 
    ```sh
    ./target/release/audio-berry sections recording.mp3
@@ -128,20 +124,16 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    than one speaker, check each suggestion is the right one. It looks through
    at most 30 minutes, so cut a longer recording first.
 
-   Make two or three with `clean`, then compare them with `audition` (step 4).
+3. **Make the voice sample.** Run `clean` for two or three of the suggestions,
+   to compare them in step 6. About 10 seconds is right: OmniVoice recommends
+   3-10 seconds, and 11.4 is what's been tested for narration. Over 20 seconds,
+   the app uses up to the first 15, ending at a pause. `voices/` is ignored by
+   git, so recordings stay out of the repo.
 
-   To cut a clean recording without `clean`, take 10 seconds starting 3 minutes
-   in with:
-
-   ```sh
-   mkdir -p voices
-   ffmpeg -ss 180 -t 10 -i recording.mp3 -ac 1 -ar 24000 voices/me.wav
-   ```
-
-   If the recording has background noise, such as birds or wind, clean it as you
-   cut it. `clean` cleans the whole recording with DeepFilterNet 3, which is built
-   in and runs on the CPU, then takes 20.1 to 30.8 seconds as a voice sample. It
-   reproduces the earlier Python DeepFilterNet 0.5.6 result:
+   `clean` removes background noise, such as birds or wind, as it cuts. It
+   cleans the whole recording with DeepFilterNet 3, which is built in and runs
+   on the CPU, then takes 20.1 to 30.8 seconds as a voice sample. It reproduces
+   the earlier Python DeepFilterNet 0.5.6 result:
 
    ```sh
    ./target/release/audio-berry clean recording.mp3 20.1 30.8 voices/me.wav
@@ -157,7 +149,15 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    limit). The default keeps a little room tone, which every take copies, so you
    may need a higher [noise limit](#noise-limit).
 
-3. **Check the levels.** `max_volume` should be below 0 dB. If it reads 0.0 dB,
+   A recording with no background noise doesn't need cleaning. This takes 10
+   seconds starting 3 minutes in:
+
+   ```sh
+   mkdir -p voices
+   ffmpeg -ss 180 -t 10 -i recording.mp3 -ac 1 -ar 24000 voices/me.wav
+   ```
+
+4. **Check the levels.** `max_volume` should be below 0 dB. If it reads 0.0 dB,
    the recording is probably clipped, so pick another section or record it
    again.
 
@@ -165,9 +165,28 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ffmpeg -hide_banner -i voices/me.wav -af volumedetect -f null - 2>&1 | grep -E 'mean_volume|max_volume'
    ```
 
-4. **Listen to a test.** Judge it by ear, ideally on the speaker you'll use.
+5. **Check its words.** OmniVoice also needs the words spoken in the sample. The
+   first command to use it, such as `audition` in the next step, transcribes it
+   locally and saves the text beside it, as `voices/me.txt`. Read that file and
+   correct any mistakes, since a wrong word no longer matches the audio. You can
+   also write the file yourself before the first run.
+
+   Every run also prints the sample's [floor](#noise-limit), since takes copy it:
+
+   ```text
+   Voice sample: using 10.7s, floor -66.6 dB
+   ```
+
+   A floor more than 7 dB above the noise limit (-48 dB for the default) is marked
+   noisy, since many takes will then fail the limit. Above -40 dB, it asks whether
+   the sample is a raw recording. On the first run, it also says what to do: raise
+   the noise limit, or clean again with a higher reduction, or clean a raw
+   recording. It only advises: the run carries on either way.
+
+6. **Listen to a test.** Judge it by ear, ideally on the speaker you'll use.
    To compare the clone with the original, `audition` says the sample's own
-   words in the cloned voice, then plays the sample and the clone in turn:
+   words in the cloned voice, then plays the sample and the clone in turn.
+   Keep the sample most like the speaker:
 
    ```sh
    ./target/release/audio-berry audition voices/me.wav kitchen
@@ -181,37 +200,25 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ./target/release/audio-berry play kitchen output/test.wav
    ```
 
-OmniVoice also needs the words spoken in the sample. The first run transcribes
-it locally and saves the text beside it, as `voices/me.txt`. Read that file and
-correct any mistakes, since a wrong word no longer matches the audio. You can
-also write the file yourself before the first run.
+   Takes vary, so if one sounds wrong, render another with a different seed before
+   blaming the sample:
 
-Every run also prints the sample's [floor](#noise-limit), since takes copy it:
+   ```sh
+   OMNIVOICE_SEED=2 ./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav
+   ```
 
-```text
-Voice sample: using 10.7s, floor -66.6 dB
-```
-
-A floor more than 7 dB above the noise limit (-48 dB for the default) is marked
-noisy, since many takes will then fail the limit. Above -40 dB, it asks whether
-the sample is a raw recording. On the first run, it also says what to do: raise
-the noise limit, or clean again with a higher reduction, or clean a raw
-recording. It only advises: the run carries on either way.
-
-Takes vary, so if one sounds wrong, render another with a different seed before
-blaming the sample:
-
-```sh
-OMNIVOICE_SEED=2 ./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav
-```
+7. **Add allowances, if needed.** Once you've narrated some of a book, if
+   Whisper hears the speaker's accent the same wrong way again and again, such as
+   "in" as "and", `mishearings` lists the candidates and an `.allowances` file
+   beside the sample lets those takes pass. See [Allowances](#allowances).
 
 ## Commands
 
 ```text
 audio-berry speak <voice-sample> <text> <output.wav> [--speed <factor>]
 audio-berry chapters <book.epub>
-audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers] [--speed <factor>]
-audio-berry retake <voice-sample> <book.epub> <output-dir> <words or chunk number>...
+audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers, e.g. 2 3 7] [--speed <factor>]
+audio-berry retake <voice-sample> <book.epub> <output-dir> <words from the book, or a chunk number like 3.12>...
 audio-berry mishearings <book.epub> <output-dir> [voice-sample]
 audio-berry speakers
 audio-berry play <speaker> <file>...
@@ -220,30 +227,13 @@ audio-berry sections <recording> [count] [--reduction <dB>]
 audio-berry clean <recording> <start> <end> <output.wav> [--reduction <dB>]
 ```
 
-`sections` suggests the best `count` stretches of a recording to use as a voice
-sample, 3 by default, each with the `clean` command that makes it. With
-`--reduction`, it cleans as `clean` would with it. See
-[Adding a voice](#adding-a-voice).
+`book` and `retake` are explained in [Narrating a book](#narrating-a-book) and
+[One output directory, one narration](#one-output-directory-one-narration).
 
 `mishearings` lists the words most often heard as other words in the takes kept
 in an output directory, to help write a voice's allowances. Given the voice
 sample, it marks the pairs already allowed. It only reads. See
 [Allowances](#allowances).
-
-`clean` makes a voice sample from a noisy recording: it removes background noise
-from the whole recording, then saves `start` to `end` as 24 kHz mono 16-bit WAV.
-If the output already has a `.txt` beside it, it renames that to `.txt.old`,
-since it describes the old audio, so the first use transcribes the new sample.
-See [Adding a voice](#adding-a-voice).
-
-`audition` says a voice sample's own words, from its `.txt` file, in the cloned
-voice, then plays the sample and the clone in turn on the speaker, so you hear the
-same words in both. If there's no `.txt` yet, it transcribes the sample first. It saves them in `output/audition`, so `voices/me.wav` gives
-`me-original.wav` and `me-clone.wav`. The original is the part of the sample the
-model hears, at 24 kHz mono, and trimmed to at most 15 seconds if the sample is
-over 20. If you wrote the `.txt` for a longer recording than that, it warns
-that the clone will say more than the original. Without a speaker, it only saves them. Like `speak`, it uses
-`OMNIVOICE_SEED` if set.
 
 `play` matches part of a speaker's name, ignoring case, and needs exactly one
 match. It interrupts whatever the speaker is playing. While playing, it serves
@@ -257,6 +247,27 @@ folder and the folder above. A file with no tags shows its file name.
 
 Pausing on the speaker doesn't count towards `play`'s time limit, which is the
 length the speaker reports plus a minute. Leave `play` running until playback ends.
+
+`audition` says a voice sample's own words, from its `.txt` file, in the cloned
+voice, then plays the sample and the clone in turn on the speaker, so you hear the
+same words in both. If there's no `.txt` yet, it transcribes the sample first.
+It saves them in `output/audition`, so `voices/me.wav` gives `me-original.wav` and
+`me-clone.wav`. The original is the part of the sample the model hears, at 24 kHz
+mono, and trimmed to at most 15 seconds if the sample is over 20. If you wrote the
+`.txt` for a longer recording than that, it warns that the clone will say more
+than the original. Without a speaker, it only saves them. Like `speak`, it uses
+`OMNIVOICE_SEED` if set.
+
+`sections` suggests the best `count` stretches of a recording to use as a voice
+sample, 3 by default, each with the `clean` command that makes it. With
+`--reduction`, it cleans as `clean` would with it. See
+[Adding a voice](#adding-a-voice).
+
+`clean` makes a voice sample from a noisy recording: it removes background noise
+from the whole recording, then saves `start` to `end` as 24 kHz mono 16-bit WAV.
+If the output already has a `.txt` beside it, it renames that to `.txt.old`,
+since it describes the old audio, so the first use transcribes the new sample.
+See [Adding a voice](#adding-a-voice).
 
 ## Narrating a book
 

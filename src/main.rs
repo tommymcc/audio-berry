@@ -169,6 +169,15 @@ mod tests {
     }
 
     #[test]
+    fn the_readme_lists_the_commands_as_usage_does() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("## Commands\n\n```text\n").expect("README has a Commands list") + "## Commands\n\n```text\n".len();
+        let listed = &readme[start..start + readme[start..].find("```").unwrap()];
+        let usage: Vec<&str> = USAGE.lines().skip(1).map(str::trim).collect();
+        assert_eq!(listed.lines().collect::<Vec<_>>(), usage);
+    }
+
+    #[test]
     fn speed_is_taken_from_any_position() {
         let (rest, speed) = take(&SPEED, &["book", "--speed", "0.9", "v", "b", "o", "3"], parse_speed).unwrap();
         assert_eq!(rest, args(&["book", "v", "b", "o", "3"]));
