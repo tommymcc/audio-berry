@@ -1,8 +1,9 @@
-//! Checks generated speech against its text with a local transcriber, because
-//! the model sometimes produces fluent nonsense that sounds clean and runs to a
-//! plausible length.
+//! Hears what's said in audio with a local Whisper model, so generated speech can
+//! be checked against its text, because the model sometimes produces fluent
+//! nonsense that sounds clean and runs to a plausible length.
 
-use any_tts::DeviceSelection;
+use crate::audio::resample_as_saved;
+use any_tts::{AudioSamples, DeviceSelection};
 use any_tts::download::download_file;
 use candle_core::{D, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
@@ -14,12 +15,7 @@ use flate2::write::ZlibEncoder;
 use std::error::Error;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
 use tokenizers::Tokenizer;
-
-/// Passages the user approved by ear scored 0.98-1.00 recall with 0.00-0.02 extra.
-const MIN_RECALL: f32 = 0.92;
-const MAX_EXTRA: f32 = 0.12;
 
 /// Fast enough to check every take, at the cost of some misheard words.
 pub const CHECK_MODEL: &str = "base.en";
@@ -30,111 +26,6 @@ pub const VOICE_TRANSCRIPTION_MODEL: &str = "medium.en";
 const SAMPLING_SEED: u64 = 42;
 /// A fifth of a second at Whisper's sample rate.
 const PAUSE_SAMPLES: usize = whisper::SAMPLE_RATE / 5;
-
-const ONES: [&str; 20] = [
-    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
-    "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
-];
-const TENS: [&str; 8] = ["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
-
-pub struct Accuracy {
-    /// Share of the text's words heard, in order.
-    pub recall: f32,
-    /// Words heard that aren't in the text, relative to the text's length.
-    pub extra: f32,
-    pub transcript: String,
-}
-
-impl Accuracy {
-    pub fn acceptable(&self) -> bool {
-        self.recall >= MIN_RECALL && self.extra <= MAX_EXTRA
-    }
-
-    pub fn score(&self) -> f32 {
-        self.recall - self.extra
-    }
-}
-
-/// Lowercases into words, spelling out small numbers so "1" matches "one".
-fn words(text: &str) -> Vec<String> {
-    let cleaned: String = text
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' })
-        .collect();
-    let mut out = Vec::new();
-    for word in cleaned.split_whitespace() {
-        let word = word.trim_matches('\'');
-        match word.parse::<usize>() {
-            Ok(number) if number < 20 => out.push(ONES[number].to_string()),
-            Ok(number) if number < 100 => {
-                out.push(TENS[number / 10 - 2].to_string());
-                if number % 10 != 0 {
-                    out.push(ONES[number % 10].to_string());
-                }
-            }
-            _ if !word.is_empty() => out.push(word.to_string()),
-            _ => {}
-        }
-    }
-    out
-}
-
-fn common_subsequence(a: &[String], b: &[String]) -> usize {
-    let mut row = vec![0usize; b.len() + 1];
-    for word in a {
-        let mut diagonal = 0;
-        for (j, other) in b.iter().enumerate() {
-            let above = row[j + 1];
-            row[j + 1] = if word == other {
-                diagonal + 1
-            } else {
-                above.max(row[j])
-            };
-            diagonal = above;
-        }
-    }
-    row[b.len()]
-}
-
-/// Joins neighbouring words where `other` has them as one word, so "quarter
-/// deck" matches "quarterdeck" and "e book" matches "ebook".
-fn join_split_words(words: &[String], other: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(words.len());
-    let mut index = 0;
-    while index < words.len() {
-        if let Some(next) = words.get(index + 1) {
-            let joined = format!("{}{next}", words[index]);
-            if other.contains(&joined) {
-                out.push(joined);
-                index += 2;
-                continue;
-            }
-        }
-        out.push(words[index].clone());
-        index += 1;
-    }
-    out
-}
-
-pub fn compare(text: &str, transcript: &str) -> Accuracy {
-    let (expected, heard) = (words(text), words(transcript));
-    let expected = join_split_words(&expected, &heard);
-    let heard = join_split_words(&heard, &expected);
-    let matched = common_subsequence(&expected, &heard);
-    let length = expected.len().max(1) as f32;
-    Accuracy {
-        recall: matched as f32 / length,
-        extra: heard.len().saturating_sub(matched) as f32 / length,
-        transcript: transcript.to_string(),
-    }
-}
-
-/// Whether `text` has the phrase's words in a row, ignoring case and punctuation.
-pub fn contains_phrase(text: &str, phrase: &str) -> bool {
-    let phrase = words(phrase);
-    !phrase.is_empty() && words(text).windows(phrase.len()).any(|window| window == phrase)
-}
 
 /// Matches Whisper's own mel scale, which is linear below 1 kHz.
 fn hz_to_mel(hz: f64) -> f64 {
@@ -342,8 +233,9 @@ impl Transcriber {
         Ok(best.filter(|attempt| !attempt.silent()).map(|attempt| attempt.text).unwrap_or_default())
     }
 
-    pub fn transcribe(&mut self, path: &Path) -> Result<String, Box<dyn Error>> {
-        let samples = crate::audio::decode_audio(path, whisper::SAMPLE_RATE as u32)?;
+    /// What's said in `audio`, heard as it would be once saved as a WAV file.
+    pub fn transcribe(&mut self, audio: &AudioSamples) -> Result<String, Box<dyn Error>> {
+        let samples = resample_as_saved(audio, whisper::SAMPLE_RATE as u32)?;
         let bands = self.model.config.num_mel_bins;
         let mut rest = samples.as_slice();
         let mut text = Vec::new();
@@ -363,46 +255,6 @@ impl Transcriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn matching_ignores_case_punctuation_and_digit_style() {
-        let accuracy = compare("Chapter 12. Down the Rabbit-Hole!", "chapter twelve, down the rabbit hole");
-        assert_eq!(accuracy.recall, 1.0);
-        assert_eq!(accuracy.extra, 0.0);
-        assert!(accuracy.acceptable());
-    }
-
-    #[test]
-    fn words_joined_on_one_side_and_split_on_the_other_match() {
-        // Whisper's spelling of compounds often differs from the book's.
-        for (text, heard) in [
-            ("Chapter 36. The Quarter-Deck.", "chapter thirty six, the quarterdeck"),
-            ("This eBook is for the use of anyone", "this e-book is for the use of anyone"),
-            ("a rose bud in the grub worm's way", "a rosebud in the grubworm's way"),
-        ] {
-            let accuracy = compare(text, heard);
-            assert_eq!((accuracy.recall, accuracy.extra), (1.0, 0.0), "{text} / {heard}");
-        }
-        // Joining is only forgiven when the joined word is really there.
-        assert!(compare("the quarter deck", "the quarter").recall < 1.0);
-    }
-
-    #[test]
-    fn phrases_match_whole_words_in_order() {
-        assert!(contains_phrase("It took a Watch, out of its pocket", "took a watch out"));
-        assert!(!contains_phrase("took a watt out", "took a watch"));
-        assert!(!contains_phrase("watchman", "watch"));
-    }
-
-    #[test]
-    fn nonsense_and_repeats_are_rejected() {
-        let text = "the quick brown fox jumps over the lazy dog";
-        assert!(!compare(text, "in what trade setups and cost free workers").acceptable());
-        let repeated = format!("{text} {text}");
-        let accuracy = compare(text, &repeated);
-        assert_eq!(accuracy.recall, 1.0);
-        assert!(!accuracy.acceptable());
-    }
 
     #[test]
     fn mel_filters_match_whisper() {

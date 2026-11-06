@@ -65,12 +65,9 @@ impl Voice {
             return Ok(Voice::new(samples, existing));
         }
 
-        let clip = transcript_path.with_extension("transcribing.wav");
-        save(&samples, &clip)?;
-        let transcript = Transcriber::start(VOICE_TRANSCRIPTION_MODEL)
-            .and_then(|mut transcriber| transcriber.transcribe(&clip));
-        fs::remove_file(&clip)?;
-        let transcript = transcript?;
+        let heard = AudioSamples::new(samples, SAMPLE_RATE);
+        let transcript = Transcriber::start(VOICE_TRANSCRIPTION_MODEL)?.transcribe(&heard)?;
+        let samples = heard.samples;
         if transcript.is_empty() {
             return Err(format!("heard no speech in {}", path.display()).into());
         }

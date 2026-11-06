@@ -1,5 +1,6 @@
 //! Narrates a whole book: generates checked chunks, then assembles the audio.
 
+use crate::accuracy;
 use crate::checks::{Standard, Verdict};
 use crate::epub::{Book, image_type, read_book};
 use crate::narrator::Narrator;
@@ -73,11 +74,8 @@ fn render_take(
     take: u64,
 ) -> Result<Take, Box<dyn Error>> {
     let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
-    let candidate = store.scratch_path(item);
     let audio = narrator.say(voice, &item.text, store.speed(), Some(base_seed + take))?;
-    audio.save_wav(&candidate)?;
-    let transcript = transcriber.transcribe(&candidate)?;
-    fs::remove_file(&candidate)?;
+    let transcript = transcriber.transcribe(&audio)?;
     let verdict = Standard::of(store).judge(&item.text, &audio, &transcript);
     Ok(Take { audio, verdict })
 }
@@ -386,7 +384,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
         let phrases = &selected.phrases;
         let path = store.audio_path(item);
         let heard_all = |transcript: &str| {
-            phrases.iter().all(|phrase| transcribe::contains_phrase(transcript, phrase))
+            phrases.iter().all(|phrase| accuracy::contains_phrase(transcript, phrase))
         };
         // The check file holds the take count, so seeds already tried are skipped.
         let (first_take, mut best_rank) = if store.has_audio(item) {
@@ -414,7 +412,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
             let (plausible, clean, score) = current.verdict.rank();
             let heard = heard_all(&accuracy.transcript);
             let rank = (plausible, clean, heard, score);
-            let exact = accuracy.recall >= 0.99 && accuracy.extra <= 0.01;
+            let done = plausible && clean && heard && accuracy.exact();
             println!(
                 "  take {count}: recall {:.2}, extra {:.2}, phrase heard {heard}, floor {:.0} dB",
                 accuracy.recall, accuracy.extra, quality.floor_db,
@@ -424,7 +422,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
                 best_rank = Some(rank);
                 best = Some(current);
             }
-            if plausible && clean && heard && exact {
+            if done {
                 break;
             }
         }

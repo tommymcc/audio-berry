@@ -2,7 +2,7 @@
 
 use crate::quality::{self, Quality};
 use crate::store::NarrationStore;
-use crate::transcribe::{self, Accuracy};
+use crate::accuracy::{self, Accuracy};
 use any_tts::AudioSamples;
 
 /// What a take must meet in one output directory.
@@ -32,7 +32,7 @@ impl Standard {
         Verdict {
             plausible: quality::plausible_length_at(characters, quality.seconds, self.speed),
             clean: quality.clean(self.noise_limit_db),
-            accuracy: transcribe::compare(text, transcript),
+            accuracy: accuracy::compare(text, transcript),
             quality,
         }
     }

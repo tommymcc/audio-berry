@@ -2,7 +2,7 @@
 //! of render settings. Owns chunk numbering, the cache key and the files.
 
 use crate::quality::{MAX_FLOOR_DB, valid_noise_limit};
-use crate::transcribe::contains_phrase;
+use crate::accuracy::contains_phrase;
 use any_tts::{AudioSamples, DeviceSelection};
 use any_tts::models::omnivoice::{OmniVoiceRuntimeChoice, preferred_runtime_choice};
 use std::collections::{HashMap, HashSet};
@@ -394,11 +394,6 @@ impl NarrationStore {
 
     pub fn audio_path(&self, chunk: &Chunk) -> PathBuf {
         self.out.join("chunks").join(format!("{}.wav", chunk.hash))
-    }
-
-    /// Where a take can wait while it's checked.
-    pub fn scratch_path(&self, chunk: &Chunk) -> PathBuf {
-        self.out.join("chunks").join(format!("{}.take.wav", chunk.hash))
     }
 
     pub fn has_audio(&self, chunk: &Chunk) -> bool {
