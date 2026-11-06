@@ -2,7 +2,6 @@
 //! takes, to help write a voice's allowances. It only reads.
 
 use crate::accuracy::{self, Allowances, WordPair};
-use crate::book::chapter_chunks;
 use crate::epub::read_book;
 use crate::store::NarrationStore;
 use crate::voice::{allowances_path, read_allowances};
@@ -81,7 +80,7 @@ fn lines(found: &[Mishearing], allowances: &Allowances) -> Vec<String> {
 pub fn list(epub: &Path, out: &Path, voice_sample: Option<&Path>) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
     let allowances = voice_sample.map(read_allowances).transpose()?.unwrap_or_default();
-    let store = NarrationStore::read(out, &book.title, &chapter_chunks(&book))?;
+    let store = NarrationStore::read(out, &book.title, &book.chunks())?;
     let mut tally = Tally::default();
     let mut seen = HashSet::new();
     let mut skipped = 0;

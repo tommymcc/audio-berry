@@ -1,6 +1,6 @@
 //! Reads an EPUB's spine into chapters of paragraphs.
 
-use crate::text::Paragraph;
+use crate::text::{MAX_CHUNK_CHARS, Paragraph, chunk};
 use epub::doc::{EpubDoc, NavPoint};
 use scraper::{ElementRef, Html, Node, Selector};
 use std::error::Error;
@@ -30,6 +30,20 @@ pub struct Book {
     /// A JPEG or PNG, the formats both M4B players and Cast displays show.
     pub cover: Option<Vec<u8>>,
     pub chapters: Vec<Chapter>,
+}
+
+impl Chapter {
+    /// The chapter's text in chunks, as narrated.
+    pub fn chunks(&self) -> Vec<String> {
+        chunk(&self.paragraphs, MAX_CHUNK_CHARS)
+    }
+}
+
+impl Book {
+    /// Each chapter's chunks, as narrated.
+    pub fn chunks(&self) -> Vec<Vec<String>> {
+        self.chapters.iter().map(Chapter::chunks).collect()
+    }
 }
 
 /// The MIME type and file extension of a JPEG or PNG, judged by its first bytes.

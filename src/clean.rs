@@ -3,6 +3,7 @@
 
 use crate::audio::decode_audio;
 use crate::quality;
+use crate::shell;
 use crate::voice::{SAMPLE_RATE, transcript_path};
 use any_tts::AudioSamples;
 use df::tract::{DfParams, DfTract, RuntimeParams};
@@ -97,22 +98,7 @@ fn retire_transcript(sample: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
 /// `end` of `recording`. The times are text, so advice can show placeholders.
 pub fn command_line(recording: &Path, start: &str, end: &str, output: &Path, reduction_db: Option<f32>) -> String {
     let reduction = reduction_db.map(|db| format!(" --reduction {db}")).unwrap_or_default();
-    format!("audio-berry clean {} {start} {end} {}{reduction}", shell_word(recording), shell_word(output))
-}
-
-/// A path as one shell word, quoted if it has anything a shell would split or
-/// expand, and starting `./` if it would otherwise be read as an option.
-pub fn shell_word(path: &Path) -> String {
-    let mut text = path.display().to_string();
-    if text.starts_with('-') {
-        text.insert_str(0, "./");
-    }
-    let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c);
-    if !text.is_empty() && text.chars().all(plain) {
-        text
-    } else {
-        format!("'{}'", text.replace('\'', r"'\''"))
-    }
+    format!("audio-berry clean {} {start} {end} {}{reduction}", shell::word(recording), shell::word(output))
 }
 
 /// Runs DeepFilterNet 3 over 48 kHz mono audio, removing at most `reduction_db`
@@ -290,12 +276,6 @@ mod tests {
         assert_eq!(plain, "audio-berry clean dad-raw.wav 20.1 30.8 voices/dad-raw-1.wav");
         let quoted = command_line(Path::new("Dad's tape.mp3"), "<start>", "<end>", Path::new("voices/dad.wav"), Some(20.0));
         assert_eq!(quoted, r"audio-berry clean 'Dad'\''s tape.mp3' <start> <end> voices/dad.wav --reduction 20");
-    }
-
-    #[test]
-    fn a_path_that_looks_like_an_option_is_made_relative() {
-        assert_eq!(shell_word(Path::new("-take 2.wav")), "'./-take 2.wav'");
-        assert_eq!(shell_word(Path::new("-take.wav")), "./-take.wav");
     }
 
     #[test]

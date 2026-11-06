@@ -3,8 +3,9 @@
 //! floor once cleaned. Finding them by ear is the slow part of adding a voice.
 
 use crate::audio::decode_audio_up_to;
-use crate::clean::{self, CLEANING_RATE, DEFAULT_REDUCTION_DB, shell_word};
+use crate::clean::{self, CLEANING_RATE, DEFAULT_REDUCTION_DB};
 use crate::quality::{self, FRAME_SECONDS};
+use crate::shell;
 use crate::transcribe::{CHECK_MODEL, Phrase, Transcriber};
 use crate::voice::SAMPLE_RATE;
 use any_tts::AudioSamples;
@@ -173,7 +174,7 @@ pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Res
     println!(
         "\nMake each with its clean command, then hear how each clones with audition, and keep the one most \
          like the speaker:\n    audio-berry audition {}",
-        shell_word(&sample_path(recording, sections[0].start))
+        shell::word(&sample_path(recording, sections[0].start))
     );
     Ok(())
 }
@@ -187,8 +188,8 @@ fn too_long(recording: &Path) -> String {
          ffmpeg -ss 300 -t 600 -i {} {}",
         recording.display(),
         MAX_RECORDING_SECONDS / 60.0,
-        shell_word(recording),
-        shell_word(&part)
+        shell::word(recording),
+        shell::word(&part)
     )
 }
 

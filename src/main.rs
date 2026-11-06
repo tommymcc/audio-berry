@@ -1,4 +1,5 @@
 mod accuracy;
+mod assemble;
 mod audio;
 mod audition;
 mod book;
@@ -11,6 +12,7 @@ mod narrator;
 mod quality;
 mod sample_check;
 mod sections;
+mod shell;
 mod store;
 mod text;
 mod transcribe;
