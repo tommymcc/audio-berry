@@ -14,6 +14,8 @@ mod sample_check;
 mod sections;
 mod shell;
 mod store;
+#[cfg(test)]
+mod test_dir;
 mod text;
 mod transcribe;
 mod voice;

@@ -230,6 +230,7 @@ pub fn parse_reduction(text: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TempDir;
 
     fn rms(samples: &[f32]) -> f32 {
         (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
@@ -280,19 +281,14 @@ mod tests {
 
     #[test]
     fn a_new_voice_sample_moves_its_old_transcript_aside() {
-        let folder = std::env::temp_dir().join(format!("audio-berry-retire-{}", std::process::id()));
-        fs::create_dir_all(&folder).unwrap();
+        let folder = TempDir::new("retire");
         let sample = folder.join("dad.wav");
-        let nothing_to_move = retire_transcript(&sample).unwrap();
+        assert_eq!(retire_transcript(&sample).unwrap(), None);
         fs::write(folder.join("dad.txt"), "Words of the old sample.\n").unwrap();
         let old = retire_transcript(&sample).unwrap();
-        let kept = old.as_ref().map(|old| fs::read_to_string(old).unwrap());
-        let transcript_left = folder.join("dad.txt").exists();
-        fs::remove_dir_all(&folder).unwrap();
-        assert_eq!(nothing_to_move, None);
         assert_eq!(old, Some(folder.join("dad.txt.old")));
-        assert_eq!(kept.as_deref(), Some("Words of the old sample.\n"));
-        assert!(!transcript_left);
+        assert_eq!(fs::read_to_string(folder.join("dad.txt.old")).unwrap(), "Words of the old sample.\n");
+        assert!(!folder.join("dad.txt").exists());
     }
 
     #[test]

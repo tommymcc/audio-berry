@@ -145,6 +145,7 @@ fn save(samples: &[f32], path: &Path) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TempDir;
 
     #[test]
     fn the_hash_stays_the_same() {
@@ -161,20 +162,15 @@ mod tests {
 
     #[test]
     fn no_allowances_file_means_none_and_a_bad_one_names_the_file_and_line() {
-        let dir = std::env::temp_dir().join(format!("audio-berry-voice-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("allowances");
         let sample = dir.join("me.wav");
         let path = allowances_path(&sample);
-        let missing = read_allowances(&sample).map(|allowances| allowances.is_empty());
+        assert!(read_allowances(&sample).unwrap().is_empty());
         fs::write(&path, "in = and\nat had\n").unwrap();
-        let bad = read_allowances(&sample).map(|allowances| allowances.len());
-        fs::write(&path, "in = and  # his accent\n").unwrap();
-        let good = read_allowances(&sample).map(|allowances| allowances.allows("in", "and"));
-        fs::remove_dir_all(&dir).unwrap();
-        assert!(missing.unwrap());
         let wanted = format!("{}: line 2: \"at had\" isn't in the form \"in = and\"", path.display());
-        assert_eq!(bad.unwrap_err().to_string(), wanted);
-        assert!(good.unwrap());
+        assert_eq!(read_allowances(&sample).unwrap_err().to_string(), wanted);
+        fs::write(&path, "in = and  # his accent\n").unwrap();
+        assert!(read_allowances(&sample).unwrap().allows("in", "and"));
     }
 
     #[test]

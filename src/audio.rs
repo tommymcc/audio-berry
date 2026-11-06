@@ -69,17 +69,17 @@ fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, failed: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TempDir;
 
     #[test]
     fn audio_resampled_in_memory_matches_the_saved_file_read_back() {
         // Transcripts are kept, so a take must be heard the same either way.
         let samples = (0..24_000).map(|i| (i as f32 * 0.031).sin() * 0.4 + (i as f32 * 0.17).cos() * 0.1).collect();
         let audio = AudioSamples::new(samples, 24_000);
-        let path = std::env::temp_dir().join(format!("audio-berry-resample-{}.wav", std::process::id()));
+        let dir = TempDir::new("resample");
+        let path = dir.join("take.wav");
         audio.save_wav(&path).unwrap();
-        let from_file = decode_audio(&path, 16_000);
-        std::fs::remove_file(&path).unwrap();
-        let from_file = from_file.unwrap();
+        let from_file = decode_audio(&path, 16_000).unwrap();
         assert_eq!(from_file.len(), 16_000);
         assert_eq!(resample_as_saved(&audio, 16_000).unwrap(), from_file);
     }

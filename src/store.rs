@@ -515,26 +515,9 @@ impl NarrationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_dir::TempDir;
     use any_tts::config::DType;
     use std::fs;
-
-    /// A directory that's removed when the test ends.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("audio-berry-store-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn runtime(device: DeviceSelection, dtype: DType) -> OmniVoiceRuntimeChoice {
         OmniVoiceRuntimeChoice { device, dtype }
@@ -549,7 +532,7 @@ mod tests {
     }
 
     fn open(dir: &TempDir, texts: &[&[&str]]) -> NarrationStore {
-        NarrationStore::open(&dir.0, "A Book", &chapters(texts), 0xabc, &settings(), None).unwrap()
+        NarrationStore::open(dir.path(), "A Book", &chapters(texts), 0xabc, &settings(), None).unwrap()
     }
 
     fn tone() -> AudioSamples {
@@ -569,9 +552,9 @@ mod tests {
 
     #[test]
     fn opening_a_folder_saves_nothing_until_a_take_is_stored() {
-        let dir = TempDir::new("nothing-yet");
+        let dir = TempDir::new("store-nothing-yet");
         open_at(&dir, None).unwrap();
-        assert!(!dir.0.join(MANIFEST).exists());
+        assert!(!dir.join(MANIFEST).exists());
         assert!(open_at(&dir, Some(0.9)).is_ok(), "nothing has been rendered yet");
         render_at(&dir, Some(0.9));
         assert!(open_at(&dir, Some(1.1)).is_err());
@@ -579,16 +562,16 @@ mod tests {
 
     #[test]
     fn speed_on_an_older_folder_is_refused_by_name() {
-        let dir = TempDir::new("older-speed-name");
-        fs::create_dir_all(dir.0.join("chunks")).unwrap();
-        fs::write(dir.0.join("chunks").join("026926e6f4d06f3e.wav"), "audio").unwrap();
+        let dir = TempDir::new("store-older-speed-name");
+        fs::create_dir_all(dir.join("chunks")).unwrap();
+        fs::write(dir.join("chunks").join("026926e6f4d06f3e.wav"), "audio").unwrap();
         let error = open_at(&dir, Some(0.9)).err().unwrap().to_string();
         assert!(error.contains("at normal speed"), "{error}");
     }
 
     #[test]
     fn partly_rendered_chapters_are_named_and_missing_ones_counted() {
-        let dir = TempDir::new("partial");
+        let dir = TempDir::new("store-partial");
         let store = open(&dir, &[&["a", "b"], &["c"], &[], &["d"], &["e"]]);
         store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
         store.store(&store.chunks()[3], &tone(), "d", 1).unwrap();
@@ -598,7 +581,7 @@ mod tests {
 
     fn open_as(dir: &TempDir, title: &str, voice: u64, precision: &str) -> Result<NarrationStore, Box<dyn Error>> {
         let settings = RenderSettings { precision: precision.into(), speed: None };
-        NarrationStore::open(&dir.0, title, &chapters(&[&["a"]]), voice, &settings, None)
+        NarrationStore::open(dir.path(), title, &chapters(&[&["a"]]), voice, &settings, None)
     }
 
     fn numbers(selected: &[Selected]) -> Vec<String> {
@@ -607,7 +590,7 @@ mod tests {
 
     #[test]
     fn a_number_selects_that_chunk_even_with_no_audio() {
-        let dir = TempDir::new("select-number");
+        let dir = TempDir::new("store-select-number");
         let store = open(&dir, &[&["one"], &["two", "three"]]);
         let selected = store.select(&["2.2"]).unwrap();
         assert_eq!(numbers(&selected), ["2.2"]);
@@ -616,7 +599,7 @@ mod tests {
 
     #[test]
     fn selecting_never_adds_chunks_that_were_not_named() {
-        let dir = TempDir::new("select-only");
+        let dir = TempDir::new("store-select-only");
         let store = open(&dir, &[&["one"], &["two"], &["three"]]);
         store.store(&store.chunks()[0], &tone(), "one", 1).unwrap();
         assert_eq!(numbers(&store.select(&["1.1"]).unwrap()), ["1.1"]);
@@ -624,7 +607,7 @@ mod tests {
 
     #[test]
     fn a_number_outside_the_book_is_an_error() {
-        let dir = TempDir::new("select-range");
+        let dir = TempDir::new("store-select-range");
         let store = open(&dir, &[&["one"]]);
         for target in ["1.2", "2.1", "0.1", "1.0"] {
             let error = store.select(&[target]).err().unwrap().to_string();
@@ -634,7 +617,7 @@ mod tests {
 
     #[test]
     fn words_select_only_chunks_with_audio() {
-        let dir = TempDir::new("select-words");
+        let dir = TempDir::new("store-select-words");
         let store = open(&dir, &[&["the white rabbit"], &["a white hat"]]);
         store.store(&store.chunks()[0], &tone(), "x", 1).unwrap();
         let selected = store.select(&["white"]).unwrap();
@@ -644,7 +627,7 @@ mod tests {
 
     #[test]
     fn words_matching_only_missing_chunks_ask_for_a_number() {
-        let dir = TempDir::new("select-missing");
+        let dir = TempDir::new("store-select-missing");
         let store = open(&dir, &[&["the white rabbit"]]);
         let error = store.select(&["white"]).err().unwrap().to_string();
         assert!(error.contains("1.1"), "{error}");
@@ -652,7 +635,7 @@ mod tests {
 
     #[test]
     fn a_bare_number_that_matches_nothing_shows_the_new_form() {
-        let dir = TempDir::new("select-bare");
+        let dir = TempDir::new("store-select-bare");
         let store = open(&dir, &[&["one"]]);
         let error = store.select(&["32"]).err().unwrap().to_string();
         assert!(error.contains("3.12"), "{error}");
@@ -660,7 +643,7 @@ mod tests {
 
     #[test]
     fn shared_audio_is_selected_once_with_every_number() {
-        let dir = TempDir::new("select-shared");
+        let dir = TempDir::new("store-select-shared");
         let store = open(&dir, &[&["same line", "other"], &["same line"]]);
         store.store(&store.chunks()[0], &tone(), "same line", 1).unwrap();
         let selected = store.select(&["same line", "2.1"]).unwrap();
@@ -671,34 +654,34 @@ mod tests {
 
     #[test]
     fn selections_come_back_in_book_order() {
-        let dir = TempDir::new("select-order");
+        let dir = TempDir::new("store-select-order");
         let store = open(&dir, &[&["a"], &["b"]]);
         assert_eq!(numbers(&store.select(&["2.1", "1.1"]).unwrap()), ["1.1", "2.1"]);
     }
 
     fn open_at(dir: &TempDir, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
         let settings = RenderSettings { speed, ..settings() };
-        NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings, None)
+        NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings, None)
     }
 
     #[test]
     fn a_new_speed_gets_its_own_cache_key() {
         // Worked out independently with FNV-1a of "3\nabc\nspeed=0.9\nHello there.".
-        let dir = TempDir::new("speed-key");
+        let dir = TempDir::new("store-speed-key");
         let store = open_at(&dir, Some(0.9)).unwrap();
         assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "6c7ca5b9cb1c27dd.wav");
     }
 
     #[test]
     fn normal_speed_keeps_the_existing_cache_key() {
-        let dir = TempDir::new("speed-normal");
+        let dir = TempDir::new("store-speed-normal");
         let store = open_at(&dir, Some(1.0)).unwrap();
         assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "026926e6f4d06f3e.wav");
     }
 
     #[test]
     fn leaving_out_the_speed_uses_the_saved_one() {
-        let dir = TempDir::new("speed-saved");
+        let dir = TempDir::new("store-speed-saved");
         render_at(&dir, Some(0.9));
         let store = open_at(&dir, None).unwrap();
         assert_eq!(store.speed(), 0.9);
@@ -707,7 +690,7 @@ mod tests {
 
     #[test]
     fn a_different_speed_is_refused_by_name() {
-        let dir = TempDir::new("speed-refused");
+        let dir = TempDir::new("store-speed-refused");
         render_at(&dir, Some(0.9));
         let error = open_at(&dir, Some(1.1)).err().unwrap().to_string();
         assert!(error.contains("with speed"), "{error}");
@@ -715,30 +698,30 @@ mod tests {
 
     #[test]
     fn an_older_folder_is_normal_speed() {
-        let dir = TempDir::new("speed-older");
-        fs::create_dir_all(dir.0.join("chunks")).unwrap();
-        fs::write(dir.0.join("chunks").join("026926e6f4d06f3e.wav"), "audio").unwrap();
+        let dir = TempDir::new("store-speed-older");
+        fs::create_dir_all(dir.join("chunks")).unwrap();
+        fs::write(dir.join("chunks").join("026926e6f4d06f3e.wav"), "audio").unwrap();
         assert_eq!(open_at(&dir, None).unwrap().speed(), 1.0);
         assert!(open_at(&dir, Some(0.9)).is_err());
     }
 
     #[test]
     fn a_folder_from_before_speed_was_saved_is_normal_speed() {
-        let dir = TempDir::new("speed-manifest");
-        fs::write(dir.0.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\n").unwrap();
+        let dir = TempDir::new("store-speed-manifest");
+        fs::write(dir.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\n").unwrap();
         assert_eq!(open_at(&dir, None).unwrap().speed(), 1.0);
     }
 
     #[test]
     fn a_folder_reopens_with_the_same_voice_and_settings() {
-        let dir = TempDir::new("same");
+        let dir = TempDir::new("store-same");
         render_as(&dir, "A Book", 1, "f16");
         assert!(open_as(&dir, "A Book", 1, "f16").is_ok());
     }
 
     #[test]
     fn a_different_voice_is_refused_by_name() {
-        let dir = TempDir::new("voice");
+        let dir = TempDir::new("store-voice");
         render_as(&dir, "A Book", 1, "f16");
         let error = open_as(&dir, "A Book", 2, "f16").err().unwrap().to_string();
         assert!(error.contains("with voice"), "{error}");
@@ -747,7 +730,7 @@ mod tests {
 
     #[test]
     fn a_different_precision_is_refused_by_name() {
-        let dir = TempDir::new("precision");
+        let dir = TempDir::new("store-precision");
         render_as(&dir, "A Book", 1, "f16");
         let error = open_as(&dir, "A Book", 1, "f32").err().unwrap().to_string();
         assert!(error.contains("with precision"), "{error}");
@@ -755,7 +738,7 @@ mod tests {
 
     #[test]
     fn a_different_book_is_refused_by_name() {
-        let dir = TempDir::new("book");
+        let dir = TempDir::new("store-book");
         render_as(&dir, "A Book", 1, "f16");
         let error = open_as(&dir, "Another Book", 1, "f16").err().unwrap().to_string();
         assert!(error.contains("Another Book"), "{error}");
@@ -763,16 +746,16 @@ mod tests {
 
     /// Makes a folder as older versions left it: chunks, but no saved settings.
     fn older_folder(dir: &TempDir, voice: u64) {
-        let scratch = TempDir::new(&format!("older-of-{}", dir.0.display()).replace('/', "-"));
+        let scratch = TempDir::new(&format!("store-older-of-{}", dir.path().display()).replace('/', "-"));
         let store = open_as(&scratch, "A Book", voice, "f16").unwrap();
         let name = store.audio_path(&store.chunks()[0]);
-        fs::create_dir_all(dir.0.join("chunks")).unwrap();
-        fs::write(dir.0.join("chunks").join(name.file_name().unwrap()), "audio").unwrap();
+        fs::create_dir_all(dir.join("chunks")).unwrap();
+        fs::write(dir.join("chunks").join(name.file_name().unwrap()), "audio").unwrap();
     }
 
     #[test]
     fn an_older_folder_with_matching_chunks_adopts_the_voice() {
-        let dir = TempDir::new("adopt");
+        let dir = TempDir::new("store-adopt");
         older_folder(&dir, 1);
         open_as(&dir, "A Book", 1, "f16").unwrap();
         assert!(open_as(&dir, "A Book", 2, "f16").is_err(), "the adopted voice should now be saved");
@@ -780,7 +763,7 @@ mod tests {
 
     #[test]
     fn an_older_folder_with_no_matching_chunks_is_refused() {
-        let dir = TempDir::new("mismatch");
+        let dir = TempDir::new("store-mismatch");
         older_folder(&dir, 1);
         let error = open_as(&dir, "A Book", 2, "f16").err().unwrap().to_string();
         assert!(error.contains("new output directory"), "{error}");
@@ -788,7 +771,7 @@ mod tests {
 
     #[test]
     fn an_older_folder_is_assumed_to_be_the_default_precision() {
-        let dir = TempDir::new("older-precision");
+        let dir = TempDir::new("store-older-precision");
         older_folder(&dir, 1);
         assert!(open_as(&dir, "A Book", 1, "f32").is_err());
     }
@@ -814,7 +797,7 @@ mod tests {
     }
 
     fn open_store(dir: &TempDir, noise_limit: Option<f32>) -> Result<NarrationStore, Box<dyn Error>> {
-        NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), noise_limit)
+        NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), noise_limit)
     }
 
     fn open_with_limit(dir: &TempDir, noise_limit: Option<f32>) -> NarrationStore {
@@ -827,30 +810,30 @@ mod tests {
     }
 
     fn saved_limit(dir: &TempDir) -> Option<String> {
-        let text = fs::read_to_string(dir.0.join(MANIFEST)).unwrap();
+        let text = fs::read_to_string(dir.join(MANIFEST)).unwrap();
         text.lines().find_map(|line| line.strip_prefix("noise_limit_db=")).map(str::to_string)
     }
 
     #[test]
     fn the_noise_limit_is_saved_with_the_first_take() {
-        let dir = TempDir::new("limit-first");
+        let dir = TempDir::new("store-limit-first");
         let store = open_with_limit(&dir, Some(-50.0));
         assert_eq!(store.noise_limit_db(), -50.0);
-        assert!(!dir.0.join(MANIFEST).exists());
+        assert!(!dir.join(MANIFEST).exists());
         store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
         assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
     }
 
     #[test]
     fn the_default_noise_limit_is_saved_when_none_is_given() {
-        let dir = TempDir::new("limit-default");
+        let dir = TempDir::new("store-limit-default");
         render_with_limit(&dir, None);
         assert_eq!(saved_limit(&dir).as_deref(), Some("-55"));
     }
 
     #[test]
     fn the_saved_noise_limit_is_used_when_none_is_given() {
-        let dir = TempDir::new("limit-reused");
+        let dir = TempDir::new("store-limit-reused");
         render_with_limit(&dir, Some(-50.0));
         assert_eq!(open_with_limit(&dir, None).noise_limit_db(), -50.0);
         assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
@@ -858,15 +841,15 @@ mod tests {
 
     #[test]
     fn a_new_noise_limit_replaces_the_saved_one_and_keeps_the_audio() {
-        let dir = TempDir::new("limit-changed");
+        let dir = TempDir::new("store-limit-changed");
         render_with_limit(&dir, Some(-50.0));
-        let before = fs::read_to_string(dir.0.join(MANIFEST)).unwrap();
+        let before = fs::read_to_string(dir.join(MANIFEST)).unwrap();
         let store = open_with_limit(&dir, Some(-48.5));
         assert_eq!(store.noise_limit_db(), -48.5);
         assert!(store.has_audio(&store.chunks()[0]), "the cached take should still be found");
         assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "026926e6f4d06f3e.wav");
         assert_eq!(saved_limit(&dir).as_deref(), Some("-48.5"));
-        let after = fs::read_to_string(dir.0.join(MANIFEST)).unwrap();
+        let after = fs::read_to_string(dir.join(MANIFEST)).unwrap();
         assert_eq!(before.replace("noise_limit_db=-50", "noise_limit_db=-48.5"), after);
         assert_eq!(open_with_limit(&dir, None).noise_limit_db(), -48.5);
     }
@@ -876,8 +859,8 @@ mod tests {
 
     fn folder_without_a_saved_limit(name: &str) -> TempDir {
         let dir = TempDir::new(name);
-        fs::create_dir_all(dir.0.join("chunks")).unwrap();
-        fs::write(dir.0.join(MANIFEST), OLDER_MANIFEST).unwrap();
+        fs::create_dir_all(dir.join("chunks")).unwrap();
+        fs::write(dir.join(MANIFEST), OLDER_MANIFEST).unwrap();
         dir
     }
 
@@ -887,8 +870,8 @@ mod tests {
         // default would quietly judge its takes against the wrong one.
         let dir = folder_without_a_saved_limit("limit-older");
         assert_eq!(open_with_limit(&dir, None).noise_limit_db(), MAX_FLOOR_DB);
-        assert_eq!(fs::read_to_string(dir.0.join(MANIFEST)).unwrap(), OLDER_MANIFEST);
-        let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), None, &dir.0);
+        assert_eq!(fs::read_to_string(dir.join(MANIFEST)).unwrap(), OLDER_MANIFEST);
+        let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), None, dir.path());
         assert!(settled.note.unwrap().contains("give it once"));
     }
 
@@ -898,7 +881,7 @@ mod tests {
         assert_eq!(open_with_limit(&dir, Some(-50.0)).noise_limit_db(), -50.0);
         assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
         assert_eq!(open_with_limit(&dir, None).noise_limit_db(), -50.0);
-        let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), Some(-50.0), &dir.0);
+        let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), Some(-50.0), dir.path());
         let note = settled.note.unwrap();
         assert!(note.contains("saved in") && !note.contains("replacing"), "{note}");
     }
@@ -915,14 +898,14 @@ mod tests {
     #[test]
     fn a_bad_saved_noise_limit_is_an_error_that_says_how_to_fix_it() {
         let dir = folder_without_a_saved_limit("limit-bad");
-        fs::write(dir.0.join(MANIFEST), format!("{OLDER_MANIFEST}noise_limit_db=loud\n")).unwrap();
+        fs::write(dir.join(MANIFEST), format!("{OLDER_MANIFEST}noise_limit_db=loud\n")).unwrap();
         let error = open_store(&dir, Some(-50.0)).err().unwrap().to_string();
         assert!(error.contains("noise_limit_db=loud") && error.contains("delete that line"), "{error}");
     }
 
     #[test]
     fn a_stored_take_can_be_read_back() {
-        let dir = TempDir::new("roundtrip");
+        let dir = TempDir::new("store-roundtrip");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         assert!(!store.has_audio(chunk));
@@ -933,25 +916,25 @@ mod tests {
 
     #[test]
     fn reading_a_folder_finds_its_takes_at_its_saved_speed() {
-        let dir = TempDir::new("read");
+        let dir = TempDir::new("store-read");
         render_at(&dir, Some(0.9));
-        let store = NarrationStore::read(&dir.0, "A Book", &chapters(&[&["Hello there."]])).unwrap();
+        let store = NarrationStore::read(dir.path(), "A Book", &chapters(&[&["Hello there."]])).unwrap();
         assert_eq!(store.speed(), 0.9);
         assert_eq!(store.check(&store.chunks()[0]).unwrap(), Check { takes: 1, transcript: "a".into() });
-        assert!(NarrationStore::read(&dir.0, "Another Book", &chapters(&[&["Hello there."]])).is_err());
+        assert!(NarrationStore::read(dir.path(), "Another Book", &chapters(&[&["Hello there."]])).is_err());
     }
 
     #[test]
     fn reading_a_folder_with_nothing_rendered_is_an_error_that_changes_nothing() {
-        let dir = TempDir::new("read-empty");
-        let error = NarrationStore::read(&dir.0, "A Book", &chapters(&[&["a"]])).err().unwrap().to_string();
+        let dir = TempDir::new("store-read-empty");
+        let error = NarrationStore::read(dir.path(), "A Book", &chapters(&[&["a"]])).err().unwrap().to_string();
         assert!(error.ends_with("has no narration.txt, so nothing has been rendered there"), "{error}");
-        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
     fn a_malformed_check_file_is_an_error() {
-        let dir = TempDir::new("malformed");
+        let dir = TempDir::new("store-malformed");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), "heard", 1).unwrap();
@@ -961,7 +944,7 @@ mod tests {
 
     #[test]
     fn recording_tried_seeds_keeps_the_transcript() {
-        let dir = TempDir::new("tried");
+        let dir = TempDir::new("store-tried");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), "heard", 1).unwrap();
@@ -971,20 +954,20 @@ mod tests {
 
     #[test]
     fn retiring_a_take_keeps_it_in_replaced() {
-        let dir = TempDir::new("retire");
+        let dir = TempDir::new("store-retire");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), "heard", 3).unwrap();
         store.retire(chunk).unwrap();
         assert!(!store.has_audio(chunk));
         let name = store.audio_path(chunk).file_stem().unwrap().to_str().unwrap().to_string();
-        assert!(dir.0.join("replaced").join(format!("{name}-3.wav")).exists());
-        assert_eq!(fs::read_to_string(dir.0.join("replaced").join(format!("{name}-3.check"))).unwrap(), "3\nheard");
+        assert!(dir.join("replaced").join(format!("{name}-3.wav")).exists());
+        assert_eq!(fs::read_to_string(dir.join("replaced").join(format!("{name}-3.check"))).unwrap(), "3\nheard");
     }
 
     #[test]
     fn pending_lists_only_the_chapters_asked_for_and_shared_audio_once() {
-        let dir = TempDir::new("pending");
+        let dir = TempDir::new("store-pending");
         let store = open(&dir, &[&["a", "b", "a"], &["c"]]);
         store.store(&store.chunks()[1], &tone(), "b", 1).unwrap();
         let numbers: Vec<String> = store.pending(&[0]).iter().map(|chunk| chunk.number()).collect();
@@ -993,7 +976,7 @@ mod tests {
 
     #[test]
     fn only_chapters_with_all_their_audio_are_complete() {
-        let dir = TempDir::new("complete");
+        let dir = TempDir::new("store-complete");
         let store = open(&dir, &[&["a", "b"], &["c"], &[], &["d"]]);
         store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
         store.store(&store.chunks()[3], &tone(), "d", 1).unwrap();
@@ -1003,7 +986,7 @@ mod tests {
 
     #[test]
     fn chunk_numbers_count_from_one_within_each_chapter() {
-        let dir = TempDir::new("numbers");
+        let dir = TempDir::new("store-numbers");
         let store = open(&dir, &[&["a", "b"], &["c"]]);
         let numbers: Vec<String> = store.chunks().iter().map(Chunk::number).collect();
         assert_eq!(numbers, ["1.1", "1.2", "2.1"]);
@@ -1012,7 +995,7 @@ mod tests {
     #[test]
     fn chunk_files_keep_the_existing_cache_key() {
         // Worked out independently with FNV-1a of "3\nabc\nHello there.".
-        let dir = TempDir::new("key");
+        let dir = TempDir::new("store-key");
         let store = open(&dir, &[&["Hello there."]]);
         let path = store.audio_path(&store.chunks()[0]);
         assert_eq!(path.file_name().unwrap(), "026926e6f4d06f3e.wav");
