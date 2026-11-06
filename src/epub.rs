@@ -46,7 +46,7 @@ pub fn image_type(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
 /// Inlines entities declared in the DOCTYPE and removes it. HTML parsers don't
 /// honour custom entities, and end the DOCTYPE at its first `>`, which would
 /// spill the declarations into the text.
-pub fn expand_doctype(source: &str) -> String {
+fn expand_doctype(source: &str) -> String {
     let Some(start) = source.find("<!DOCTYPE") else {
         return source.to_string();
     };
@@ -145,7 +145,7 @@ fn walk(element: ElementRef, current: &mut String, heading: bool, paragraphs: &m
 }
 
 /// Extracts the readable paragraphs from one XHTML document.
-pub fn extract_paragraphs(source: &str) -> Vec<Paragraph> {
+fn extract_paragraphs(source: &str) -> Vec<Paragraph> {
     let document = Html::parse_document(&expand_doctype(source));
     let mut paragraphs = Vec::new();
     let Ok(selector) = Selector::parse("body") else {

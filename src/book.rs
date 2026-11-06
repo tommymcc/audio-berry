@@ -8,7 +8,7 @@ use crate::quality;
 use crate::store::{Chunk, NarrationStore, RenderSettings, fnv};
 use crate::text::{MAX_CHUNK_CHARS, chunk};
 use crate::transcribe::{self, Transcriber};
-use crate::voice::Voice;
+use crate::voice::{SAMPLE_RATE, Voice};
 use any_tts::AudioSamples;
 use std::error::Error;
 use std::fmt::Write as _;
@@ -172,7 +172,7 @@ fn tag_chapter(book: &Book, title: &str, untagged: &Path, tagged: &Path) -> Resu
 fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let chapter_dir = out.join("chapters");
     fs::create_dir_all(&chapter_dir)?;
-    let mut sample_rate = 24_000;
+    let mut sample_rate = SAMPLE_RATE;
     let mut all = Vec::new();
     let mut metadata = format!(";FFMETADATA1\ntitle={}\n", metadata_escape(&book.title));
     if let Some(author) = &book.author {

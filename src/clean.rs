@@ -17,7 +17,7 @@ use std::path::Path;
 pub const DEFAULT_REDUCTION_DB: f32 = 15.0;
 
 /// DeepFilterNet treats 100 dB as no limit at all.
-pub const REDUCTION_RANGE: std::ops::RangeInclusive<f32> = 1.0..=100.0;
+const REDUCTION_RANGE: std::ops::RangeInclusive<f32> = 1.0..=100.0;
 
 /// DeepFilterNet 3 works at 48 kHz.
 const CLEANING_RATE: u32 = 48_000;

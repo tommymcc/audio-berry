@@ -52,6 +52,10 @@ fn to_db(linear: f32) -> f32 {
     20.0 * linear.max(1e-5).log10()
 }
 
+fn from_db(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
 fn frame_levels(samples: &[f32], sample_rate: u32) -> Vec<f32> {
     let size = ((sample_rate as f32 * FRAME_SECONDS) as usize).max(1);
     samples
@@ -64,7 +68,7 @@ pub fn measure(samples: &[f32], sample_rate: u32) -> Quality {
     let mut levels = frame_levels(samples, sample_rate);
     levels.sort_by(f32::total_cmp);
     let floor = levels.get(levels.len() / 20).copied().unwrap_or(0.0);
-    let threshold = 10f32.powf(SILENCE_DB / 20.0);
+    let threshold = from_db(SILENCE_DB);
     let active: Vec<f32> = levels.into_iter().filter(|level| *level > threshold).collect();
     let speech = if active.is_empty() {
         0.0
@@ -90,7 +94,7 @@ impl Quality {
 /// Whether a take's length is plausible for its text. A take far outside this
 /// has probably skipped words or run on. Tested speech ran at 16-19 characters
 /// per second, and short headings can be slower.
-pub fn plausible_length(characters: usize, seconds: f32) -> bool {
+fn plausible_length(characters: usize, seconds: f32) -> bool {
     let characters = characters as f32;
     seconds >= characters / 30.0 && seconds <= characters / 9.0 + 4.0
 }
@@ -103,7 +107,7 @@ pub fn plausible_length_at(characters: usize, seconds: f32, speed: f64) -> bool 
 /// Removes leading and trailing silence, so gaps between chunks are consistent.
 pub fn trim_silence(samples: &[f32], sample_rate: u32) -> &[f32] {
     let size = ((sample_rate as f32 * FRAME_SECONDS) as usize).max(1);
-    let threshold = 10f32.powf(SILENCE_DB / 20.0);
+    let threshold = from_db(SILENCE_DB);
     let levels = frame_levels(samples, sample_rate);
     let Some(first) = levels.iter().position(|level| *level > threshold) else {
         return samples;
@@ -120,7 +124,7 @@ pub fn trim_silence(samples: &[f32], sample_rate: u32) -> &[f32] {
 pub fn gain_for(quality: &Quality, target_db: f32) -> f32 {
     let wanted = (target_db - quality.speech_db).clamp(-6.0, 6.0);
     let room = -1.0 - quality.peak_db;
-    10f32.powf(wanted.min(room) / 20.0)
+    from_db(wanted.min(room))
 }
 
 #[cfg(test)]

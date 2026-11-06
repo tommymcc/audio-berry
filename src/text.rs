@@ -155,7 +155,7 @@ fn soften_capitals(text: &str) -> String {
 }
 
 /// Cleans one paragraph for reading aloud.
-pub fn normalize(paragraph: &Paragraph) -> String {
+fn normalize(paragraph: &Paragraph) -> String {
     let mut text = String::with_capacity(paragraph.text.len());
     for c in replace_double_hyphens(&paragraph.text).chars() {
         match c {
@@ -224,7 +224,7 @@ pub fn normalize(paragraph: &Paragraph) -> String {
 }
 
 /// Splits text at sentence ends, keeping closing quotes with their sentence.
-pub fn split_sentences(text: &str) -> Vec<String> {
+fn split_sentences(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut sentences = Vec::new();
     let mut start = 0;
