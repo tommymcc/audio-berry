@@ -26,24 +26,26 @@ struct Lines<W> {
 }
 
 impl Progress {
-    /// Progress where, without a terminal, each finished chunk prints its summary
-    /// with the time elapsed and left.
-    pub fn new(total: usize) -> Self {
-        Self::on_stdout(total, true)
+    /// Progress through a book of `total` chunks, `already_done` of them rendered
+    /// before this run. The bar shows the whole book, with the time left at this
+    /// run's pace. Without a terminal, each chunk this run finishes prints its
+    /// summary with the time elapsed and left, counted over this run's chunks only.
+    pub fn new(total: usize, already_done: usize) -> Self {
+        Self::on_stdout(total, already_done, true)
     }
 
     /// Progress where, without a terminal, a finished chunk prints nothing, for a
     /// caller that already prints its own lines per chunk.
     pub fn untimed(total: usize) -> Self {
-        Self::on_stdout(total, false)
+        Self::on_stdout(total, 0, false)
     }
 
-    fn on_stdout(total: usize, timed: bool) -> Self {
+    fn on_stdout(total: usize, already_done: usize, timed: bool) -> Self {
         let out = io::stdout();
         if out.is_terminal() {
-            Progress { show: Show::Bar(bar(total)) }
+            Progress { show: Show::Bar(bar(total, already_done)) }
         } else {
-            Self::lines(out, total, timed)
+            Self::lines(out, total.saturating_sub(already_done), timed)
         }
     }
 }
@@ -107,7 +109,18 @@ fn minutes_left(elapsed_secs: f32, done: usize, total: usize) -> f32 {
     elapsed_secs / done as f32 * total.saturating_sub(done) as f32 / 60.0
 }
 
-fn bar(total: usize) -> ProgressBar {
+/// The bar's time left: chunks done before this run count towards the position,
+/// but only this run's chunks set the pace.
+fn bar_time_left(elapsed_secs: f32, position: usize, total: usize, already_done: usize) -> String {
+    let done_this_run = position.saturating_sub(already_done);
+    if done_this_run == 0 {
+        return "time left unknown".to_string();
+    }
+    let left = minutes_left(elapsed_secs, done_this_run, total.saturating_sub(already_done));
+    format!("about {left:.0} min left")
+}
+
+fn bar(total: usize, already_done: usize) -> ProgressBar {
     let style = ProgressStyle::with_template(
         "[{pos}/{len}] {wide_bar} {percent}%, {minutes} min elapsed, {left}\n{wide_msg}",
     )
@@ -115,17 +128,13 @@ fn bar(total: usize) -> ProgressBar {
     .with_key("minutes", |state: &ProgressState, out: &mut dyn std::fmt::Write| {
         write!(out, "{:.0}", state.elapsed().as_secs_f32() / 60.0).ok();
     })
-    .with_key("left", |state: &ProgressState, out: &mut dyn std::fmt::Write| {
-        let done = state.pos() as usize;
+    .with_key("left", move |state: &ProgressState, out: &mut dyn std::fmt::Write| {
+        let position = state.pos() as usize;
         let total = state.len().unwrap_or(0) as usize;
-        if done == 0 {
-            write!(out, "time left unknown").ok();
-        } else {
-            let left = minutes_left(state.elapsed().as_secs_f32(), done, total);
-            write!(out, "about {left:.0} min left").ok();
-        }
+        write!(out, "{}", bar_time_left(state.elapsed().as_secs_f32(), position, total, already_done)).ok();
     });
     let bar = ProgressBar::with_draw_target(Some(total as u64), ProgressDrawTarget::stdout()).with_style(style);
+    bar.set_position(already_done as u64);
     // Chunks take many seconds each, so tick to keep the elapsed time moving.
     bar.enable_steady_tick(Duration::from_secs(1));
     bar
@@ -162,6 +171,14 @@ mod tests {
     }
 
     #[test]
+    fn the_bar_paces_time_left_by_this_runs_chunks_only() {
+        // 163 of 1421 were done before; this run did 10 in 120s, so 1248 left at 12s each.
+        assert_eq!(bar_time_left(120.0, 173, 1421, 163), "about 250 min left");
+        assert_eq!(bar_time_left(30.0, 163, 1421, 163), "time left unknown");
+        assert_eq!(bar_time_left(600.0, 1421, 1421, 163), "about 0 min left");
+    }
+
+    #[test]
     fn plain_lines_print_messages_and_finished_chunks_in_order() {
         let mut progress = Progress::lines(Vec::new(), 2, true);
         progress.line("  take 1 rejected: floor -51 dB, 19.2s, recall 0.94, extra 0.04").unwrap();
@@ -188,7 +205,7 @@ mod tests {
     #[test]
     #[ignore = "draws to the terminal and takes a few seconds"]
     fn bar_demo() {
-        let mut progress = Progress::new(5);
+        let mut progress = Progress::new(8, 3);
         for chunk in 1..=5 {
             std::thread::sleep(Duration::from_millis(700));
             if chunk % 2 == 0 {

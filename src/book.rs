@@ -203,7 +203,7 @@ pub fn narrate(
     println!("{total} chunks, {} to generate", pending.len());
     if !pending.is_empty() {
         let mut recorder = Recorder::load(&voice, &store, &standard)?;
-        let mut progress = Progress::new(pending.len());
+        let mut progress = Progress::new(total, total - pending.len());
         for item in &pending {
             let (take, count) = recorder.best(item, &mut progress)?;
             store.store(item, &take.audio, &take.verdict.accuracy.transcript, count)?;

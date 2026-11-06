@@ -300,8 +300,9 @@ its text, transcript and chunk file so you can listen to it. Finished chunks are
 cached in `chunks/`, so rerunning the same command resumes an interrupted book.
 
 In a terminal, `book` and `retake` show a progress bar with the time left and the
-latest chunk's take and recall. Redirected to a file, they print one line per
-chunk instead, such as
+latest chunk's take and recall. For `book` the bar covers the whole book, so a
+resumed run starts part-way along, but the time left comes from this run's pace.
+Redirected to a file, they print one line per chunk this run makes instead, such as
 `[3/40] 22s of audio, take 1, recall 0.98, 2 min elapsed, about 31 min left`.
 
 The M4B and `report.tsv` cover every chapter rendered in that output directory so
