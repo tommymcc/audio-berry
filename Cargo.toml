@@ -19,6 +19,7 @@ candle-transformers = "0.10.2"
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"] }
 epub = "2"
 flate2 = "1"
+indicatif = "0.18"
 mdns-sd = "0.21"
 # The version deep_filter uses, for passing audio to it.
 ndarray = "0.15"

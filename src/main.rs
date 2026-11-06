@@ -9,6 +9,7 @@ mod clean;
 mod epub;
 mod mishearings;
 mod narrator;
+mod progress;
 mod quality;
 mod sample_check;
 mod sections;

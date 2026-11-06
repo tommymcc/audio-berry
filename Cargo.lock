@@ -110,6 +110,7 @@ dependencies = [
  "deep_filter",
  "epub",
  "flate2",
+ "indicatif",
  "libc",
  "mdns-sd",
  "ndarray",

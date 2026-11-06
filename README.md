@@ -299,6 +299,11 @@ If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
 cached in `chunks/`, so rerunning the same command resumes an interrupted book.
 
+In a terminal, `book` and `retake` show a progress bar with the time left and the
+latest chunk's take and recall. Redirected to a file, they print one line per
+chunk instead, such as
+`[3/40] 22s of audio, take 1, recall 0.98, 2 min elapsed, about 31 min left`.
+
 The M4B and `report.tsv` cover every chapter rendered in that output directory so
 far, so rendering chapter 3 and then chapter 4 builds up one audiobook. The M4B
 holds only complete chapters, and the command prints how many chunks and chapters

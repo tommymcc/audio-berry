@@ -6,6 +6,7 @@ use crate::assemble::assemble;
 use crate::checks::{Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
+use crate::progress::Progress;
 use crate::quality;
 use crate::store::{Chunk, NarrationStore, RenderSettings, fnv};
 use crate::transcribe::{self, Transcriber};
@@ -15,7 +16,6 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
 
 /// Takes tried per chunk by `book`.
 pub const MAX_TAKES: u64 = 5;
@@ -93,7 +93,8 @@ impl<'a> Recorder<'a> {
     }
 
     /// Renders takes until one passes, or returns the best of them with its take count.
-    fn best(&mut self, item: &Chunk) -> Result<(Take, u64), Box<dyn Error>> {
+    /// Each rejected take is reported through `progress`.
+    fn best(&mut self, item: &Chunk, progress: &mut Progress) -> Result<(Take, u64), Box<dyn Error>> {
         let mut best: Option<Take> = None;
         for take in 0..MAX_TAKES {
             let current = self.take(item, take)?;
@@ -101,14 +102,14 @@ impl<'a> Recorder<'a> {
                 return Ok((current, take + 1));
             }
             let Verdict { quality, accuracy, .. } = &current.verdict;
-            println!(
+            progress.line(&format!(
                 "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}",
                 take + 1,
                 quality.floor_db,
                 quality.seconds,
                 accuracy.recall,
                 accuracy.extra,
-            );
+            ))?;
             let replace = best
                 .as_ref()
                 .is_none_or(|existing| current.verdict.rank() > existing.verdict.rank());
@@ -202,22 +203,17 @@ pub fn narrate(
     println!("{total} chunks, {} to generate", pending.len());
     if !pending.is_empty() {
         let mut recorder = Recorder::load(&voice, &store, &standard)?;
-        let started = Instant::now();
-        let mut done = 0;
+        let mut progress = Progress::new(pending.len());
         for item in &pending {
-            let (take, count) = recorder.best(item)?;
+            let (take, count) = recorder.best(item, &mut progress)?;
             store.store(item, &take.audio, &take.verdict.accuracy.transcript, count)?;
-            done += 1;
-            let elapsed = started.elapsed().as_secs_f32();
-            println!(
-                "[{done}/{}] {:.0}s of audio, take {count}, recall {:.2}, {:.0} min elapsed, about {:.0} min left",
-                pending.len(),
+            progress.chunk_done(&format!(
+                "{:.0}s of audio, take {count}, recall {:.2}",
                 take.audio.duration_secs(),
                 take.verdict.accuracy.recall,
-                elapsed / 60.0,
-                elapsed / done as f32 * (pending.len() - done) as f32 / 60.0,
-            );
+            ))?;
         }
+        progress.finish();
     }
 
     let flagged = write_report(&book, &store, &standard, out)?;
@@ -270,6 +266,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
     let wanted = store.select(targets)?;
 
     let mut recorder = Recorder::load(&voice, &store, &standard)?;
+    let mut progress = Progress::quiet(wanted.len());
     for (position, selected) in wanted.iter().enumerate() {
         let item = selected.chunk;
         let phrases = &selected.phrases;
@@ -286,13 +283,13 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
         } else {
             (0, None)
         };
-        println!(
-            "[{}/{}] chunk {}: {}",
+        let numbers = selected.numbers.join(", ");
+        progress.line(&format!(
+            "[{}/{}] chunk {numbers}: {}",
             position + 1,
             wanted.len(),
-            selected.numbers.join(", "),
             item.text.chars().take(60).collect::<String>()
-        );
+        ))?;
 
         let mut best: Option<Take> = None;
         let mut count = first_take;
@@ -304,11 +301,11 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
             let heard = heard_all(&accuracy.transcript);
             let rank = (plausible, clean, heard, score);
             let done = plausible && clean && heard && accuracy.exact();
-            println!(
+            progress.line(&format!(
                 "  take {count}: recall {:.2}, extra {:.2}, phrase heard {heard}, floor {:.0} dB",
                 accuracy.recall, accuracy.extra, quality.floor_db,
-            );
-            println!("    heard: {}", accuracy.transcript);
+            ))?;
+            progress.line(&format!("    heard: {}", accuracy.transcript))?;
             if best_rank.is_none_or(|existing| rank > existing) {
                 best_rank = Some(rank);
                 best = Some(current);
@@ -317,21 +314,25 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
                 break;
             }
         }
-        match best {
+        let outcome = match best {
             Some(take) => {
                 if store.has_audio(item) {
                     store.retire(item)?;
                 }
                 store.store(item, &take.audio, &take.verdict.accuracy.transcript, count)?;
-                println!("  replaced: {}", take.verdict.accuracy.transcript);
+                progress.line(&format!("  replaced: {}", take.verdict.accuracy.transcript))?;
+                "replaced"
             }
             None => {
                 // Still counts the tried seeds, so the next retake tries new ones.
                 store.record_tried(item, count)?;
-                println!("  kept the current take; none was better");
+                progress.line("  kept the current take; none was better")?;
+                "kept the current take"
             }
-        }
+        };
+        progress.chunk_done(&format!("chunk {numbers}: {outcome}"))?;
     }
+    progress.finish();
 
     let flagged = write_report(&book, &store, &standard, out)?;
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
