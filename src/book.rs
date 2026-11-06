@@ -1,6 +1,6 @@
 //! Narrates a whole book: generates checked chunks, then assembles the audio.
 
-use crate::accuracy;
+use crate::accuracy::Allowances;
 use crate::checks::{Standard, Verdict};
 use crate::epub::{Book, image_type, read_book};
 use crate::narrator::Narrator;
@@ -8,7 +8,7 @@ use crate::quality;
 use crate::store::{Chunk, NarrationStore, RenderSettings, fnv};
 use crate::text::{MAX_CHUNK_CHARS, chunk};
 use crate::transcribe::{self, Transcriber};
-use crate::voice::{SAMPLE_RATE, Voice};
+use crate::voice::{SAMPLE_RATE, Voice, allowances_path, read_allowances};
 use any_tts::AudioSamples;
 use std::error::Error;
 use std::fmt::Write as _;
@@ -24,6 +24,16 @@ const MAX_RETAKES: u64 = 6;
 const SPEECH_TARGET_DB: f32 = -21.0;
 const CHUNK_GAP_SECONDS: f32 = 0.35;
 const CHAPTER_GAP_SECONDS: f32 = 1.2;
+
+/// Reads the voice's allowances, and says how many there are, since they change
+/// which takes pass.
+fn read_allowances_saying_so(voice_sample: &Path) -> Result<Allowances, Box<dyn Error>> {
+    let allowances = read_allowances(voice_sample)?;
+    if !allowances.is_empty() {
+        println!("Allowances: {} from {}", allowances.len(), allowances_path(voice_sample).display());
+    }
+    Ok(allowances)
+}
 
 /// Each chapter's chunks, as narrated.
 pub fn chapter_chunks(book: &Book) -> Vec<Vec<String>> {
@@ -293,9 +303,10 @@ pub fn narrate(
         None => (0..book.chapters.len()).collect(),
     };
 
+    let allowances = read_allowances_saying_so(voice_sample)?;
     let voice = Voice::load(voice_sample)?;
     let store = open_store(&book, &voice, out, speed)?;
-    let standard = Standard::of(&store, voice.allowances());
+    let standard = Standard::of(&store, allowances);
 
     let text_dir = out.join("text");
     fs::create_dir_all(&text_dir)?;
@@ -376,9 +387,10 @@ fn print_missing(store: &NarrationStore) {
 /// the M4B alone, so it's safe during playback; `book` rebuilds it afterwards.
 pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
+    let allowances = read_allowances_saying_so(voice_sample)?;
     let voice = Voice::load(voice_sample)?;
     let store = open_store(&book, &voice, out, None)?;
-    let standard = Standard::of(&store, voice.allowances());
+    let standard = Standard::of(&store, allowances);
     let wanted = store.select(targets)?;
 
     let mut recorder = Recorder::load(&voice, &store, &standard)?;
@@ -387,7 +399,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
         let phrases = &selected.phrases;
         let path = store.audio_path(item);
         let heard_all = |transcript: &str| {
-            phrases.iter().all(|phrase| accuracy::contains_phrase(transcript, phrase))
+            phrases.iter().all(|phrase| standard.heard(phrase, transcript))
         };
         // The check file holds the take count, so seeds already tried are skipped.
         let (first_take, mut best_rank) = if store.has_audio(item) {

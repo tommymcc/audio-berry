@@ -212,7 +212,7 @@ audio-berry speak <voice-sample> <text> <output.wav> [--speed <factor>]
 audio-berry chapters <book.epub>
 audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers] [--speed <factor>]
 audio-berry retake <voice-sample> <book.epub> <output-dir> <words or chunk number>...
-audio-berry mishearings <book.epub> <output-dir>
+audio-berry mishearings <book.epub> <output-dir> [voice-sample]
 audio-berry speakers
 audio-berry play <speaker> <file>...
 audio-berry audition <voice-sample> [speaker] [--speed <factor>]
@@ -226,7 +226,8 @@ sample, 3 by default, each with the `clean` command that makes it. With
 [Adding a voice](#adding-a-voice).
 
 `mishearings` lists the words most often heard as other words in the takes kept
-in an output directory, to help write a voice's allowances. It only reads. See
+in an output directory, to help write a voice's allowances. Given the voice
+sample, it marks the pairs already allowed. It only reads. See
 [Allowances](#allowances).
 
 `clean` makes a voice sample from a noisy recording: it removes background noise
@@ -398,8 +399,9 @@ at = had
 Each line pairs a word from the book with the word heard instead. `#` starts a
 comment. Words are compared as the check compares them, ignoring case and
 punctuation, with small numbers spelled out, and each side must be one word. A
-bad line stops the run with the file and line number. When a voice has
-allowances, each run says so:
+bad line stops `book` or `retake` with the file and line number. Only those
+commands, which judge takes, read the file, so `speak` and `audition` ignore it.
+When a voice has allowances, `book` and `retake` say so:
 
 ```text
 Allowances: 2 from voices/dad.allowances
@@ -410,30 +412,38 @@ the book's "and" as "in". Add the reverse as its own line only if that happens
 too.
 
 Allowances aren't part of the voice. Adding or changing them keeps every chunk
-already rendered and nothing is saved in `narration.txt`: they only change which
-takes pass from then on, in `book`, `retake` and the `CHECK` flags in
-`report.tsv`.
+already rendered and nothing is saved in `narration.txt`: they only change how
+takes are judged from then on. That covers new takes in `book` and `retake`,
+which take a `retake` keeps, and the `CHECK` flags in `report.tsv`, which are
+judged again from each kept take's saved transcript. `book` doesn't render a
+chunk again once it has audio, so a chunk flagged before only gets a new take
+from `retake`. A `retake` phrase counts as heard through the allowances too, so
+with `in = and`, `retake ... "in the boat"` accepts a take heard as "and the boat".
 
 To find candidates, list the words most often heard as others in an output
-directory. It only reads, so it's safe during a render:
+directory. It only reads, so it can run during a render. Add the voice sample to
+mark the pairs it already allows:
 
 ```sh
-./target/release/audio-berry mishearings book.epub output/book
+./target/release/audio-berry mishearings book.epub output/book voices/dad.wav
 ```
 
 ```text
-Words heard as other words in 624 takes, most often first:
-ye = you                # 37 of 97 times
-peleg = pelleg          # 30 of 63 times
-in = and                # 16 of 773 times
+Words heard as other words in 635 takes, most often first:
+ye = you                # 39 of 109 times
+peleg = pelleg          # 34 of 69 times
+harpooneer = harpaneer  # 27 of 40 times
+in = and                # 17 of 789 times
 ...
 ```
 
 It shows each word heard as the same other word at least twice in the takes
 kept, and how often the book's word appears. Rejected takes aren't saved, so it
-can't count those. Most lines will be names and old or British spellings, which
-any voice gets. Copy only what's the speaker's own, such as a word other voices
-are heard saying correctly.
+can't count those. A take whose audio is there but whose check file isn't, as
+happens for a moment while `retake` replaces it, is skipped and counted. In that
+Moby-Dick render, most lines were names and old or British spellings, which
+aren't the speaker's own. Copy only what is, such as a word other voices are
+heard saying correctly.
 
 Be careful with common words. `in = and` also passes a take that really says
 "and" where the book says "in", so every allowance hides some real mistakes.

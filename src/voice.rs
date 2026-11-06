@@ -25,14 +25,12 @@ const TRIM_VOICE_ABOVE_SECONDS: f32 = 20.0;
 pub struct Voice {
     /// Always has a transcript.
     reference: ReferenceAudio,
-    /// Not part of the voice: they only decide whether a take was heard right.
-    allowances: Allowances,
 }
 
 impl Voice {
     /// Loads a voice sample and what's said in it. The text lives in a `.txt` file
     /// beside the sample, written by transcribing it the first time, and can be
-    /// corrected by hand. Any allowances are in another file beside it.
+    /// corrected by hand.
     pub fn load(path: &Path) -> Result<Voice, Box<dyn Error>> {
         let recording = decode_audio(path, SAMPLE_RATE)?;
         let samples = trim_long_audio(
@@ -44,7 +42,6 @@ impl Voice {
         );
         let check = SampleCheck::of(&samples, noise_limit_from_env_quietly());
         println!("Voice sample: using {:.1}s{}", seconds(&samples), check.summary());
-        let allowances = read_allowances(path)?;
 
         let transcript_path = transcript_path(path);
         let existing = match fs::read_to_string(&transcript_path) {
@@ -65,7 +62,7 @@ impl Voice {
                     transcript_path.display()
                 );
             }
-            return Ok(Voice { allowances, ..Voice::new(samples, existing) });
+            return Ok(Voice::new(samples, existing));
         }
 
         let heard = AudioSamples::new(samples, SAMPLE_RATE);
@@ -81,19 +78,15 @@ impl Voice {
         if let Some(advice) = check.advice(path, seconds(&recording)) {
             println!("{advice}");
         }
-        Ok(Voice { allowances, ..Voice::new(samples, &transcript) })
+        Ok(Voice::new(samples, &transcript))
     }
 
     fn new(samples: Vec<f32>, transcript: &str) -> Voice {
-        Voice {
-            reference: ReferenceAudio::new(samples, SAMPLE_RATE).with_transcript(transcript),
-            allowances: Allowances::default(),
-        }
+        Voice { reference: ReferenceAudio::new(samples, SAMPLE_RATE).with_transcript(transcript) }
     }
 
     /// Identifies the voice, including its transcript since that changes the speech.
     /// Output directories save it, so the same sample must always give the same hash.
-    /// Allowances aren't included, since they don't change the speech.
     pub fn hash(&self) -> u64 {
         let mut bytes: Vec<u8> = self.reference.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         bytes.extend_from_slice(self.transcript().as_bytes());
@@ -103,11 +96,6 @@ impl Voice {
     /// The sample and transcript in the form the model takes.
     pub fn reference(&self) -> &ReferenceAudio {
         &self.reference
-    }
-
-    /// Words this voice may be heard saying as others, such as "in" heard as "and".
-    pub fn allowances(&self) -> &Allowances {
-        &self.allowances
     }
 
     /// What's said in the sample.
@@ -129,21 +117,20 @@ pub fn transcript_path(sample: &Path) -> PathBuf {
 
 /// Where the words a voice may be heard saying as others are kept, beside the
 /// voice sample at `sample`, such as `voices/me.allowances` for `voices/me.wav`.
+/// They aren't part of the voice: they only decide whether a take was heard right.
 pub fn allowances_path(sample: &Path) -> PathBuf {
     sample.with_extension("allowances")
 }
 
 /// Reads the allowances beside a voice sample. Most voices have none.
-fn read_allowances(sample: &Path) -> Result<Allowances, Box<dyn Error>> {
+pub fn read_allowances(sample: &Path) -> Result<Allowances, Box<dyn Error>> {
     let path = allowances_path(sample);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Allowances::default()),
         Err(error) => return Err(format!("{}: {error}", path.display()).into()),
     };
-    let allowances = Allowances::parse(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-    println!("Allowances: {} from {}", allowances.len(), path.display());
-    Ok(allowances)
+    Ok(Allowances::parse(&text).map_err(|error| format!("{}: {error}", path.display()))?)
 }
 
 fn seconds(samples: &[f32]) -> f32 {
@@ -168,15 +155,6 @@ mod tests {
     }
 
     #[test]
-    fn allowances_leave_the_hash_alone() {
-        let samples = (0..240).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
-        let allowances = Allowances::parse("in = and").unwrap();
-        let voice = Voice { allowances, ..Voice::new(samples, "Hello there.") };
-        assert_eq!(voice.allowances().len(), 1);
-        assert_eq!(voice.hash(), 3087178596103644096);
-    }
-
-    #[test]
     fn allowances_are_kept_beside_the_voice_sample() {
         assert_eq!(allowances_path(Path::new("voices/me.wav")), Path::new("voices/me.allowances"));
     }
@@ -187,13 +165,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let sample = dir.join("me.wav");
         let path = allowances_path(&sample);
-        let missing = read_allowances(&sample).map(|allowances| allowances.len());
+        let missing = read_allowances(&sample).map(|allowances| allowances.is_empty());
         fs::write(&path, "in = and\nat had\n").unwrap();
         let bad = read_allowances(&sample).map(|allowances| allowances.len());
         fs::write(&path, "in = and  # his accent\n").unwrap();
         let good = read_allowances(&sample).map(|allowances| allowances.allows("in", "and"));
         fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(missing.unwrap(), 0);
+        assert!(missing.unwrap());
         let wanted = format!("{}: line 2: \"at had\" isn't in the form \"in = and\"", path.display());
         assert_eq!(bad.unwrap_err().to_string(), wanted);
         assert!(good.unwrap());

@@ -27,7 +27,7 @@ const USAGE: &str = "usage:
   audio-berry chapters <book.epub>
   audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers, e.g. 2 3 7] [--speed <factor>]
   audio-berry retake <voice-sample> <book.epub> <output-dir> <words from the book, or a chunk number like 3.12>...
-  audio-berry mishearings <book.epub> <output-dir>
+  audio-berry mishearings <book.epub> <output-dir> [voice-sample]
   audio-berry speakers
   audio-berry play <speaker> <file>...
   audio-berry audition <voice-sample> [speaker] [--speed <factor>]
@@ -67,7 +67,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             book::retake(Path::new(voice), Path::new(book), Path::new(output), targets)
         }
-        ["mishearings", book, output] => mishearings::list(Path::new(book), Path::new(output)),
+        ["mishearings", book, output] => mishearings::list(Path::new(book), Path::new(output), None),
+        ["mishearings", book, output, voice] => mishearings::list(Path::new(book), Path::new(output), Some(Path::new(voice))),
         ["speakers"] => {
             for speaker in cast::discover()? {
                 println!("{} ({})", speaker.name, speaker.ip);

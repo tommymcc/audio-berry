@@ -23,8 +23,8 @@ pub struct Verdict {
 impl Standard {
     /// The standard of an output directory, from its speed and noise limit, and of
     /// its voice, from the words that voice may be heard saying as others.
-    pub fn of(store: &NarrationStore, allowances: &Allowances) -> Standard {
-        Standard { speed: store.speed(), noise_limit_db: store.noise_limit_db(), allowances: allowances.clone() }
+    pub fn of(store: &NarrationStore, allowances: Allowances) -> Standard {
+        Standard { speed: store.speed(), noise_limit_db: store.noise_limit_db(), allowances }
     }
 
     /// Measures a take of `text`, given what was heard in it.
@@ -37,6 +37,12 @@ impl Standard {
             accuracy: accuracy::compare(text, transcript, &self.allowances),
             quality,
         }
+    }
+
+    /// Whether the words of `phrase`, from the book, were heard in a row in
+    /// `transcript`, counting the voice's allowed mishearings as heard.
+    pub fn heard(&self, phrase: &str, transcript: &str) -> bool {
+        accuracy::heard_phrase(transcript, phrase, &self.allowances)
     }
 }
 
@@ -101,5 +107,14 @@ mod tests {
         let verdict = accent.judge(text, &silence(4.0), heard);
         assert!(verdict.passes());
         assert_eq!(verdict.accuracy.recall, 1.0);
+    }
+
+    #[test]
+    fn a_phrase_is_heard_through_the_voice_s_allowances() {
+        let heard = "He sat, and the boat, all night.";
+        assert!(!standard(1.0).heard("in the boat", heard));
+        let accent = Standard { allowances: Allowances::parse("in = and").unwrap(), ..standard(1.0) };
+        assert!(accent.heard("in the boat", heard));
+        assert!(!accent.heard("in the ship", heard));
     }
 }

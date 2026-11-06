@@ -2,7 +2,7 @@
 //! forgiving the differences in spelling a transcriber makes, and the words a
 //! voice's allowances say it hears as others.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Passages the user approved by ear scored 0.98-1.00 recall with 0.00-0.02 extra.
 const MIN_RECALL: f32 = 0.92;
@@ -42,15 +42,28 @@ impl Accuracy {
 /// as the other, not the reverse.
 #[derive(Clone, Debug, Default)]
 pub struct Allowances {
-    /// (text word, heard word), normalised as `words` does.
-    pairs: HashSet<(String, String)>,
+    /// What each text word may be heard as, all normalised as `words` does.
+    heard_as: HashMap<String, HashSet<String>>,
+}
+
+/// A word of the text and a word heard in its place.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WordPair {
+    pub written: String,
+    pub heard: String,
+}
+
+impl WordPair {
+    fn new(written: &str, heard: &str) -> WordPair {
+        WordPair { written: written.to_string(), heard: heard.to_string() }
+    }
 }
 
 impl Allowances {
     /// Reads lines like `in = and`, meaning the text's "in" may be heard as "and".
     /// `#` starts a comment, and blank lines are skipped. Errors name the line.
     pub fn parse(text: &str) -> Result<Allowances, String> {
-        let mut pairs = HashSet::new();
+        let mut heard_as: HashMap<String, HashSet<String>> = HashMap::new();
         for (index, line) in text.lines().enumerate() {
             let number = index + 1;
             let line = line.split('#').next().unwrap_or_default().trim();
@@ -68,24 +81,29 @@ impl Allowances {
             if written == heard {
                 return Err(format!("line {number}: \"{written}\" is the same word on both sides"));
             }
-            pairs.insert((written, heard));
+            heard_as.entry(written).or_default().insert(heard);
         }
-        Ok(Allowances { pairs })
+        Ok(Allowances { heard_as })
     }
 
     /// Whether the text's `written` word may be heard as `heard`, both normalised
     /// as `words` does.
     pub fn allows(&self, written: &str, heard: &str) -> bool {
-        self.pairs.contains(&(written.to_string(), heard.to_string()))
+        !self.heard_as.is_empty() && self.heard_as.get(written).is_some_and(|heard_as| heard_as.contains(heard))
     }
 
+    /// How many pairs there are.
     pub fn len(&self) -> usize {
-        self.pairs.len()
+        self.heard_as.values().map(HashSet::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.heard_as.is_empty()
     }
 }
 
 /// Lowercases into words, spelling out small numbers so "1" matches "one".
-pub fn words(text: &str) -> Vec<String> {
+fn words(text: &str) -> Vec<String> {
     let cleaned: String = text
         .to_lowercase()
         .chars()
@@ -166,10 +184,17 @@ pub fn compare(text: &str, transcript: &str, allowances: &Allowances) -> Accurac
     }
 }
 
-/// Each place one word of `text` was heard as one other word in `transcript`,
-/// as (text word, heard word), such as ("in", "and"). Words missed or added, and
-/// several words heard for one, aren't included.
-pub fn substitutions(text: &str, transcript: &str) -> Vec<(String, String)> {
+/// Where one word of a text was heard as one other word.
+pub struct Substitutions {
+    /// The text's words as they were compared, with any split words joined.
+    pub text_words: Vec<String>,
+    /// Each place one word was heard as one other, such as "in" heard as "and".
+    /// Words missed or added, and several words heard for one, aren't included.
+    pub found: Vec<WordPair>,
+}
+
+/// Lines `transcript` up with `text` and finds the words heard as others.
+pub fn substitutions(text: &str, transcript: &str) -> Substitutions {
     let (expected, heard) = aligned_words(text, transcript);
     let table = common_subsequences(&expected, &heard, &Allowances::default());
     let mut found = Vec::new();
@@ -184,12 +209,12 @@ pub fn substitutions(text: &str, transcript: &str) -> Vec<(String, String)> {
         }
         if at_end || expected[i] == heard[j] {
             if let ([written], [other]) = (missed.as_slice(), instead.as_slice()) {
-                found.push((written.to_string(), other.to_string()));
+                found.push(WordPair::new(written, other));
             }
             missed.clear();
             instead.clear();
             if at_end {
-                return found;
+                return Substitutions { text_words: expected, found };
             }
             i += 1;
             j += 1;
@@ -209,6 +234,16 @@ pub fn contains_phrase(text: &str, phrase: &str) -> bool {
     !phrase.is_empty() && words(text).windows(phrase.len()).any(|window| window == phrase)
 }
 
+/// Whether the phrase's words were heard in a row in `transcript`, counting the
+/// words `allowances` let be heard as others.
+pub fn heard_phrase(transcript: &str, phrase: &str, allowances: &Allowances) -> bool {
+    let phrase = words(phrase);
+    let matches = |window: &[String]| {
+        phrase.iter().zip(window).all(|(written, heard)| written == heard || allowances.allows(written, heard))
+    };
+    !phrase.is_empty() && words(transcript).windows(phrase.len()).any(matches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,8 +256,8 @@ mod tests {
         Allowances::parse(lines).unwrap()
     }
 
-    fn pairs(found: &[(&str, &str)]) -> Vec<(String, String)> {
-        found.iter().map(|(written, heard)| (written.to_string(), heard.to_string())).collect()
+    fn pairs(found: &[(&str, &str)]) -> Vec<WordPair> {
+        found.iter().map(|(written, heard)| WordPair::new(written, heard)).collect()
     }
 
     #[test]
@@ -272,7 +307,8 @@ mod tests {
         assert!(allowances.allows("in", "and"));
         assert!(allowances.allows("at", "had"));
         assert!(allowances.allows("seven", "seven's"));
-        assert_eq!(allow("# nothing yet\n\n").len(), 0);
+        assert!(allow("# nothing yet\n\n").is_empty());
+        assert_eq!(allow("in = and\nin = an\nIN = and").len(), 2);
     }
 
     #[test]
@@ -318,9 +354,24 @@ mod tests {
             "Call me Ishmael, and the boat, by the harpaneer. Amen",
         );
         // "old harpooneer." heard as "harpaneer. Amen" isn't one word for one.
-        assert_eq!(found, pairs(&[("in", "and")]));
+        assert_eq!(found.found, pairs(&[("in", "and")]));
         let found = substitutions("Ye see the sea now, Bildad", "You see the see now, bill dad");
-        assert_eq!(found, pairs(&[("ye", "you"), ("sea", "see")]));
-        assert!(substitutions("all heard", "all heard").is_empty());
+        assert_eq!(found.found, pairs(&[("ye", "you"), ("sea", "see")]));
+        assert!(substitutions("all heard", "all heard").found.is_empty());
+    }
+
+    #[test]
+    fn substitutions_give_the_text_words_as_compared() {
+        let found = substitutions("The quarter deck, 12 feet", "the quarterdeck twelve feet");
+        assert_eq!(found.text_words, ["the", "quarterdeck", "twelve", "feet"]);
+    }
+
+    #[test]
+    fn a_phrase_counts_as_heard_through_an_allowance() {
+        let allowances = allow("in = and");
+        assert!(heard_phrase("He sat, and the boat.", "in the boat", &allowances));
+        assert!(!heard_phrase("He sat, and the boat.", "in the boat", &none()));
+        assert!(!heard_phrase("He sat, in the boat.", "and the boat", &allowances));
+        assert!(!heard_phrase("He sat, and the boat.", "", &allowances));
     }
 }
