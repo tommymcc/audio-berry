@@ -229,7 +229,7 @@ heard as clean have measured about -91 to -96 dB, and takes with audible
 background -34 to -48 dB.
 
 Set `AUDIO_BERRY_NOISE_LIMIT_DB` to change the limit, from -100 to 0 dB, where
-higher allows more background. An invalid value prints a warning and uses -55.
+higher allows more background. An invalid value prints a warning and is ignored.
 It applies to `book` (whether a take passes), `retake` (which take wins) and the
 `CHECK` flags in `report.tsv`. `speak` doesn't check takes, so it ignores it.
 
@@ -262,20 +262,31 @@ such as a hum or faint music, lower the limit so they're retried:
 AUDIO_BERRY_NOISE_LIMIT_DB=-65 ./target/release/audio-berry book voices/me.wav book.epub output/book
 ```
 
-**Use the same value on every run of a book.** The limit isn't saved in
-`narration.txt`, so give it to each `book` and `retake` run for that output
-directory. Without it, `retake` and `report.tsv` judge earlier takes against the
-default.
+**It's saved with the book.** The output directory saves the limit in
+`narration.txt` with its first take, so give it once. Later `book` and `retake`
+runs, and `report.tsv`, use the saved value:
 
 ```sh
-AUDIO_BERRY_NOISE_LIMIT_DB=-50 ./target/release/audio-berry retake voices/dad.wav book.epub output/book 3.12
+./target/release/audio-berry retake voices/dad.wav book.epub output/book 3.12
 ```
+
+To change it, give it again. The new value is used and saved, and the run prints
+the old one:
+
+```text
+Noise limit: -48 dB, replacing -50 dB in output/book/narration.txt
+```
+
+Changing it doesn't render anything again: chunks that already have audio are
+kept, and only new takes and the `CHECK` flags are judged against the new value.
+Directories saved before the limit was have -55 until you give one.
 
 ## One output directory, one narration
 
 An output directory holds one book in one voice, with one speed and model
 precision (`OMNIVOICE_DTYPE`). It saves them in `narration.txt` with its first take, and
-later runs reuse the saved speed, so you don't have to repeat `--speed`. A run
+later runs reuse the saved speed, so you don't have to repeat `--speed`. It also
+saves the [noise limit](#noise-limit), which can change at any time. A run
 with a different book, voice, speed or precision stops with an error rather than
 rendering everything again, so use a new directory for those. Correcting a voice's
 `.txt` file counts as a different voice.

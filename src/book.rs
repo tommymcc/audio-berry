@@ -33,7 +33,14 @@ fn open_store(book: &Book, reference: &ReferenceAudio, out: &Path, speed: Option
         .iter()
         .map(|chapter| chunk(&chapter.paragraphs, MAX_CHUNK_CHARS))
         .collect();
-    NarrationStore::open(out, &book.title, &chapters, voice_hash(reference), &RenderSettings::from_env(speed))
+    NarrationStore::open(
+        out,
+        &book.title,
+        &chapters,
+        voice_hash(reference),
+        &RenderSettings::from_env(speed),
+        quality::noise_limit_from_env(),
+    )
 }
 
 /// Prints each chapter's number, title and size.
@@ -58,6 +65,7 @@ struct Take {
     quality: Quality,
     accuracy: Accuracy,
     speed: f64,
+    noise_limit_db: f32,
 }
 
 impl Take {
@@ -66,7 +74,7 @@ impl Take {
     }
 
     fn clean(&self) -> bool {
-        self.quality.clean()
+        self.quality.clean(self.noise_limit_db)
     }
 
     fn acceptable(&self, characters: usize) -> bool {
@@ -107,6 +115,7 @@ fn render_take(
         accuracy: transcribe::compare(&item.text, &transcript),
         audio,
         speed: store.speed(),
+        noise_limit_db: store.noise_limit_db(),
     })
 }
 
@@ -273,7 +282,7 @@ fn write_report(book: &Book, store: &NarrationStore, out: &Path) -> Result<usize
         let check = store.check(item)?;
         let accuracy = transcribe::compare(&item.text, &check.transcript);
         let characters = item.text.chars().count();
-        let pass = quality.clean()
+        let pass = quality.clean(store.noise_limit_db())
             && quality::plausible_length_at(characters, quality.seconds, store.speed())
             && accuracy.acceptable();
         flagged += usize::from(!pass);
@@ -426,6 +435,7 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
                 accuracy: transcribe::compare(&item.text, &check.transcript),
                 audio,
                 speed: store.speed(),
+                noise_limit_db: store.noise_limit_db(),
             };
             let (plausible, clean, score) = current.rank(characters);
             (check.takes, Some((plausible, clean, heard_all(&check.transcript), score)))

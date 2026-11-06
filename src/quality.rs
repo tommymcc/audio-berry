@@ -7,33 +7,26 @@ const SILENCE_DB: f32 = -55.0;
 /// Takes heard as clean measured about -91 to -96 dB, and noisy ones -34 to -48.
 pub const MAX_FLOOR_DB: f32 = -55.0;
 
-/// Overrides `MAX_FLOOR_DB`. A sample with faint room tone, such as a denoised
-/// outdoor recording, passes a little of it to every take: one voice's takes
-/// measured -51 to -57 dB and were heard as clean on a Cast speaker.
+/// Overrides `MAX_FLOOR_DB`, and is saved with the output directory. A sample
+/// with faint room tone, such as a denoised outdoor recording, passes a little
+/// of it to every take: one voice's takes measured -51 to -57 dB and were heard
+/// as clean on a Cast speaker.
 const NOISE_LIMIT_VAR: &str = "AUDIO_BERRY_NOISE_LIMIT_DB";
 
-/// The noise limit in use, read once from the environment.
-pub fn noise_limit_db() -> f32 {
-    static LIMIT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        let value = std::env::var(NOISE_LIMIT_VAR).ok();
-        let limit = parse_noise_limit(value.as_deref());
-        match value {
-            Some(value) if value.trim().parse::<f32>().ok() != Some(limit) => {
-                eprintln!("{NOISE_LIMIT_VAR}={value} isn't a level from -100 to 0 dB, so using {limit} dB")
-            }
-            Some(_) => eprintln!("Noise limit: {limit} dB ({NOISE_LIMIT_VAR})"),
-            None => {}
-        }
-        limit
-    })
+/// The noise limit given in the environment, if any. An invalid value is
+/// reported and ignored.
+pub fn noise_limit_from_env() -> Option<f32> {
+    let value = std::env::var(NOISE_LIMIT_VAR).ok()?;
+    let limit = valid_noise_limit(&value);
+    if limit.is_none() {
+        eprintln!("{NOISE_LIMIT_VAR}={value} isn't a level from -100 to 0 dB, so ignoring it");
+    }
+    limit
 }
 
-fn parse_noise_limit(value: Option<&str>) -> f32 {
-    value
-        .and_then(|value| value.trim().parse::<f32>().ok())
-        .filter(|db| (-100.0..=0.0).contains(db))
-        .unwrap_or(MAX_FLOOR_DB)
+/// A noise limit from text, if it's a level from -100 to 0 dB.
+pub fn valid_noise_limit(value: &str) -> Option<f32> {
+    value.trim().parse::<f32>().ok().filter(|db| (-100.0..=0.0).contains(db))
 }
 
 const MIN_SECONDS_FOR_FLOOR: f32 = 6.0;
@@ -82,8 +75,8 @@ pub fn measure(samples: &[f32], sample_rate: u32) -> Quality {
 impl Quality {
     /// Whether the pauses are quiet. Very short takes barely pause, so their
     /// quietest frames are speech and say nothing about the background.
-    pub fn clean(&self) -> bool {
-        self.seconds < MIN_SECONDS_FOR_FLOOR || self.floor_db <= noise_limit_db()
+    pub fn clean(&self, noise_limit_db: f32) -> bool {
+        self.seconds < MIN_SECONDS_FOR_FLOOR || self.floor_db <= noise_limit_db
     }
 }
 
@@ -153,19 +146,29 @@ mod tests {
     }
 
     #[test]
-    fn noise_limit_comes_from_a_valid_level_or_the_default() {
-        assert_eq!(parse_noise_limit(None), MAX_FLOOR_DB);
-        assert_eq!(parse_noise_limit(Some("-50")), -50.0);
-        assert_eq!(parse_noise_limit(Some(" -48.5 ")), -48.5);
-        assert_eq!(parse_noise_limit(Some("loud")), MAX_FLOOR_DB);
-        assert_eq!(parse_noise_limit(Some("5")), MAX_FLOOR_DB);
-        assert_eq!(parse_noise_limit(Some("-120")), MAX_FLOOR_DB);
+    fn a_noise_limit_must_be_a_level_from_minus_100_to_0() {
+        assert_eq!(valid_noise_limit("-50"), Some(-50.0));
+        assert_eq!(valid_noise_limit(" -48.5 "), Some(-48.5));
+        assert_eq!(valid_noise_limit("loud"), None);
+        assert_eq!(valid_noise_limit("5"), None);
+        assert_eq!(valid_noise_limit("-120"), None);
+        assert_eq!(valid_noise_limit(""), None);
+    }
+
+    #[test]
+    fn the_noise_limit_decides_whether_a_take_is_clean() {
+        let mut take = tone(8.0, 0.2);
+        take.extend(tone(1.0, 0.004));
+        let quality = measure(&take, 24_000);
+        assert!(quality.floor_db > -55.0 && quality.floor_db < -45.0, "{}", quality.floor_db);
+        assert!(!quality.clean(-55.0));
+        assert!(quality.clean(-45.0));
     }
 
     #[test]
     fn short_takes_are_not_judged_on_their_floor() {
-        assert!(measure(&tone(1.5, 0.2), 24_000).clean());
-        assert!(!measure(&tone(8.0, 0.2), 24_000).clean());
+        assert!(measure(&tone(1.5, 0.2), 24_000).clean(MAX_FLOOR_DB));
+        assert!(!measure(&tone(8.0, 0.2), 24_000).clean(MAX_FLOOR_DB));
     }
 
     #[test]

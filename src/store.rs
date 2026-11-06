@@ -1,6 +1,7 @@
 //! An output directory: one narration of one book, in one voice, with one set
 //! of render settings. Owns chunk numbering, the cache key and the files.
 
+use crate::quality::{MAX_FLOOR_DB, valid_noise_limit};
 use crate::transcribe::contains_phrase;
 use any_tts::{AudioSamples, DeviceSelection};
 use any_tts::models::omnivoice::{OmniVoiceRuntimeChoice, preferred_runtime_choice};
@@ -102,14 +103,21 @@ struct Manifest {
     voice: String,
     precision: String,
     speed: f64,
+    /// Not a render setting: it only decides which take is kept, so it can
+    /// change without touching the audio. `None` in folders saved before it was.
+    noise_limit_db: Option<f32>,
 }
 
 impl Manifest {
     fn render(&self) -> String {
-        format!(
+        let mut text = format!(
             "book={}\nvoice={}\nprecision={}\nspeed={}\n",
             self.book, self.voice, self.precision, self.speed
-        )
+        );
+        if let Some(limit) = self.noise_limit_db {
+            text.push_str(&format!("noise_limit_db={limit}\n"));
+        }
+        text
     }
 
     fn parse(text: &str) -> Result<Self, Box<dyn Error>> {
@@ -124,6 +132,12 @@ impl Manifest {
             voice: field("voice")?,
             precision: field("precision")?,
             speed: field("speed").map_or(Ok(NORMAL_SPEED), |speed| speed.parse())?,
+            noise_limit_db: match field("noise_limit_db") {
+                Ok(value) => Some(
+                    valid_noise_limit(&value).ok_or_else(|| format!("{MANIFEST} has a bad noise_limit_db: {value}"))?,
+                ),
+                Err(_) => None,
+            },
         })
     }
 
@@ -151,6 +165,7 @@ pub struct NarrationStore {
     out: PathBuf,
     chunks: Vec<Chunk>,
     speed: f64,
+    noise_limit_db: f32,
     manifest: Manifest,
 }
 
@@ -161,9 +176,13 @@ impl NarrationStore {
         chapters: &[Vec<String>],
         voice: u64,
         settings: &RenderSettings,
+        noise_limit_db: Option<f32>,
     ) -> Result<Self, Box<dyn Error>> {
         let saved = read_manifest(out)?;
         let speed = settings.speed.or(saved.as_ref().map(|saved| saved.speed)).unwrap_or(NORMAL_SPEED);
+        let saved_limit = saved.as_ref().and_then(|saved| saved.noise_limit_db);
+        let given_limit = noise_limit_db;
+        let noise_limit_db = given_limit.or(saved_limit).unwrap_or(MAX_FLOOR_DB);
         // Normal speed keeps the original key, so older chunks stay valid.
         let speed_key = if speed == NORMAL_SPEED { String::new() } else { format!("speed={speed}\n") };
         let mut chunks = Vec::new();
@@ -184,9 +203,21 @@ impl NarrationStore {
             voice: format!("{voice:x}"),
             precision: settings.precision.clone(),
             speed,
+            noise_limit_db: Some(noise_limit_db),
         };
-        let store = Self { out: out.to_path_buf(), chunks, speed, manifest };
+        let store = Self { out: out.to_path_buf(), chunks, speed, noise_limit_db, manifest };
+        let had_manifest = saved.is_some();
         store.require_same(saved)?;
+        if had_manifest && saved_limit != Some(noise_limit_db) {
+            // Saves a changed limit, or the default in a folder that didn't record it.
+            store.write_manifest()?;
+        }
+        let was = saved_limit.unwrap_or(MAX_FLOOR_DB);
+        if had_manifest && given_limit.is_some() && was != noise_limit_db {
+            eprintln!("Noise limit: {noise_limit_db} dB, replacing {was} dB in {}", out.join(MANIFEST).display());
+        } else if given_limit.is_some() || noise_limit_db != MAX_FLOOR_DB {
+            eprintln!("Noise limit: {noise_limit_db} dB");
+        }
         Ok(store)
     }
 
@@ -204,12 +235,17 @@ impl NarrationStore {
 
     /// Saves what this folder narrates, once it has audio to go with it.
     fn save_manifest(&self) -> Result<(), Box<dyn Error>> {
-        let path = self.out.join(MANIFEST);
-        if !path.exists() {
-            let temporary = path.with_extension("tmp");
-            fs::write(&temporary, self.manifest.render())?;
-            fs::rename(&temporary, &path)?;
+        if !self.out.join(MANIFEST).exists() {
+            self.write_manifest()?;
         }
+        Ok(())
+    }
+
+    fn write_manifest(&self) -> Result<(), Box<dyn Error>> {
+        let path = self.out.join(MANIFEST);
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, self.manifest.render())?;
+        fs::rename(&temporary, &path)?;
         Ok(())
     }
 
@@ -295,6 +331,11 @@ impl NarrationStore {
     /// The speaking speed this folder narrates at.
     pub fn speed(&self) -> f64 {
         self.speed
+    }
+
+    /// The background level a take's pauses must stay under, saved for this folder.
+    pub fn noise_limit_db(&self) -> f32 {
+        self.noise_limit_db
     }
 
     /// Every chunk in the book, whichever chapters have been rendered.
@@ -440,7 +481,7 @@ mod tests {
     }
 
     fn open(dir: &TempDir, texts: &[&[&str]]) -> NarrationStore {
-        NarrationStore::open(&dir.0, "A Book", &chapters(texts), 0xabc, &settings()).unwrap()
+        NarrationStore::open(&dir.0, "A Book", &chapters(texts), 0xabc, &settings(), None).unwrap()
     }
 
     fn tone() -> AudioSamples {
@@ -489,7 +530,7 @@ mod tests {
 
     fn open_as(dir: &TempDir, title: &str, voice: u64, precision: &str) -> Result<NarrationStore, Box<dyn Error>> {
         let settings = RenderSettings { precision: precision.into(), speed: None };
-        NarrationStore::open(&dir.0, title, &chapters(&[&["a"]]), voice, &settings)
+        NarrationStore::open(&dir.0, title, &chapters(&[&["a"]]), voice, &settings, None)
     }
 
     fn numbers(selected: &[Selected]) -> Vec<String> {
@@ -569,7 +610,7 @@ mod tests {
 
     fn open_at(dir: &TempDir, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
         let settings = RenderSettings { speed, ..settings() };
-        NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings)
+        NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings, None)
     }
 
     #[test]
@@ -702,6 +743,87 @@ mod tests {
             assert_eq!(RenderSettings::from_dtype(Some("bf16"), choice).precision, "f32");
             assert_eq!(RenderSettings::from_dtype(Some("nonsense"), choice).precision, "f32");
         }
+    }
+
+    fn open_with_limit(dir: &TempDir, noise_limit: Option<f32>) -> NarrationStore {
+        NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), noise_limit).unwrap()
+    }
+
+    fn render_with_limit(dir: &TempDir, noise_limit: Option<f32>) {
+        let store = open_with_limit(dir, noise_limit);
+        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+    }
+
+    fn saved_limit(dir: &TempDir) -> Option<String> {
+        let text = fs::read_to_string(dir.0.join(MANIFEST)).unwrap();
+        text.lines().find_map(|line| line.strip_prefix("noise_limit_db=")).map(str::to_string)
+    }
+
+    #[test]
+    fn the_noise_limit_is_saved_with_the_first_take() {
+        let dir = TempDir::new("limit-first");
+        let store = open_with_limit(&dir, Some(-50.0));
+        assert_eq!(store.noise_limit_db(), -50.0);
+        assert!(!dir.0.join(MANIFEST).exists());
+        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+        assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
+    }
+
+    #[test]
+    fn the_default_noise_limit_is_saved_when_none_is_given() {
+        let dir = TempDir::new("limit-default");
+        render_with_limit(&dir, None);
+        assert_eq!(saved_limit(&dir).as_deref(), Some("-55"));
+    }
+
+    #[test]
+    fn the_saved_noise_limit_is_used_when_none_is_given() {
+        let dir = TempDir::new("limit-reused");
+        render_with_limit(&dir, Some(-50.0));
+        assert_eq!(open_with_limit(&dir, None).noise_limit_db(), -50.0);
+        assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
+    }
+
+    #[test]
+    fn a_new_noise_limit_replaces_the_saved_one_and_keeps_the_audio() {
+        let dir = TempDir::new("limit-changed");
+        render_with_limit(&dir, Some(-50.0));
+        let before = fs::read_to_string(dir.0.join(MANIFEST)).unwrap();
+        let store = open_with_limit(&dir, Some(-48.5));
+        assert_eq!(store.noise_limit_db(), -48.5);
+        assert!(store.has_audio(&store.chunks()[0]), "the cached take should still be found");
+        assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "026926e6f4d06f3e.wav");
+        assert_eq!(saved_limit(&dir).as_deref(), Some("-48.5"));
+        let after = fs::read_to_string(dir.0.join(MANIFEST)).unwrap();
+        assert_eq!(before.replace("noise_limit_db=-50", "noise_limit_db=-48.5"), after);
+        assert_eq!(open_with_limit(&dir, None).noise_limit_db(), -48.5);
+    }
+
+    #[test]
+    fn a_folder_from_before_the_noise_limit_was_saved_uses_the_default() {
+        let dir = TempDir::new("limit-older");
+        fs::create_dir_all(dir.0.join("chunks")).unwrap();
+        fs::write(dir.0.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n").unwrap();
+        assert_eq!(open_with_limit(&dir, None).noise_limit_db(), MAX_FLOOR_DB);
+        assert_eq!(saved_limit(&dir).as_deref(), Some("-55"));
+    }
+
+    #[test]
+    fn a_folder_from_before_the_noise_limit_was_saved_takes_a_new_one() {
+        let dir = TempDir::new("limit-older-new");
+        fs::create_dir_all(dir.0.join("chunks")).unwrap();
+        fs::write(dir.0.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n").unwrap();
+        assert_eq!(open_with_limit(&dir, Some(-50.0)).noise_limit_db(), -50.0);
+        assert_eq!(open_with_limit(&dir, None).noise_limit_db(), -50.0);
+    }
+
+    #[test]
+    fn a_bad_saved_noise_limit_is_an_error() {
+        let dir = TempDir::new("limit-bad");
+        fs::write(dir.0.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\nnoise_limit_db=loud\n").unwrap();
+        let store = NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), None);
+        let error = store.err().unwrap().to_string();
+        assert!(error.contains("noise_limit_db"), "{error}");
     }
 
     #[test]
