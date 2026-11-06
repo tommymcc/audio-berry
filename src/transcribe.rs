@@ -97,9 +97,30 @@ fn common_subsequence(a: &[String], b: &[String]) -> usize {
     row[b.len()]
 }
 
+/// Joins neighbouring words where `other` has them as one word, so "quarter
+/// deck" matches "quarterdeck" and "e book" matches "ebook".
+fn join_split_words(words: &[String], other: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while index < words.len() {
+        if let Some(next) = words.get(index + 1) {
+            let joined = format!("{}{next}", words[index]);
+            if other.contains(&joined) {
+                out.push(joined);
+                index += 2;
+                continue;
+            }
+        }
+        out.push(words[index].clone());
+        index += 1;
+    }
+    out
+}
+
 pub fn compare(text: &str, transcript: &str) -> Accuracy {
-    let expected = words(text);
-    let heard = words(transcript);
+    let (expected, heard) = (words(text), words(transcript));
+    let expected = join_split_words(&expected, &heard);
+    let heard = join_split_words(&heard, &expected);
     let matched = common_subsequence(&expected, &heard);
     let length = expected.len().max(1) as f32;
     Accuracy {
@@ -349,6 +370,21 @@ mod tests {
         assert_eq!(accuracy.recall, 1.0);
         assert_eq!(accuracy.extra, 0.0);
         assert!(accuracy.acceptable());
+    }
+
+    #[test]
+    fn words_joined_on_one_side_and_split_on_the_other_match() {
+        // Whisper's spelling of compounds often differs from the book's.
+        for (text, heard) in [
+            ("Chapter 36. The Quarter-Deck.", "chapter thirty six, the quarterdeck"),
+            ("This eBook is for the use of anyone", "this e-book is for the use of anyone"),
+            ("a rose bud in the grub worm's way", "a rosebud in the grubworm's way"),
+        ] {
+            let accuracy = compare(text, heard);
+            assert_eq!((accuracy.recall, accuracy.extra), (1.0, 0.0), "{text} / {heard}");
+        }
+        // Joining is only forgiven when the joined word is really there.
+        assert!(compare("the quarter deck", "the quarter").recall < 1.0);
     }
 
     #[test]
