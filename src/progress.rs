@@ -34,7 +34,7 @@ impl Progress {
 
     /// Progress where, without a terminal, a finished chunk prints nothing, for a
     /// caller that already prints its own lines per chunk.
-    pub fn quiet(total: usize) -> Self {
+    pub fn untimed(total: usize) -> Self {
         Self::on_stdout(total, false)
     }
 
@@ -92,7 +92,7 @@ impl<W: Write> Progress<W> {
 }
 
 /// The line printed for a finished chunk, such as
-/// `[3/40] 22s of audio, take 1, recall 0.98, 2 min elapsed, about 25 min left`.
+/// `[3/40] 22s of audio, take 1, recall 0.98, 2 min elapsed, about 31 min left`.
 fn chunk_line(done: usize, total: usize, summary: &str, elapsed: Duration) -> String {
     let elapsed = elapsed.as_secs_f32();
     format!(
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_plain_lines_print_only_messages() {
+    fn untimed_plain_lines_print_only_messages() {
         let mut progress = Progress::lines(Vec::new(), 1, false);
         progress.line("[1/1] chunk 3.12: Alice took a watch out").unwrap();
         progress.chunk_done("chunk 3.12 replaced").unwrap();

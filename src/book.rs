@@ -266,7 +266,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
     let wanted = store.select(targets)?;
 
     let mut recorder = Recorder::load(&voice, &store, &standard)?;
-    let mut progress = Progress::quiet(wanted.len());
+    let mut progress = Progress::untimed(wanted.len());
     for (position, selected) in wanted.iter().enumerate() {
         let item = selected.chunk;
         let phrases = &selected.phrases;
