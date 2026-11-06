@@ -212,6 +212,7 @@ audio-berry speak <voice-sample> <text> <output.wav> [--speed <factor>]
 audio-berry chapters <book.epub>
 audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers] [--speed <factor>]
 audio-berry retake <voice-sample> <book.epub> <output-dir> <words or chunk number>...
+audio-berry mishearings <book.epub> <output-dir>
 audio-berry speakers
 audio-berry play <speaker> <file>...
 audio-berry audition <voice-sample> [speaker] [--speed <factor>]
@@ -223,6 +224,10 @@ audio-berry clean <recording> <start> <end> <output.wav> [--reduction <dB>]
 sample, 3 by default, each with the `clean` command that makes it. With
 `--reduction`, it cleans as `clean` would with it. See
 [Adding a voice](#adding-a-voice).
+
+`mishearings` lists the words most often heard as other words in the takes kept
+in an output directory, to help write a voice's allowances. It only reads. See
+[Allowances](#allowances).
 
 `clean` makes a voice sample from a noisy recording: it removes background noise
 from the whole recording, then saves `start` to `end` as 24 kHz mono 16-bit WAV.
@@ -275,7 +280,8 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
   locally and compares it with the text. The models download on first use:
   `base.en` (290 MB) for checks and `medium.en` (3 GB) for voice samples.
   Whisper mishears some correct speech, so treat a flag as a reason to listen,
-  not as proof of a mistake.
+  not as proof of a mistake. If it mishears a speaker's accent the same way
+  again and again, see [Allowances](#allowances).
 
 If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
@@ -374,6 +380,65 @@ rendered with a limit that wasn't saved. If it was, give that limit once:
 AUDIO_BERRY_NOISE_LIMIT_DB=-50 ./target/release/audio-berry book voices/dad.wav book.epub output/book
 ```
 
+## Allowances
+
+Whisper mishears some speakers' accents the same way again and again. If it
+hears a speaker's "in" as "and", good takes fail the word check, get rendered
+again and end up marked `CHECK`. Allowances tell the check which words a voice
+may be heard saying as others. They go in a file beside the voice sample, named
+like its `.txt` but ending `.allowances`, so `voices/dad.wav` has
+`voices/dad.allowances`:
+
+```text
+# Dad's accent: the book's word = what Whisper hears
+in = and
+at = had
+```
+
+Each line pairs a word from the book with the word heard instead. `#` starts a
+comment. Words are compared as the check compares them, ignoring case and
+punctuation, with small numbers spelled out, and each side must be one word. A
+bad line stops the run with the file and line number. When a voice has
+allowances, each run says so:
+
+```text
+Allowances: 2 from voices/dad.allowances
+```
+
+A pair works one way: `in = and` lets the book's "in" be heard as "and", but not
+the book's "and" as "in". Add the reverse as its own line only if that happens
+too.
+
+Allowances aren't part of the voice. Adding or changing them keeps every chunk
+already rendered and nothing is saved in `narration.txt`: they only change which
+takes pass from then on, in `book`, `retake` and the `CHECK` flags in
+`report.tsv`.
+
+To find candidates, list the words most often heard as others in an output
+directory. It only reads, so it's safe during a render:
+
+```sh
+./target/release/audio-berry mishearings book.epub output/book
+```
+
+```text
+Words heard as other words in 624 takes, most often first:
+ye = you                # 37 of 97 times
+peleg = pelleg          # 30 of 63 times
+in = and                # 16 of 773 times
+...
+```
+
+It shows each word heard as the same other word at least twice in the takes
+kept, and how often the book's word appears. Rejected takes aren't saved, so it
+can't count those. Most lines will be names and old or British spellings, which
+any voice gets. Copy only what's the speaker's own, such as a word other voices
+are heard saying correctly.
+
+Be careful with common words. `in = and` also passes a take that really says
+"and" where the book says "in", so every allowance hides some real mistakes.
+Allow only what you've heard the speaker say right.
+
 ## One output directory, one narration
 
 An output directory holds one book in one voice, with one speed and model
@@ -382,7 +447,8 @@ later runs reuse the saved speed, so you don't have to repeat `--speed`. It also
 saves the [noise limit](#noise-limit), which can change at any time. A run
 with a different book, voice, speed or precision stops with an error rather than
 rendering everything again, so use a new directory for those. Correcting a voice's
-`.txt` file counts as a different voice.
+`.txt` file counts as a different voice, but changing its [allowances](#allowances)
+doesn't.
 
 Directories made before this was added have no `narration.txt`. They're treated as
 normal speed and default precision, and they adopt the voice you give them if at

@@ -25,3 +25,5 @@
 **Section:** a stretch of a recording, from one pause to another, that `sections` suggests making into a voice sample.
 
 **Reduction:** the most noise `clean` removes from a recording when making a voice sample, in dB, 15 unless `--reduction` sets it. It's DeepFilterNet's attenuation limit. It changes the voice sample, unlike the floor and noise limit, which measure and judge takes. A higher reduction gives quieter takes but a clone less like the speaker.
+
+**Allowance:** a word of the book that a voice may be heard saying as another, such as `in = and` for a speaker whose "in" Whisper hears as "and". It's one-way, and kept beside the voice sample in a `.allowances` file, such as `voices/me.allowances`. It isn't part of the voice: changing it keeps the audio already rendered and only changes which takes pass from then on. `mishearings` suggests candidates.
