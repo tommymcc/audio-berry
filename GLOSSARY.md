@@ -15,3 +15,7 @@
 **Render settings:** settings that change a chunk's audio, such as speed and model precision (`OMNIVOICE_DTYPE`). Changing one needs a new output directory. Gaps aren't render settings, because they only affect assembly and can change freely.
 
 **Shared chunk:** a chunk whose text is identical to another's. They share one audio file, so a `retake` of one changes all of them, and it prints each chunk number affected.
+
+**Floor:** a take's background level, measured as its quietest 5% of 50 ms frames. Takes below 6 seconds aren't judged on it, because they barely pause.
+
+**Noise limit:** the highest floor a take can have and still pass, -55 dB unless `AUDIO_BERRY_NOISE_LIMIT_DB` sets it. It isn't a render setting: it decides which take is kept, not how a take sounds, so it isn't saved and has to be given on each run.

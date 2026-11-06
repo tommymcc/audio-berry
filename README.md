@@ -175,6 +175,7 @@ The model sometimes adds background noise, skips words, runs on or says fluent
 nonsense, so every take is checked and retried up to 5 times with a new seed:
 
 - **Background noise:** the quietest 5% of the take must be below -55 dB.
+  Some voices need a different limit; see [Noise limit](#noise-limit).
 - **Length:** the duration must be plausible for the amount of text.
 - **Accuracy:** Whisper, running on candle like OmniVoice, transcribes the take
   locally and compares it with the text. The models download on first use:
@@ -203,6 +204,57 @@ faster. Actual lengths won't change by exactly that factor, so judge it by ear:
 ```sh
 ./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav --speed 0.9
 ./target/release/audio-berry book voices/me.wav book.epub output/book-slow --speed 0.9
+```
+
+## Noise limit
+
+Each take's background is measured as the level of its quietest 5% (in 50 ms
+frames). A take louder than the limit is treated as noisy and retried. The
+default is **-55 dB**, which suits a voice sample recorded somewhere quiet. Takes
+heard as clean have measured about -91 to -96 dB, and takes with audible
+background -34 to -48 dB.
+
+Set `AUDIO_BERRY_NOISE_LIMIT_DB` to change the limit, from -100 to 0 dB, where
+higher allows more background. An invalid value prints a warning and uses -55.
+It applies to `book` (whether a take passes), `retake` (which take wins) and the
+`CHECK` flags in `report.tsv`. `speak` doesn't check takes, so it ignores it.
+
+**When to raise it.** The model copies the sample's background, so a sample with
+faint room tone, such as a noisy recording cleaned with a denoiser, gives every
+take a little of it. You'll see most takes rejected on the floor alone, with
+good recall:
+
+```text
+  take 2 rejected: floor -51 dB, 19.2s, recall 0.94, extra 0.04
+```
+
+Each chunk is then rendered 5 times, about five times slower, and most still end
+up marked `CHECK`. Listen to a few of those chunks, ideally on the speaker you'll
+use. If they sound clean, raise the limit to just above the floors you see. For
+a sample whose takes measure about -51 to -57 dB:
+
+```sh
+AUDIO_BERRY_NOISE_LIMIT_DB=-50 ./target/release/audio-berry book voices/dad.wav book.epub output/book
+```
+
+Don't raise it to get past noise you can hear. Pick a cleaner stretch of the
+recording, or clean the sample harder, which may make the voice sound less like
+the speaker.
+
+**When to lower it.** If takes that pass still have background you can hear,
+such as a hum or faint music, lower the limit so they're retried:
+
+```sh
+AUDIO_BERRY_NOISE_LIMIT_DB=-65 ./target/release/audio-berry book voices/me.wav book.epub output/book
+```
+
+**Use the same value on every run of a book.** The limit isn't saved in
+`narration.txt`, so give it to each `book` and `retake` run for that output
+directory. Without it, `retake` and `report.tsv` judge earlier takes against the
+default.
+
+```sh
+AUDIO_BERRY_NOISE_LIMIT_DB=-50 ./target/release/audio-berry retake voices/dad.wav book.epub output/book 3.12
 ```
 
 ## One output directory, one narration
