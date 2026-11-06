@@ -63,55 +63,60 @@ struct Take {
     verdict: Verdict,
 }
 
-/// Renders and checks one take. Seeds follow from the text, so `take` picks a
-/// repeatable take that differs from the others.
-fn render_take(
-    narrator: &Narrator,
-    transcriber: &mut Transcriber,
-    voice: &Voice,
-    store: &NarrationStore,
-    item: &Chunk,
-    take: u64,
-) -> Result<Take, Box<dyn Error>> {
-    let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
-    let audio = narrator.say(voice, &item.text, store.speed(), Some(base_seed + take))?;
-    let transcript = transcriber.transcribe(&audio)?;
-    let verdict = Standard::of(store).judge(&item.text, &audio, &transcript);
-    Ok(Take { audio, verdict })
+/// Renders takes of chunks in one voice and checks each against one standard.
+struct Recorder<'a> {
+    narrator: Narrator,
+    transcriber: Transcriber,
+    voice: &'a Voice,
+    speed: f64,
+    standard: &'a Standard,
 }
 
-/// Renders takes until one passes, or returns the best of them with its take count.
-fn render(
-    narrator: &Narrator,
-    transcriber: &mut Transcriber,
-    voice: &Voice,
-    store: &NarrationStore,
-    item: &Chunk,
-) -> Result<(Take, u64), Box<dyn Error>> {
-    let mut best: Option<Take> = None;
-    for take in 0..MAX_TAKES {
-        let current = render_take(narrator, transcriber, voice, store, item, take)?;
-        if current.verdict.passes() {
-            return Ok((current, take + 1));
-        }
-        let Verdict { quality, accuracy, .. } = &current.verdict;
-        println!(
-            "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}",
-            take + 1,
-            quality.floor_db,
-            quality.seconds,
-            accuracy.recall,
-            accuracy.extra,
-        );
-        let replace = best
-            .as_ref()
-            .is_none_or(|existing| current.verdict.rank() > existing.verdict.rank());
-        if replace {
-            best = Some(current);
-        }
+impl<'a> Recorder<'a> {
+    /// Loads the narrator and the transcriber that checks it.
+    fn load(voice: &'a Voice, store: &NarrationStore, standard: &'a Standard) -> Result<Self, Box<dyn Error>> {
+        let narrator = Narrator::load()?;
+        let transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
+        Ok(Recorder { narrator, transcriber, voice, speed: store.speed(), standard })
     }
-    let best = best.ok_or("no takes were rendered")?;
-    Ok((best, MAX_TAKES))
+
+    /// Renders and checks one take. Seeds follow from the text, so `take` picks a
+    /// repeatable take that differs from the others.
+    fn take(&mut self, item: &Chunk, take: u64) -> Result<Take, Box<dyn Error>> {
+        let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
+        let audio = self.narrator.say(self.voice, &item.text, self.speed, Some(base_seed + take))?;
+        let transcript = self.transcriber.transcribe(&audio)?;
+        let verdict = self.standard.judge(&item.text, &audio, &transcript);
+        Ok(Take { audio, verdict })
+    }
+
+    /// Renders takes until one passes, or returns the best of them with its take count.
+    fn best(&mut self, item: &Chunk) -> Result<(Take, u64), Box<dyn Error>> {
+        let mut best: Option<Take> = None;
+        for take in 0..MAX_TAKES {
+            let current = self.take(item, take)?;
+            if current.verdict.passes() {
+                return Ok((current, take + 1));
+            }
+            let Verdict { quality, accuracy, .. } = &current.verdict;
+            println!(
+                "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}",
+                take + 1,
+                quality.floor_db,
+                quality.seconds,
+                accuracy.recall,
+                accuracy.extra,
+            );
+            let replace = best
+                .as_ref()
+                .is_none_or(|existing| current.verdict.rank() > existing.verdict.rank());
+            if replace {
+                best = Some(current);
+            }
+        }
+        let best = best.ok_or("no takes were rendered")?;
+        Ok((best, MAX_TAKES))
+    }
 }
 
 fn safe_name(title: &str) -> String {
@@ -231,11 +236,10 @@ fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathBuf, 
 }
 
 /// Writes one row per chunk with audio, so weak spots can be found and listened to.
-fn write_report(book: &Book, store: &NarrationStore, out: &Path) -> Result<usize, Box<dyn Error>> {
+fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &Path) -> Result<usize, Box<dyn Error>> {
     let mut report = String::from(
         "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\n",
     );
-    let standard = Standard::of(store);
     let mut flagged = 0;
     for item in store.chunks().iter().filter(|item| store.has_audio(item)) {
         let path = store.audio_path(item);
@@ -291,6 +295,7 @@ pub fn narrate(
 
     let voice = Voice::load(voice_sample)?;
     let store = open_store(&book, &voice, out, speed)?;
+    let standard = Standard::of(&store);
 
     let text_dir = out.join("text");
     fs::create_dir_all(&text_dir)?;
@@ -309,12 +314,11 @@ pub fn narrate(
     let total = store.chunks().iter().filter(|item| selected.contains(&item.chapter)).count();
     println!("{total} chunks, {} to generate", pending.len());
     if !pending.is_empty() {
-        let narrator = Narrator::load()?;
-        let mut transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
+        let mut recorder = Recorder::load(&voice, &store, &standard)?;
         let started = Instant::now();
         let mut done = 0;
         for item in &pending {
-            let (take, count) = render(&narrator, &mut transcriber, &voice, &store, item)?;
+            let (take, count) = recorder.best(item)?;
             store.store(item, &take.audio, &take.verdict.accuracy.transcript, count)?;
             done += 1;
             let elapsed = started.elapsed().as_secs_f32();
@@ -329,7 +333,7 @@ pub fn narrate(
         }
     }
 
-    let flagged = write_report(&book, &store, out)?;
+    let flagged = write_report(&book, &store, &standard, out)?;
     let m4b = assemble(&book, &store, out)?;
     println!("Wrote {}", m4b.display());
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
@@ -377,8 +381,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
     let standard = Standard::of(&store);
     let wanted = store.select(targets)?;
 
-    let narrator = Narrator::load()?;
-    let mut transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
+    let mut recorder = Recorder::load(&voice, &store, &standard)?;
     for (position, selected) in wanted.iter().enumerate() {
         let item = selected.chunk;
         let phrases = &selected.phrases;
@@ -406,7 +409,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
         let mut best: Option<Take> = None;
         let mut count = first_take;
         for take in first_take..first_take + MAX_RETAKES {
-            let current = render_take(&narrator, &mut transcriber, &voice, &store, item, take)?;
+            let current = recorder.take(item, take)?;
             count = take + 1;
             let Verdict { quality, accuracy, .. } = &current.verdict;
             let (plausible, clean, score) = current.verdict.rank();
@@ -442,7 +445,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
         }
     }
 
-    let flagged = write_report(&book, &store, out)?;
+    let flagged = write_report(&book, &store, &standard, out)?;
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
     print_missing(&store);
     match rebuild_command(voice_sample, epub, out, &store.complete_chapters(), store.missing_count()) {
