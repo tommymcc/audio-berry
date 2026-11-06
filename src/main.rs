@@ -8,6 +8,7 @@ mod clean;
 mod epub;
 mod narrator;
 mod quality;
+mod sample_check;
 mod store;
 mod text;
 mod transcribe;

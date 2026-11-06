@@ -24,6 +24,13 @@ pub fn noise_limit_from_env() -> Option<f32> {
     limit
 }
 
+/// The noise limit given in the environment, without reporting an invalid value,
+/// for when something else reports it: when a voice sample loads, `book` and
+/// `retake` report it later.
+pub fn noise_limit_from_env_quietly() -> Option<f32> {
+    std::env::var(NOISE_LIMIT_VAR).ok().and_then(|value| valid_noise_limit(&value))
+}
+
 /// A noise limit from text, if it's a level from -100 to 0 dB.
 pub fn valid_noise_limit(value: &str) -> Option<f32> {
     value.trim().parse::<f32>().ok().filter(|db| (-100.0..=0.0).contains(db))

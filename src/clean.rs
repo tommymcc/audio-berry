@@ -3,7 +3,7 @@
 
 use crate::audio::decode_audio;
 use crate::quality;
-use crate::voice::SAMPLE_RATE;
+use crate::voice::{SAMPLE_RATE, transcript_path};
 use any_tts::AudioSamples;
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::{Array2, ArrayView2, Axis};
@@ -61,7 +61,7 @@ pub fn clean(
     );
     println!(
         "The first command to use it transcribes it to {}. Check that file's words.",
-        output.with_extension("txt").display()
+        transcript_path(output).display()
     );
     Ok(())
 }
