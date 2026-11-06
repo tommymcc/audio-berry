@@ -14,6 +14,10 @@ const SKIPPED: [&str; 8] = ["head", "img", "nav", "script", "style", "svg", "tab
 const SKIPPED_ROLES: [&str; 7] = [
     "noteref", "footnote", "endnote", "rearnote", "pagebreak", "toc", "doc-noteref",
 ];
+/// Project Gutenberg's header and licence (`pg-boilerplate`) and contents lists
+/// marked as `toc` aren't part of the story. The licence alone is about 18,000
+/// characters, and sits in the same file as the last chapter.
+const SKIPPED_CLASSES: [&str; 2] = ["pg-boilerplate", "toc"];
 
 pub struct Chapter {
     pub title: String,
@@ -76,7 +80,7 @@ pub fn expand_doctype(source: &str) -> String {
 
 fn is_skipped(element: &ElementRef) -> bool {
     let tag = element.value().name();
-    if SKIPPED.contains(&tag) {
+    if SKIPPED.contains(&tag) || element.value().classes().any(|class| SKIPPED_CLASSES.contains(&class)) {
         return true;
     }
     // Footnote markers are superscript links.
@@ -288,6 +292,22 @@ mod tests {
                 ("Line one, line two.", false),
             ]
         );
+    }
+
+    #[test]
+    fn skips_project_gutenberg_boilerplate_and_contents_lists() {
+        // As in Project Gutenberg's EPUBs, whose header and licence share a
+        // file with the book's opening and ending.
+        let source = r##"<html><body>
+<div class="pg-boilerplate pgheader header" id="pg-header"><p>The Project Gutenberg eBook of Moby Dick</p></div>
+<p class="toc"><b>CONTENTS</b></p>
+<blockquote><div><p class="toc"><a href="#c1" class="pginternal">Chapter 1. Loomings.</a></p></div></blockquote>
+<h2>Chapter 1. Loomings.</h2>
+<p>Call me Ishmael.</p>
+<div class="pg-boilerplate pgheader footer" id="pg-footer"><p>Project Gutenberg is a registered trademark.</p></div>
+</body></html>"##;
+        let texts: Vec<String> = extract_paragraphs(source).into_iter().map(|p| p.text).collect();
+        assert_eq!(texts, vec!["Chapter 1. Loomings.", "Call me Ishmael."]);
     }
 
     #[test]
