@@ -129,6 +129,14 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ```
 
 4. **Listen to a test.** Judge it by ear, ideally on the speaker you'll use.
+   To compare the clone with the original, `audition` says the sample's own
+   words in the cloned voice, then plays the sample and the clone in turn:
+
+   ```sh
+   ./target/release/audio-berry audition voices/me.wav kitchen
+   ```
+
+   To hear it say something else:
 
    ```sh
    mkdir -p output
@@ -157,7 +165,16 @@ audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers] [--sp
 audio-berry retake <voice-sample> <book.epub> <output-dir> <words or chunk number>...
 audio-berry speakers
 audio-berry play <speaker> <file>...
+audio-berry audition <voice-sample> [speaker] [--speed <factor>]
 ```
+
+`audition` says a voice sample's own words, from its `.txt` file, in the cloned
+voice, then plays the sample and the clone in turn on the speaker, so you hear the
+same words in both. It saves them in `output/audition`, so `voices/me.wav` gives
+`me-original.wav` and `me-clone.wav`. The original is the part of the sample the
+model hears, at 24 kHz mono, and trimmed to at most 15 seconds if the sample is
+over 20. Without a speaker, it only saves them. Like `speak`, it uses
+`OMNIVOICE_SEED` if set.
 
 `play` matches part of a speaker's name, ignoring case, and needs exactly one
 match. It interrupts whatever the speaker is playing. While playing, it serves

@@ -1,3 +1,4 @@
+mod audition;
 mod book;
 mod cast;
 mod epub;
@@ -95,7 +96,8 @@ const USAGE: &str = "usage:
   audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers, e.g. 2 3 7] [--speed <factor>]
   audio-berry retake <voice-sample> <book.epub> <output-dir> <words from the book, or a chunk number like 3.12>...
   audio-berry speakers
-  audio-berry play <speaker> <file>...";
+  audio-berry play <speaker> <file>...
+  audio-berry audition <voice-sample> [speaker] [--speed <factor>]";
 
 pub fn load_narrator() -> Result<Box<dyn TtsModel>, Box<dyn Error>> {
     let started = Instant::now();
@@ -118,8 +120,8 @@ fn stop_quietly_when_output_closes() {}
 fn main() -> Result<(), Box<dyn Error>> {
     stop_quietly_when_output_closes();
     let (args, speed) = take_speed(std::env::args().skip(1).collect())?;
-    if speed.is_some() && !matches!(args.first().map(String::as_str), Some("speak" | "book")) {
-        return Err("--speed only works with speak and book; retake uses the speed saved in the output directory".into());
+    if speed.is_some() && !takes_speed(args.first().map(String::as_str)) {
+        return Err("--speed only works with speak, book and audition; retake uses the speed saved in the output directory".into());
     }
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["speak", voice, text, output] => speak(voice, text, output, speed),
@@ -151,8 +153,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             cast::play(&cast::find(speaker)?, files)
         }
+        ["audition", voice] => audition::audition(Path::new(voice), None, speed),
+        ["audition", voice, speaker] => audition::audition(Path::new(voice), Some(speaker), speed),
         _ => Err(USAGE.into()),
     }
+}
+
+/// Whether a command accepts `--speed`. `retake` doesn't, as it reuses the saved speed.
+fn takes_speed(command: Option<&str>) -> bool {
+    matches!(command, Some("speak" | "book" | "audition"))
 }
 
 /// Takes `--speed <factor>` out of the arguments, wherever it appears.
@@ -171,7 +180,12 @@ fn take_speed(mut args: Vec<String>) -> Result<(Vec<String>, Option<f64>), Box<d
 
 fn speak(voice: &str, text: &str, output: &str, speed: Option<f64>) -> Result<(), Box<dyn Error>> {
     let reference = load_reference(Path::new(voice))?;
+    render(reference, text, Path::new(output), speed)
+}
 
+/// Loads the model, says `text` in the reference's voice and saves it to `output`.
+/// Each run picks its seed from `OMNIVOICE_SEED`, as the model does by default.
+pub fn render(reference: ReferenceAudio, text: &str, output: &Path, speed: Option<f64>) -> Result<(), Box<dyn Error>> {
     let model = load_narrator()?;
 
     let started = Instant::now();
@@ -184,7 +198,8 @@ fn speak(voice: &str, text: &str, output: &str, speed: Option<f64>) -> Result<()
 
     audio.save_wav(output)?;
     println!(
-        "Wrote {output}: {:.1}s of audio in {elapsed:.0}s ({:.2}x realtime)",
+        "Wrote {}: {:.1}s of audio in {elapsed:.0}s ({:.2}x realtime)",
+        output.display(),
         audio.duration_secs(),
         audio.duration_secs() / elapsed
     );
@@ -207,6 +222,17 @@ mod tests {
         let (rest, speed) = take_speed(args(&["book", "v", "b", "o", "--speed", "1.2"])).unwrap();
         assert_eq!(rest, args(&["book", "v", "b", "o"]));
         assert_eq!(speed, Some(1.2));
+    }
+
+    #[test]
+    fn speed_is_for_commands_that_render_at_a_chosen_speed() {
+        for command in ["speak", "book", "audition"] {
+            assert!(takes_speed(Some(command)), "{command}");
+        }
+        for command in ["retake", "play", "chapters", "speakers"] {
+            assert!(!takes_speed(Some(command)), "{command}");
+        }
+        assert!(!takes_speed(None));
     }
 
     #[test]

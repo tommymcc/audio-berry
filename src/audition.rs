@@ -1,0 +1,96 @@
+//! Says a voice sample's own words in its cloned voice, so the clone and the
+//! original can be compared by ear, saying the same thing.
+
+use crate::cast;
+use any_tts::AudioSamples;
+use std::error::Error;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Where auditions are saved, so they can be played again with `play`.
+const AUDITION_DIR: &str = "output/audition";
+
+/// The pair of files an audition writes for one voice sample.
+#[derive(Debug, PartialEq)]
+struct Pair {
+    /// The part of the sample the model hears, which its transcript describes.
+    original: PathBuf,
+    /// The transcript said in the cloned voice.
+    clone: PathBuf,
+}
+
+/// Names the pair after the sample, so `voices/me.wav` gives `me-original.wav`
+/// and `me-clone.wav`. Speakers with a screen show these names.
+fn pair_for(voice: &Path, dir: &Path) -> Result<Pair, Box<dyn Error>> {
+    let stem = voice
+        .file_stem()
+        .ok_or_else(|| format!("no file name in {}", voice.display()))?
+        .to_string_lossy();
+    Ok(Pair {
+        original: dir.join(format!("{stem}-original.wav")),
+        clone: dir.join(format!("{stem}-clone.wav")),
+    })
+}
+
+/// Saves the sample as the model hears it and its transcript in the cloned voice,
+/// then plays the two in turn on `speaker`, if one is given.
+pub fn audition(voice: &Path, speaker: Option<&str>, speed: Option<f64>) -> Result<(), Box<dyn Error>> {
+    // Finding the speaker first means a wrong name fails before the slow part.
+    let speaker = speaker.map(cast::find).transpose()?;
+    let reference = crate::load_reference(voice)?;
+    let transcript = reference
+        .transcript
+        .clone()
+        .ok_or_else(|| format!("no transcript for {}", voice.display()))?;
+    let pair = pair_for(voice, Path::new(AUDITION_DIR))?;
+    fs::create_dir_all(AUDITION_DIR)?;
+
+    // A long sample is trimmed before cloning, and its transcript only covers
+    // what's kept, so that part is what plays as the original.
+    AudioSamples::new(reference.samples.clone(), reference.sample_rate).save_wav(&pair.original)?;
+    println!("Wrote {}: the sample as the model hears it", pair.original.display());
+    println!("Saying: {transcript}");
+    crate::render(reference, &transcript, &pair.clone, speed)?;
+
+    let files = vec![pair.original, pair.clone];
+    match speaker {
+        Some(speaker) => cast::play(&speaker, files),
+        None => {
+            println!(
+                "To hear them: audio-berry play <speaker> {} {}",
+                files[0].display(),
+                files[1].display()
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pair_is_named_after_the_sample() {
+        let pair = pair_for(Path::new("voices/me.wav"), Path::new("output/audition")).unwrap();
+        assert_eq!(
+            pair,
+            Pair {
+                original: PathBuf::from("output/audition/me-original.wav"),
+                clone: PathBuf::from("output/audition/me-clone.wav"),
+            }
+        );
+    }
+
+    #[test]
+    fn a_sample_in_any_format_gives_wav_files() {
+        let pair = pair_for(Path::new("/home/x/dad.full.mp3"), Path::new("out")).unwrap();
+        assert_eq!(pair.original, PathBuf::from("out/dad.full-original.wav"));
+        assert_eq!(pair.clone, PathBuf::from("out/dad.full-clone.wav"));
+    }
+
+    #[test]
+    fn a_sample_needs_a_file_name() {
+        assert!(pair_for(Path::new("/"), Path::new("out")).is_err());
+    }
+}
