@@ -343,7 +343,7 @@ impl Transcriber {
     }
 
     pub fn transcribe(&mut self, path: &Path) -> Result<String, Box<dyn Error>> {
-        let samples = crate::decode_audio(path, whisper::SAMPLE_RATE as u32)?;
+        let samples = crate::audio::decode_audio(path, whisper::SAMPLE_RATE as u32)?;
         let bands = self.model.config.num_mel_bins;
         let mut rest = samples.as_slice();
         let mut text = Vec::new();

@@ -2,7 +2,8 @@
 //! original can be compared by ear, saying the same thing.
 
 use crate::cast;
-use any_tts::AudioSamples;
+use crate::narrator::Narrator;
+use crate::voice::Voice;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,23 +35,19 @@ fn pair_for(voice: &Path, dir: &Path) -> Result<Pair, Box<dyn Error>> {
 
 /// Saves the sample as the model hears it and its transcript in the cloned voice,
 /// then plays the two in turn on `speaker`, if one is given.
-pub fn audition(voice: &Path, speaker: Option<&str>, speed: Option<f64>) -> Result<(), Box<dyn Error>> {
+pub fn audition(voice_sample: &Path, speaker: Option<&str>, speed: Option<f64>) -> Result<(), Box<dyn Error>> {
     // Finding the speaker first means a wrong name fails before the slow part.
     let speaker = speaker.map(cast::find).transpose()?;
-    let reference = crate::load_reference(voice)?;
-    let transcript = reference
-        .transcript
-        .clone()
-        .ok_or_else(|| format!("no transcript for {}", voice.display()))?;
-    let pair = pair_for(voice, Path::new(AUDITION_DIR))?;
+    let voice = Voice::load(voice_sample)?;
+    let pair = pair_for(voice_sample, Path::new(AUDITION_DIR))?;
     fs::create_dir_all(AUDITION_DIR)?;
 
-    // A long sample is trimmed before cloning, and its transcript only covers
-    // what's kept, so that part is what plays as the original.
-    AudioSamples::new(reference.samples.clone(), reference.sample_rate).save_wav(&pair.original)?;
+    // What plays as the original is the part of the sample its transcript covers.
+    voice.save_heard(&pair.original)?;
     println!("Wrote {}: the sample as the model hears it", pair.original.display());
-    println!("Saying: {transcript}");
-    crate::render(reference, &transcript, &pair.cloned, speed)?;
+    println!("Saying: {}", voice.transcript());
+    let narrator = Narrator::load()?;
+    narrator.say_to_file(&voice, voice.transcript(), &pair.cloned, speed.unwrap_or(1.0))?;
 
     match speaker {
         Some(speaker) => cast::play(&speaker, vec![pair.original, pair.cloned]),

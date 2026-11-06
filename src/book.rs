@@ -1,11 +1,14 @@
 //! Narrates a whole book: generates checked chunks, then assembles the audio.
 
+use crate::checks::{Standard, Verdict};
 use crate::epub::{Book, image_type, read_book};
-use crate::quality::{self, Quality};
+use crate::narrator::Narrator;
+use crate::quality;
 use crate::store::{Chunk, NarrationStore, RenderSettings, fnv};
 use crate::text::{MAX_CHUNK_CHARS, chunk};
-use crate::transcribe::{self, Accuracy, Transcriber};
-use any_tts::{AudioSamples, ReferenceAudio, SynthesisRequest, TtsModel};
+use crate::transcribe::{self, Transcriber};
+use crate::voice::Voice;
+use any_tts::AudioSamples;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
@@ -20,14 +23,7 @@ const SPEECH_TARGET_DB: f32 = -21.0;
 const CHUNK_GAP_SECONDS: f32 = 0.35;
 const CHAPTER_GAP_SECONDS: f32 = 1.2;
 
-/// Identifies a voice, including its transcript since that changes the speech.
-fn voice_hash(reference: &ReferenceAudio) -> u64 {
-    let mut bytes: Vec<u8> = reference.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-    bytes.extend_from_slice(reference.transcript.as_deref().unwrap_or_default().as_bytes());
-    fnv(&bytes, 0)
-}
-
-fn open_store(book: &Book, reference: &ReferenceAudio, out: &Path, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
+fn open_store(book: &Book, voice: &Voice, out: &Path, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
     let chapters: Vec<Vec<String>> = book
         .chapters
         .iter()
@@ -37,7 +33,7 @@ fn open_store(book: &Book, reference: &ReferenceAudio, out: &Path, speed: Option
         out,
         &book.title,
         &chapters,
-        voice_hash(reference),
+        voice.hash(),
         &RenderSettings::from_env(speed),
         quality::noise_limit_from_env(),
     )
@@ -62,89 +58,55 @@ pub fn list_chapters(path: &Path) -> Result<(), Box<dyn Error>> {
 
 struct Take {
     audio: AudioSamples,
-    quality: Quality,
-    accuracy: Accuracy,
-    speed: f64,
-    noise_limit_db: f32,
-}
-
-impl Take {
-    fn plausible(&self, characters: usize) -> bool {
-        quality::plausible_length_at(characters, self.quality.seconds, self.speed)
-    }
-
-    fn clean(&self) -> bool {
-        self.quality.clean(self.noise_limit_db)
-    }
-
-    fn acceptable(&self, characters: usize) -> bool {
-        self.plausible(characters) && self.clean() && self.accuracy.acceptable()
-    }
-
-    /// Plausible length matters most, then clean audio, then accuracy.
-    fn rank(&self, characters: usize) -> (bool, bool, f32) {
-        (self.plausible(characters), self.clean(), self.accuracy.score())
-    }
+    verdict: Verdict,
 }
 
 /// Renders and checks one take. Seeds follow from the text, so `take` picks a
 /// repeatable take that differs from the others.
 fn render_take(
-    model: &dyn TtsModel,
+    narrator: &Narrator,
     transcriber: &mut Transcriber,
-    reference: &ReferenceAudio,
+    voice: &Voice,
     store: &NarrationStore,
     item: &Chunk,
     take: u64,
 ) -> Result<Take, Box<dyn Error>> {
     let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
     let candidate = store.scratch_path(item);
-    // SAFETY: nothing else reads or writes the environment during this
-    // call, as the model is only used from this thread between requests.
-    unsafe { std::env::set_var("OMNIVOICE_SEED", (base_seed + take).to_string()) };
-    let mut request = SynthesisRequest::new(item.text.as_str()).with_reference_audio(reference.clone());
-    if store.speed() != 1.0 {
-        request = request.with_speed(store.speed());
-    }
-    let audio = model.synthesize(&request)?;
+    let audio = narrator.say(voice, &item.text, store.speed(), Some(base_seed + take))?;
     audio.save_wav(&candidate)?;
     let transcript = transcriber.transcribe(&candidate)?;
     fs::remove_file(&candidate)?;
-    Ok(Take {
-        quality: quality::measure(&audio.samples, audio.sample_rate),
-        accuracy: transcribe::compare(&item.text, &transcript),
-        audio,
-        speed: store.speed(),
-        noise_limit_db: store.noise_limit_db(),
-    })
+    let verdict = Standard::of(store).judge(&item.text, &audio, &transcript);
+    Ok(Take { audio, verdict })
 }
 
 /// Renders takes until one passes, or returns the best of them with its take count.
 fn render(
-    model: &dyn TtsModel,
+    narrator: &Narrator,
     transcriber: &mut Transcriber,
-    reference: &ReferenceAudio,
+    voice: &Voice,
     store: &NarrationStore,
     item: &Chunk,
 ) -> Result<(Take, u64), Box<dyn Error>> {
-    let characters = item.text.chars().count();
     let mut best: Option<Take> = None;
     for take in 0..MAX_TAKES {
-        let current = render_take(model, transcriber, reference, store, item, take)?;
-        if current.acceptable(characters) {
+        let current = render_take(narrator, transcriber, voice, store, item, take)?;
+        if current.verdict.passes() {
             return Ok((current, take + 1));
         }
+        let Verdict { quality, accuracy, .. } = &current.verdict;
         println!(
             "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}",
             take + 1,
-            current.quality.floor_db,
-            current.quality.seconds,
-            current.accuracy.recall,
-            current.accuracy.extra,
+            quality.floor_db,
+            quality.seconds,
+            accuracy.recall,
+            accuracy.extra,
         );
         let replace = best
             .as_ref()
-            .is_none_or(|existing| current.rank(characters) > existing.rank(characters));
+            .is_none_or(|existing| current.verdict.rank() > existing.verdict.rank());
         if replace {
             best = Some(current);
         }
@@ -274,17 +236,16 @@ fn write_report(book: &Book, store: &NarrationStore, out: &Path) -> Result<usize
     let mut report = String::from(
         "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\n",
     );
+    let standard = Standard::of(store);
     let mut flagged = 0;
     for item in store.chunks().iter().filter(|item| store.has_audio(item)) {
         let path = store.audio_path(item);
         let audio = AudioSamples::from_wav_file(&path)?;
-        let quality = quality::measure(&audio.samples, audio.sample_rate);
         let check = store.check(item)?;
-        let accuracy = transcribe::compare(&item.text, &check.transcript);
+        let verdict = standard.judge(&item.text, &audio, &check.transcript);
+        let pass = verdict.passes();
+        let Verdict { quality, accuracy, .. } = &verdict;
         let characters = item.text.chars().count();
-        let pass = quality.clean(store.noise_limit_db())
-            && quality::plausible_length_at(characters, quality.seconds, store.speed())
-            && accuracy.acceptable();
         flagged += usize::from(!pass);
         writeln!(
             report,
@@ -312,7 +273,7 @@ fn write_report(book: &Book, store: &NarrationStore, out: &Path) -> Result<usize
 /// are cached, so an interrupted run picks up where it stopped. The report and
 /// M4B cover every chapter rendered there so far.
 pub fn narrate(
-    voice: &Path,
+    voice_sample: &Path,
     epub: &Path,
     out: &Path,
     chapters: Option<Vec<usize>>,
@@ -329,8 +290,8 @@ pub fn narrate(
         None => (0..book.chapters.len()).collect(),
     };
 
-    let reference = crate::load_reference(voice)?;
-    let store = open_store(&book, &reference, out, speed)?;
+    let voice = Voice::load(voice_sample)?;
+    let store = open_store(&book, &voice, out, speed)?;
 
     let text_dir = out.join("text");
     fs::create_dir_all(&text_dir)?;
@@ -349,20 +310,20 @@ pub fn narrate(
     let total = store.chunks().iter().filter(|item| selected.contains(&item.chapter)).count();
     println!("{total} chunks, {} to generate", pending.len());
     if !pending.is_empty() {
-        let model = crate::load_narrator()?;
+        let narrator = Narrator::load()?;
         let mut transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
         let started = Instant::now();
         let mut done = 0;
         for item in &pending {
-            let (take, count) = render(model.as_ref(), &mut transcriber, &reference, &store, item)?;
-            store.store(item, &take.audio, &take.accuracy.transcript, count)?;
+            let (take, count) = render(&narrator, &mut transcriber, &voice, &store, item)?;
+            store.store(item, &take.audio, &take.verdict.accuracy.transcript, count)?;
             done += 1;
             let elapsed = started.elapsed().as_secs_f32();
             println!(
                 "[{done}/{}] {:.0}s of audio, take {count}, recall {:.2}, {:.0} min elapsed, about {:.0} min left",
                 pending.len(),
                 take.audio.duration_secs(),
-                take.accuracy.recall,
+                take.verdict.accuracy.recall,
                 elapsed / 60.0,
                 elapsed / done as f32 * (pending.len() - done) as f32 / 60.0,
             );
@@ -410,19 +371,19 @@ fn print_missing(store: &NarrationStore) {
 /// Records new takes of only the chunks that `targets` name, keeping a new take
 /// only if it beats the current one. The old audio moves to `replaced/`. This leaves
 /// the M4B alone, so it's safe during playback; `book` rebuilds it afterwards.
-pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result<(), Box<dyn Error>> {
+pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
-    let reference = crate::load_reference(voice)?;
-    let store = open_store(&book, &reference, out, None)?;
+    let voice = Voice::load(voice_sample)?;
+    let store = open_store(&book, &voice, out, None)?;
+    let standard = Standard::of(&store);
     let wanted = store.select(targets)?;
 
-    let model = crate::load_narrator()?;
+    let narrator = Narrator::load()?;
     let mut transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
     for (position, selected) in wanted.iter().enumerate() {
         let item = selected.chunk;
         let phrases = &selected.phrases;
         let path = store.audio_path(item);
-        let characters = item.text.chars().count();
         let heard_all = |transcript: &str| {
             phrases.iter().all(|phrase| transcribe::contains_phrase(transcript, phrase))
         };
@@ -430,14 +391,7 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
         let (first_take, mut best_rank) = if store.has_audio(item) {
             let check = store.check(item)?;
             let audio = AudioSamples::from_wav_file(&path)?;
-            let current = Take {
-                quality: quality::measure(&audio.samples, audio.sample_rate),
-                accuracy: transcribe::compare(&item.text, &check.transcript),
-                audio,
-                speed: store.speed(),
-                noise_limit_db: store.noise_limit_db(),
-            };
-            let (plausible, clean, score) = current.rank(characters);
+            let (plausible, clean, score) = standard.judge(&item.text, &audio, &check.transcript).rank();
             (check.takes, Some((plausible, clean, heard_all(&check.transcript), score)))
         } else {
             (0, None)
@@ -453,17 +407,18 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
         let mut best: Option<Take> = None;
         let mut count = first_take;
         for take in first_take..first_take + MAX_RETAKES {
-            let current = render_take(model.as_ref(), &mut transcriber, &reference, &store, item, take)?;
+            let current = render_take(&narrator, &mut transcriber, &voice, &store, item, take)?;
             count = take + 1;
-            let (plausible, clean, score) = current.rank(characters);
-            let heard = heard_all(&current.accuracy.transcript);
+            let Verdict { quality, accuracy, .. } = &current.verdict;
+            let (plausible, clean, score) = current.verdict.rank();
+            let heard = heard_all(&accuracy.transcript);
             let rank = (plausible, clean, heard, score);
-            let exact = current.accuracy.recall >= 0.99 && current.accuracy.extra <= 0.01;
+            let exact = accuracy.recall >= 0.99 && accuracy.extra <= 0.01;
             println!(
                 "  take {count}: recall {:.2}, extra {:.2}, phrase heard {heard}, floor {:.0} dB",
-                current.accuracy.recall, current.accuracy.extra, current.quality.floor_db,
+                accuracy.recall, accuracy.extra, quality.floor_db,
             );
-            println!("    heard: {}", current.accuracy.transcript);
+            println!("    heard: {}", accuracy.transcript);
             if best_rank.is_none_or(|existing| rank > existing) {
                 best_rank = Some(rank);
                 best = Some(current);
@@ -477,8 +432,8 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
                 if store.has_audio(item) {
                     store.retire(item)?;
                 }
-                store.store(item, &take.audio, &take.accuracy.transcript, count)?;
-                println!("  replaced: {}", take.accuracy.transcript);
+                store.store(item, &take.audio, &take.verdict.accuracy.transcript, count)?;
+                println!("  replaced: {}", take.verdict.accuracy.transcript);
             }
             None => {
                 // Still counts the tried seeds, so the next retake tries new ones.
@@ -491,7 +446,7 @@ pub fn retake(voice: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result
     let flagged = write_report(&book, &store, out)?;
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
     print_missing(&store);
-    match rebuild_command(voice, epub, out, &store.complete_chapters(), store.missing_count()) {
+    match rebuild_command(voice_sample, epub, out, &store.complete_chapters(), store.missing_count()) {
         Some(command) => println!("To rebuild the M4B and chapter WAVs, run:\n  {command}"),
         None => println!("No chapter is complete yet, so there's no M4B to rebuild."),
     }
@@ -504,14 +459,6 @@ mod tests {
 
     fn command(complete: &[usize], missing: usize) -> Option<String> {
         rebuild_command(Path::new("v.wav"), Path::new("b.epub"), Path::new("out"), complete, missing)
-    }
-
-    #[test]
-    fn the_voice_hash_stays_the_same() {
-        // Output directories record this hash, so changing it orphans every chunk.
-        let samples = (0..240).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
-        let reference = ReferenceAudio::new(samples, 24_000).with_transcript("Hello there.");
-        assert_eq!(voice_hash(&reference), 3087178596103644096);
     }
 
     #[test]
