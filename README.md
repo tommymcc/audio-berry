@@ -262,8 +262,8 @@ such as a hum or faint music, lower the limit so they're retried:
 AUDIO_BERRY_NOISE_LIMIT_DB=-65 ./target/release/audio-berry book voices/me.wav book.epub output/book
 ```
 
-**It's saved with the book.** The output directory saves the limit in
-`narration.txt` with its first take, so give it once. Later `book` and `retake`
+**It's saved in the output directory.** The limit goes in `narration.txt` with
+the first take, so give it once. Later `book` and `retake`
 runs, and `report.tsv`, use the saved value:
 
 ```sh
@@ -279,7 +279,14 @@ Noise limit: -48 dB, replacing -50 dB in output/book/narration.txt
 
 Changing it doesn't render anything again: chunks that already have audio are
 kept, and only new takes and the `CHECK` flags are judged against the new value.
-Directories saved before the limit was have -55 until you give one.
+
+An output directory started before limits were saved uses -55 until you give
+one, and the run says so. Its file isn't changed, because it may have been
+rendered with a limit that wasn't saved. If it was, give that limit once:
+
+```sh
+AUDIO_BERRY_NOISE_LIMIT_DB=-50 ./target/release/audio-berry book voices/dad.wav book.epub output/book
+```
 
 ## One output directory, one narration
 

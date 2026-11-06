@@ -104,7 +104,8 @@ struct Manifest {
     precision: String,
     speed: f64,
     /// Not a render setting: it only decides which take is kept, so it can
-    /// change without touching the audio. `None` in folders saved before it was.
+    /// change without touching the audio. `None` in output directories saved
+    /// before it was, until a limit is given.
     noise_limit_db: Option<f32>,
 }
 
@@ -133,9 +134,9 @@ impl Manifest {
             precision: field("precision")?,
             speed: field("speed").map_or(Ok(NORMAL_SPEED), |speed| speed.parse())?,
             noise_limit_db: match field("noise_limit_db") {
-                Ok(value) => Some(
-                    valid_noise_limit(&value).ok_or_else(|| format!("{MANIFEST} has a bad noise_limit_db: {value}"))?,
-                ),
+                Ok(value) => Some(valid_noise_limit(&value).ok_or_else(|| {
+                    format!("{MANIFEST} has noise_limit_db={value}, which isn't a level from -100 to 0 dB. Correct or delete that line")
+                })?),
                 Err(_) => None,
             },
         })
@@ -169,6 +170,61 @@ pub struct NarrationStore {
     manifest: Manifest,
 }
 
+/// The noise limit a run uses, and what that means for `narration.txt`.
+struct SettledNoiseLimit {
+    limit_db: f32,
+    /// What `narration.txt` should hold. `None` leaves an older output
+    /// directory's file without a limit.
+    saved: Option<f32>,
+    /// Whether to rewrite an existing `narration.txt` now. A new output
+    /// directory saves its file with the first take instead.
+    save_now: bool,
+    note: Option<String>,
+}
+
+/// A given limit wins and is saved; otherwise the saved one is used. An output
+/// directory saved before limits were gets the default without it being written,
+/// because it may have been rendered with a limit that wasn't saved.
+fn settle_noise_limit(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> SettledNoiseLimit {
+    let path = out.join(MANIFEST);
+    let Some(saved) = saved else {
+        let limit_db = given.unwrap_or(MAX_FLOOR_DB);
+        let note = given.map(|limit| format!("Noise limit: {limit} dB"));
+        return SettledNoiseLimit { limit_db, saved: Some(limit_db), save_now: false, note };
+    };
+    match (saved.noise_limit_db, given) {
+        (Some(old), Some(new)) if old != new => SettledNoiseLimit {
+            limit_db: new,
+            saved: Some(new),
+            save_now: true,
+            note: Some(format!("Noise limit: {new} dB, replacing {old} dB in {}", path.display())),
+        },
+        (None, Some(new)) => SettledNoiseLimit {
+            limit_db: new,
+            saved: Some(new),
+            save_now: true,
+            note: Some(format!("Noise limit: {new} dB, now saved in {}", path.display())),
+        },
+        (Some(old), _) => SettledNoiseLimit {
+            limit_db: old,
+            saved: Some(old),
+            save_now: false,
+            note: (given.is_some() || old != MAX_FLOOR_DB).then(|| format!("Noise limit: {old} dB")),
+        },
+        (None, None) => SettledNoiseLimit {
+            limit_db: MAX_FLOOR_DB,
+            saved: None,
+            save_now: false,
+            note: Some(format!(
+                "Noise limit: {MAX_FLOOR_DB} dB. {} has no saved limit, so if this output directory \
+                 was rendered with {}, give it once more to save it.",
+                path.display(),
+                crate::quality::NOISE_LIMIT_VAR,
+            )),
+        },
+    }
+}
+
 impl NarrationStore {
     pub fn open(
         out: &Path,
@@ -176,13 +232,11 @@ impl NarrationStore {
         chapters: &[Vec<String>],
         voice: u64,
         settings: &RenderSettings,
-        noise_limit_db: Option<f32>,
+        given_noise_limit: Option<f32>,
     ) -> Result<Self, Box<dyn Error>> {
         let saved = read_manifest(out)?;
         let speed = settings.speed.or(saved.as_ref().map(|saved| saved.speed)).unwrap_or(NORMAL_SPEED);
-        let saved_limit = saved.as_ref().and_then(|saved| saved.noise_limit_db);
-        let given_limit = noise_limit_db;
-        let noise_limit_db = given_limit.or(saved_limit).unwrap_or(MAX_FLOOR_DB);
+        let noise_limit = settle_noise_limit(saved.as_ref(), given_noise_limit, out);
         // Normal speed keeps the original key, so older chunks stay valid.
         let speed_key = if speed == NORMAL_SPEED { String::new() } else { format!("speed={speed}\n") };
         let mut chunks = Vec::new();
@@ -203,20 +257,15 @@ impl NarrationStore {
             voice: format!("{voice:x}"),
             precision: settings.precision.clone(),
             speed,
-            noise_limit_db: Some(noise_limit_db),
+            noise_limit_db: noise_limit.saved,
         };
-        let store = Self { out: out.to_path_buf(), chunks, speed, noise_limit_db, manifest };
-        let had_manifest = saved.is_some();
+        let store = Self { out: out.to_path_buf(), chunks, speed, noise_limit_db: noise_limit.limit_db, manifest };
         store.require_same(saved)?;
-        if had_manifest && saved_limit != Some(noise_limit_db) {
-            // Saves a changed limit, or the default in a folder that didn't record it.
+        if noise_limit.save_now {
             store.write_manifest()?;
         }
-        let was = saved_limit.unwrap_or(MAX_FLOOR_DB);
-        if had_manifest && given_limit.is_some() && was != noise_limit_db {
-            eprintln!("Noise limit: {noise_limit_db} dB, replacing {was} dB in {}", out.join(MANIFEST).display());
-        } else if given_limit.is_some() || noise_limit_db != MAX_FLOOR_DB {
-            eprintln!("Noise limit: {noise_limit_db} dB");
+        if let Some(note) = noise_limit.note {
+            eprintln!("{note}");
         }
         Ok(store)
     }
@@ -333,7 +382,7 @@ impl NarrationStore {
         self.speed
     }
 
-    /// The background level a take's pauses must stay under, saved for this folder.
+    /// The background level a take's pauses must stay under in this output directory.
     pub fn noise_limit_db(&self) -> f32 {
         self.noise_limit_db
     }
@@ -745,8 +794,12 @@ mod tests {
         }
     }
 
+    fn open_store(dir: &TempDir, noise_limit: Option<f32>) -> Result<NarrationStore, Box<dyn Error>> {
+        NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), noise_limit)
+    }
+
     fn open_with_limit(dir: &TempDir, noise_limit: Option<f32>) -> NarrationStore {
-        NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), noise_limit).unwrap()
+        open_store(dir, noise_limit).unwrap()
     }
 
     fn render_with_limit(dir: &TempDir, noise_limit: Option<f32>) {
@@ -799,31 +852,53 @@ mod tests {
         assert_eq!(open_with_limit(&dir, None).noise_limit_db(), -48.5);
     }
 
-    #[test]
-    fn a_folder_from_before_the_noise_limit_was_saved_uses_the_default() {
-        let dir = TempDir::new("limit-older");
+    /// A `narration.txt` as saved before the noise limit was.
+    const OLDER_MANIFEST: &str = "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n";
+
+    fn folder_without_a_saved_limit(name: &str) -> TempDir {
+        let dir = TempDir::new(name);
         fs::create_dir_all(dir.0.join("chunks")).unwrap();
-        fs::write(dir.0.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n").unwrap();
+        fs::write(dir.0.join(MANIFEST), OLDER_MANIFEST).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_older_folder_uses_the_default_without_saving_it() {
+        // It may have been rendered with a limit that wasn't saved, so writing the
+        // default would quietly judge its takes against the wrong one.
+        let dir = folder_without_a_saved_limit("limit-older");
         assert_eq!(open_with_limit(&dir, None).noise_limit_db(), MAX_FLOOR_DB);
-        assert_eq!(saved_limit(&dir).as_deref(), Some("-55"));
+        assert_eq!(fs::read_to_string(dir.0.join(MANIFEST)).unwrap(), OLDER_MANIFEST);
+        let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), None, &dir.0);
+        assert!(settled.note.unwrap().contains("give it once"));
     }
 
     #[test]
-    fn a_folder_from_before_the_noise_limit_was_saved_takes_a_new_one() {
-        let dir = TempDir::new("limit-older-new");
-        fs::create_dir_all(dir.0.join("chunks")).unwrap();
-        fs::write(dir.0.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n").unwrap();
+    fn an_older_folder_saves_a_limit_when_one_is_given() {
+        let dir = folder_without_a_saved_limit("limit-older-new");
         assert_eq!(open_with_limit(&dir, Some(-50.0)).noise_limit_db(), -50.0);
+        assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
         assert_eq!(open_with_limit(&dir, None).noise_limit_db(), -50.0);
+        let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), Some(-50.0), &dir.0);
+        let note = settled.note.unwrap();
+        assert!(note.contains("saved in") && !note.contains("replacing"), "{note}");
     }
 
     #[test]
-    fn a_bad_saved_noise_limit_is_an_error() {
-        let dir = TempDir::new("limit-bad");
-        fs::write(dir.0.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\nnoise_limit_db=loud\n").unwrap();
-        let store = NarrationStore::open(&dir.0, "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), None);
-        let error = store.err().unwrap().to_string();
-        assert!(error.contains("noise_limit_db"), "{error}");
+    fn the_note_names_the_limit_being_replaced() {
+        let saved = Manifest::parse(&format!("{OLDER_MANIFEST}noise_limit_db=-50\n")).unwrap();
+        let settled = settle_noise_limit(Some(&saved), Some(-48.0), Path::new("out"));
+        assert!(settled.note.unwrap().contains("replacing -50 dB"));
+        let unchanged = settle_noise_limit(Some(&saved), Some(-50.0), Path::new("out"));
+        assert!(!unchanged.save_now);
+    }
+
+    #[test]
+    fn a_bad_saved_noise_limit_is_an_error_that_says_how_to_fix_it() {
+        let dir = folder_without_a_saved_limit("limit-bad");
+        fs::write(dir.0.join(MANIFEST), format!("{OLDER_MANIFEST}noise_limit_db=loud\n")).unwrap();
+        let error = open_store(&dir, Some(-50.0)).err().unwrap().to_string();
+        assert!(error.contains("noise_limit_db=loud") && error.contains("delete that line"), "{error}");
     }
 
     #[test]

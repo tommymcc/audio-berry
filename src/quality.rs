@@ -11,7 +11,7 @@ pub const MAX_FLOOR_DB: f32 = -55.0;
 /// with faint room tone, such as a denoised outdoor recording, passes a little
 /// of it to every take: one voice's takes measured -51 to -57 dB and were heard
 /// as clean on a Cast speaker.
-const NOISE_LIMIT_VAR: &str = "AUDIO_BERRY_NOISE_LIMIT_DB";
+pub const NOISE_LIMIT_VAR: &str = "AUDIO_BERRY_NOISE_LIMIT_DB";
 
 /// The noise limit given in the environment, if any. An invalid value is
 /// reported and ignored.
