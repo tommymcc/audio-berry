@@ -31,7 +31,7 @@ from Project Gutenberg.
    ```
 
    For a recording with background noise, see
-   [Adding a voice](#adding-a-voice) for `scripts/clean_sample.sh`.
+   [Adding a voice](#adding-a-voice) for `clean`.
 
 3. **Test the voice.** The first run downloads the models (about 6.3 GB) and
    writes down what's said in the sample as `voices/me.txt`. Correct any wrong
@@ -110,15 +110,27 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ```
 
    If the recording has background noise, such as birds or wind, clean it as you
-   cut it. This cleans the whole recording, then takes 20.1 to 30.8 seconds:
+   cut it. `clean` cleans the whole recording with DeepFilterNet 3, which is built
+   in and runs on the CPU, then takes 20.1 to 30.8 seconds as a voice sample:
 
    ```sh
-   scripts/clean_sample.sh recording.mp3 20.1 30.8 voices/me.wav
+   ./target/release/audio-berry clean recording.mp3 20.1 30.8 voices/me.wav
    ```
 
-   The script explains the trade-off at the top: removing more noise makes the
-   clone sound less like the speaker, and the default keeps a little room tone,
-   so you may need a higher [noise limit](#noise-limit).
+   Times can also be minutes and seconds, such as `1:05.5`. Pick the start and end
+   in pauses between words.
+
+   `--reduction <dB>` caps how much noise is removed, and defaults to 15 dB, which
+   keeps the voice most like the speaker. More removes more of the background but
+   makes the clone sound less like them. On one outdoor recording, voice ID against
+   the speaker's own recording was 0.85 at 15 dB, 0.80 at 20, 0.75 at 30 and 0.74
+   with no limit (100), where two of the speaker's own recordings scored 0.91.
+   The default keeps a little room tone, which every take copies, so you may need a
+   higher [noise limit](#noise-limit).
+
+   `scripts/clean_sample.sh` does the same with DeepFilterNet's Python version, and
+   is kept only to reproduce samples made with it. On one recording the two agreed
+   to within 0.01 dB of floor, with their difference 41 dB below the voice.
 
 3. **Check the levels.** `max_volume` should be below 0 dB. If it reads 0.0 dB,
    the recording is probably clipped, so pick another section or record it
@@ -166,7 +178,12 @@ audio-berry retake <voice-sample> <book.epub> <output-dir> <words or chunk numbe
 audio-berry speakers
 audio-berry play <speaker> <file>...
 audio-berry audition <voice-sample> [speaker] [--speed <factor>]
+audio-berry clean <recording> <start> <end> <output.wav> [--reduction <dB>]
 ```
+
+`clean` makes a voice sample from a noisy recording: it removes background noise
+from the whole recording, then saves `start` to `end` as 24 kHz mono 16-bit WAV.
+See [Adding a voice](#adding-a-voice).
 
 `audition` says a voice sample's own words, from its `.txt` file, in the cloned
 voice, then plays the sample and the clone in turn on the speaker, so you hear the

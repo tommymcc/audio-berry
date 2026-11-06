@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Makes a voice sample from a noisy recording, such as one with birds or wind.
 #
+# `audio-berry clean` does the same natively and needs no Python. This script is
+# kept only to reproduce samples made with DeepFilterNet's Python version.
+#
 #   scripts/clean_sample.sh <recording> <start-seconds> <end-seconds> <output.wav> [reduction-dB]
 #
 # Cleans the whole recording with DeepFilterNet 3, then cuts start to end into a
