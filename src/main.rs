@@ -9,6 +9,7 @@ mod epub;
 mod narrator;
 mod quality;
 mod sample_check;
+mod sections;
 mod store;
 mod text;
 mod transcribe;
@@ -28,6 +29,7 @@ const USAGE: &str = "usage:
   audio-berry speakers
   audio-berry play <speaker> <file>...
   audio-berry audition <voice-sample> [speaker] [--speed <factor>]
+  audio-berry sections <recording> [count]
   audio-berry clean <recording> <start> <end> <output.wav> [--reduction <dB>]";
 
 /// Rust ignores SIGPIPE, so printing to a reader that has gone, such as `head`, panics.
@@ -78,6 +80,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         ["audition", voice] => audition::audition(Path::new(voice), None, speed),
         ["audition", voice, speaker] => audition::audition(Path::new(voice), Some(speaker), speed),
+        ["sections", recording] => sections::suggest(Path::new(recording), sections::DEFAULT_COUNT),
+        ["sections", recording, count] => {
+            let count = count.parse::<usize>().ok().filter(|count| *count > 0);
+            sections::suggest(Path::new(recording), count.ok_or("the count of sections must be a whole number from 1")?)
+        }
         ["clean", recording, start, end, output] => {
             let (start, end) = (clean::parse_time(start)?, clean::parse_time(end)?);
             let reduction = reduction.unwrap_or(clean::DEFAULT_REDUCTION_DB);

@@ -2,7 +2,7 @@
 //! and advises what to do about a noisy one.
 
 use crate::book::MAX_TAKES;
-use crate::clean::DEFAULT_REDUCTION_DB;
+use crate::clean::{self, DEFAULT_REDUCTION_DB};
 use crate::quality::{self, MAX_FLOOR_DB, NOISE_LIMIT_VAR};
 use crate::voice::SAMPLE_RATE;
 use std::path::Path;
@@ -77,7 +77,6 @@ impl SampleCheck {
         let floor = self.floor_db;
         let stem = path.file_stem().unwrap_or_default().to_string_lossy();
         let cleaned = path.with_file_name(format!("{stem}-clean.wav"));
-        let (path, cleaned) = (path.display(), cleaned.display());
         match self.verdict {
             Verdict::Fine => None,
             Verdict::Noisy => {
@@ -88,6 +87,8 @@ impl SampleCheck {
                 // The next multiple of 5 dB above the floor takes are expected
                 // to have, as -50 was for a -45.3 dB sample.
                 let raised = ((floor - NOISY_ABOVE_LIMIT_DB) / 5.0).ceil() * 5.0;
+                let path = path.display();
+                let clean = clean::command(Path::new("recording.mp3"), "<start>", "<end>", &cleaned, Some(20.0));
                 Some(format!(
                     "The voice sample's floor is {floor:.1} dB. Takes copy it, a few dB quieter, so many \
                      will have floors above {limit} and be retried, up to {MAX_TAKES} takes per chunk. \
@@ -98,17 +99,18 @@ impl SampleCheck {
                      - or clean the original recording again into a new voice sample, with a higher \
                      --reduction than it had ({DEFAULT_REDUCTION_DB} dB by default). In tests, 20 dB gave \
                      takes about -56 dB and 30 about -59, with the clone less like the speaker:\n    \
-                     audio-berry clean recording.mp3 <start> <end> {cleaned} --reduction 20\n\
+                     {clean}\n\
                      See \"Noise limit\" in the README."
                 ))
             }
             Verdict::Raw => {
                 // Rounded down, since clean refuses an end past the recording's.
                 let end = (seconds * 10.0).floor() / 10.0;
+                let clean = clean::command(path, "0", &format!("{end:.1}"), &cleaned, None);
                 Some(format!(
                     "The voice sample's floor is {floor:.1} dB, loud enough to hear in every take. If it's \
                      a raw recording, clean it into a new voice sample first:\n    \
-                     audio-berry clean {path} 0 {end:.1} {cleaned}\n\
+                     {clean}\n\
                      See \"Adding a voice\" in the README."
                 ))
             }

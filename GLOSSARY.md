@@ -22,4 +22,6 @@
 
 **Voice sample:** the recording a narration's voice is cloned from, such as `voices/me.wav`, with what's said in it in a `.txt` file beside it. `clean` makes one from a noisy recording.
 
+**Section:** a stretch of a recording, from one pause to another, that `sections` suggests making into a voice sample.
+
 **Reduction:** the most noise `clean` removes from a recording when making a voice sample, in dB, 15 unless `--reduction` sets it. It's DeepFilterNet's attenuation limit. It changes the voice sample, unlike the floor and noise limit, which measure and judge takes. A higher reduction gives quieter takes but a clone less like the speaker.

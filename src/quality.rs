@@ -1,6 +1,7 @@
 //! Measurements for spotting bad takes, since the model varies between seeds.
 
-const FRAME_SECONDS: f32 = 0.05;
+/// Levels are measured over frames this long.
+pub const FRAME_SECONDS: f32 = 0.05;
 const SILENCE_DB: f32 = -55.0;
 
 /// A quiet-frame level above this means something is playing behind the voice.
@@ -62,6 +63,11 @@ fn frame_levels(samples: &[f32], sample_rate: u32) -> Vec<f32> {
         .chunks_exact(size)
         .map(|frame| (frame.iter().map(|s| s * s).sum::<f32>() / size as f32).sqrt())
         .collect()
+}
+
+/// The level of each `FRAME_SECONDS` frame, in dB.
+pub fn frame_levels_db(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    frame_levels(samples, sample_rate).into_iter().map(to_db).collect()
 }
 
 pub fn measure(samples: &[f32], sample_rate: u32) -> Quality {

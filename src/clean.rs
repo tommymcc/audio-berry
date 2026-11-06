@@ -19,8 +19,8 @@ pub const DEFAULT_REDUCTION_DB: f32 = 15.0;
 /// DeepFilterNet treats 100 dB as no limit at all.
 const REDUCTION_RANGE: std::ops::RangeInclusive<f32> = 1.0..=100.0;
 
-/// DeepFilterNet 3 works at 48 kHz.
-const CLEANING_RATE: u32 = 48_000;
+/// DeepFilterNet 3 works at 48 kHz, so recordings are decoded at this rate to be cleaned.
+pub const CLEANING_RATE: u32 = 48_000;
 
 /// DeepFilterNet outputs silence for a hop whose mean square is below this,
 /// without moving its buffers along, which would shift all later audio.
@@ -45,8 +45,7 @@ pub fn clean(
     }
 
     let started = std::time::Instant::now();
-    let cleaned = denoise(&noisy, reduction_db)?;
-    let sample = cut(&to_voice_rate(&cleaned)?, start, end, SAMPLE_RATE);
+    let sample = cut(&clean_samples(&noisy, reduction_db)?, start, end, SAMPLE_RATE);
     let took = started.elapsed().as_secs_f32();
 
     // Clamp as the WAV does, so the peak reported is the peak saved.
@@ -64,6 +63,30 @@ pub fn clean(
         transcript_path(output).display()
     );
     Ok(())
+}
+
+/// Cleans a whole recording decoded at `CLEANING_RATE`, removing at most
+/// `reduction_db` of noise, and gives it at the voice sample rate.
+pub fn clean_samples(noisy: &[f32], reduction_db: f32) -> Result<Vec<f32>, Box<dyn Error>> {
+    to_voice_rate(&denoise(noisy, reduction_db)?)
+}
+
+/// The `clean` command that makes a voice sample at `output` from `start` to
+/// `end` of `recording`. The times are text, so advice can show placeholders.
+pub fn command(recording: &Path, start: &str, end: &str, output: &Path, reduction_db: Option<f32>) -> String {
+    let reduction = reduction_db.map(|db| format!(" --reduction {db}")).unwrap_or_default();
+    format!("audio-berry clean {} {start} {end} {}{reduction}", shell_word(recording), shell_word(output))
+}
+
+/// A path as one shell word, quoted if it has anything a shell would split or expand.
+fn shell_word(path: &Path) -> String {
+    let text = path.display().to_string();
+    let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c);
+    if !text.is_empty() && text.chars().all(plain) {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
 }
 
 /// Runs DeepFilterNet 3 over 48 kHz mono audio, removing at most `reduction_db`
@@ -233,6 +256,14 @@ mod tests {
         for bad in ["0", "0.5", "-15", "101", "lots", "NaN"] {
             assert!(parse_reduction(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_clean_command_quotes_only_paths_that_need_it() {
+        let plain = command(Path::new("dad-raw.wav"), "20.1", "30.8", Path::new("voices/dad-raw-1.wav"), None);
+        assert_eq!(plain, "audio-berry clean dad-raw.wav 20.1 30.8 voices/dad-raw-1.wav");
+        let quoted = command(Path::new("Dad's tape.mp3"), "<start>", "<end>", Path::new("voices/dad.wav"), Some(20.0));
+        assert_eq!(quoted, r"audio-berry clean 'Dad'\''s tape.mp3' <start> <end> voices/dad.wav --reduction 20");
     }
 
     #[test]
