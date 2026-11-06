@@ -30,6 +30,9 @@ from Project Gutenberg.
    ffmpeg -ss 180 -t 10 -i recording.mp3 -ac 1 -ar 24000 voices/me.wav
    ```
 
+   For a recording with background noise, see
+   [Adding a voice](#adding-a-voice) for `scripts/clean_sample.sh`.
+
 3. **Test the voice.** The first run downloads the models (about 6.3 GB) and
    writes down what's said in the sample as `voices/me.txt`. Correct any wrong
    words in that file, then listen to `output/test.wav`:
@@ -105,6 +108,17 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    mkdir -p voices
    ffmpeg -ss 180 -t 10 -i recording.mp3 -ac 1 -ar 24000 voices/me.wav
    ```
+
+   If the recording has background noise, such as birds or wind, clean it as you
+   cut it. This cleans the whole recording, then takes 20.1 to 30.8 seconds:
+
+   ```sh
+   scripts/clean_sample.sh recording.mp3 20.1 30.8 voices/me.wav
+   ```
+
+   The script explains the trade-off at the top: removing more noise makes the
+   clone sound less like the speaker, and the default keeps a little room tone,
+   so you may need a higher [noise limit](#noise-limit).
 
 3. **Check the levels.** `max_volume` should be below 0 dB. If it reads 0.0 dB,
    the recording is probably clipped, so pick another section or record it
