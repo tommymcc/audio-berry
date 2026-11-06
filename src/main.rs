@@ -51,8 +51,9 @@ pub fn decode_audio(path: &Path, sample_rate: u32) -> Result<Vec<f32>, Box<dyn E
 /// beside the sample, written by transcribing it the first time, and can be
 /// corrected by hand.
 pub fn load_reference(path: &Path) -> Result<ReferenceAudio, Box<dyn Error>> {
+    let recording = decode_audio(path, SAMPLE_RATE)?;
     let samples = trim_long_audio(
-        &decode_audio(path, SAMPLE_RATE)?,
+        &recording,
         SAMPLE_RATE,
         MAX_VOICE_SECONDS,
         MIN_VOICE_SECONDS,
@@ -69,6 +70,17 @@ pub fn load_reference(path: &Path) -> Result<ReferenceAudio, Box<dyn Error>> {
     };
     let existing = existing.trim();
     if !existing.is_empty() {
+        if reference.samples.len() < recording.len() {
+            println!(
+                "Note: {} was cut from {:.1}s to {:.1}s, so if {} describes the whole recording, \
+                 it says more than the voice sample does. Delete it to transcribe the part kept, \
+                 or cut the recording to {MAX_VOICE_SECONDS:.0}s or less.",
+                path.display(),
+                recording.len() as f32 / SAMPLE_RATE as f32,
+                reference.duration_secs(),
+                transcript_path.display()
+            );
+        }
         return Ok(reference.with_transcript(existing));
     }
 
@@ -121,7 +133,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     stop_quietly_when_output_closes();
     let (args, speed) = take_speed(std::env::args().skip(1).collect())?;
     if speed.is_some() && !takes_speed(args.first().map(String::as_str)) {
-        return Err("--speed only works with speak, book and audition; retake uses the speed saved in the output directory".into());
+        return Err(format!(
+            "--speed only works with {}; retake uses the speed saved in the output directory",
+            SPEED_COMMANDS.join(", ")
+        )
+        .into());
     }
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["speak", voice, text, output] => speak(voice, text, output, speed),
@@ -159,9 +175,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Whether a command accepts `--speed`. `retake` doesn't, as it reuses the saved speed.
+/// The commands that accept `--speed`. `retake` doesn't, as it reuses the saved speed.
+const SPEED_COMMANDS: [&str; 3] = ["speak", "book", "audition"];
+
 fn takes_speed(command: Option<&str>) -> bool {
-    matches!(command, Some("speak" | "book" | "audition"))
+    command.is_some_and(|command| SPEED_COMMANDS.contains(&command))
 }
 
 /// Takes `--speed <factor>` out of the arguments, wherever it appears.
@@ -226,7 +244,7 @@ mod tests {
 
     #[test]
     fn speed_is_for_commands_that_render_at_a_chosen_speed() {
-        for command in ["speak", "book", "audition"] {
+        for command in SPEED_COMMANDS {
             assert!(takes_speed(Some(command)), "{command}");
         }
         for command in ["retake", "play", "chapters", "speakers"] {

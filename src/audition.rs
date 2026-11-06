@@ -16,7 +16,7 @@ struct Pair {
     /// The part of the sample the model hears, which its transcript describes.
     original: PathBuf,
     /// The transcript said in the cloned voice.
-    clone: PathBuf,
+    cloned: PathBuf,
 }
 
 /// Names the pair after the sample, so `voices/me.wav` gives `me-original.wav`
@@ -28,7 +28,7 @@ fn pair_for(voice: &Path, dir: &Path) -> Result<Pair, Box<dyn Error>> {
         .to_string_lossy();
     Ok(Pair {
         original: dir.join(format!("{stem}-original.wav")),
-        clone: dir.join(format!("{stem}-clone.wav")),
+        cloned: dir.join(format!("{stem}-clone.wav")),
     })
 }
 
@@ -50,16 +50,15 @@ pub fn audition(voice: &Path, speaker: Option<&str>, speed: Option<f64>) -> Resu
     AudioSamples::new(reference.samples.clone(), reference.sample_rate).save_wav(&pair.original)?;
     println!("Wrote {}: the sample as the model hears it", pair.original.display());
     println!("Saying: {transcript}");
-    crate::render(reference, &transcript, &pair.clone, speed)?;
+    crate::render(reference, &transcript, &pair.cloned, speed)?;
 
-    let files = vec![pair.original, pair.clone];
     match speaker {
-        Some(speaker) => cast::play(&speaker, files),
+        Some(speaker) => cast::play(&speaker, vec![pair.original, pair.cloned]),
         None => {
             println!(
                 "To hear them: audio-berry play <speaker> {} {}",
-                files[0].display(),
-                files[1].display()
+                pair.original.display(),
+                pair.cloned.display()
             );
             Ok(())
         }
@@ -77,7 +76,7 @@ mod tests {
             pair,
             Pair {
                 original: PathBuf::from("output/audition/me-original.wav"),
-                clone: PathBuf::from("output/audition/me-clone.wav"),
+                cloned: PathBuf::from("output/audition/me-clone.wav"),
             }
         );
     }
@@ -86,7 +85,7 @@ mod tests {
     fn a_sample_in_any_format_gives_wav_files() {
         let pair = pair_for(Path::new("/home/x/dad.full.mp3"), Path::new("out")).unwrap();
         assert_eq!(pair.original, PathBuf::from("out/dad.full-original.wav"));
-        assert_eq!(pair.clone, PathBuf::from("out/dad.full-clone.wav"));
+        assert_eq!(pair.cloned, PathBuf::from("out/dad.full-clone.wav"));
     }
 
     #[test]
