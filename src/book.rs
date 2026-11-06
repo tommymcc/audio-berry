@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-const MAX_TAKES: u64 = 5;
+/// Takes tried per chunk by `book`.
+pub const MAX_TAKES: u64 = 5;
 /// New takes tried per chunk by `retake`.
 const MAX_RETAKES: u64 = 6;
 const SPEECH_TARGET_DB: f32 = -21.0;
