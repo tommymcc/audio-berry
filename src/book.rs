@@ -507,6 +507,14 @@ mod tests {
     }
 
     #[test]
+    fn the_voice_hash_stays_the_same() {
+        // Output directories record this hash, so changing it orphans every chunk.
+        let samples = (0..240).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let reference = ReferenceAudio::new(samples, 24_000).with_transcript("Hello there.");
+        assert_eq!(voice_hash(&reference), 3087178596103644096);
+    }
+
+    #[test]
     fn a_partly_rendered_folder_rebuilds_by_naming_complete_chapters() {
         assert_eq!(command(&[2, 3], 40).unwrap(), "audio-berry book v.wav b.epub out 3 4");
     }
