@@ -3,6 +3,7 @@ mod audition;
 mod book;
 mod cast;
 mod checks;
+mod clean;
 mod epub;
 mod narrator;
 mod quality;
@@ -24,7 +25,8 @@ const USAGE: &str = "usage:
   audio-berry retake <voice-sample> <book.epub> <output-dir> <words from the book, or a chunk number like 3.12>...
   audio-berry speakers
   audio-berry play <speaker> <file>...
-  audio-berry audition <voice-sample> [speaker] [--speed <factor>]";
+  audio-berry audition <voice-sample> [speaker] [--speed <factor>]
+  audio-berry clean <recording> <start> <end> <output.wav> [--reduction <dB>]";
 
 /// Rust ignores SIGPIPE, so printing to a reader that has gone, such as `head`, panics.
 /// Restoring the default makes the program stop quietly like other Unix tools.
@@ -40,6 +42,10 @@ fn stop_quietly_when_output_closes() {}
 fn main() -> Result<(), Box<dyn Error>> {
     stop_quietly_when_output_closes();
     let (args, speed) = take_speed(std::env::args().skip(1).collect())?;
+    let (args, reduction) = take_reduction(args)?;
+    if reduction.is_some() && args.first().map(String::as_str) != Some("clean") {
+        return Err("--reduction only works with clean".into());
+    }
     if speed.is_some() && !takes_speed(args.first().map(String::as_str)) {
         return Err(format!(
             "--speed only works with {}; retake uses the speed saved in the output directory",
@@ -79,6 +85,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         ["audition", voice] => audition::audition(Path::new(voice), None, speed),
         ["audition", voice, speaker] => audition::audition(Path::new(voice), Some(speaker), speed),
+        ["clean", recording, start, end, output] => {
+            let time = |text: &str| {
+                clean::parse_time(text)
+                    .ok_or_else(|| format!("{text} isn't a time in seconds, such as 20.1, or minutes and seconds, such as 1:05"))
+            };
+            let reduction = reduction.unwrap_or(clean::DEFAULT_REDUCTION_DB);
+            clean::clean(Path::new(recording), time(start)?, time(end)?, Path::new(output), reduction)
+        }
         _ => Err(USAGE.into()),
     }
 }
@@ -91,17 +105,35 @@ fn takes_speed(command: Option<&str>) -> bool {
 }
 
 /// Takes `--speed <factor>` out of the arguments, wherever it appears.
-fn take_speed(mut args: Vec<String>) -> Result<(Vec<String>, Option<f64>), Box<dyn Error>> {
-    let Some(flag) = args.iter().position(|arg| arg == "--speed") else {
-        return Ok((args, None));
-    };
-    let value = args.get(flag + 1).ok_or("--speed needs a factor, such as 0.9")?;
+fn take_speed(args: Vec<String>) -> Result<(Vec<String>, Option<f64>), Box<dyn Error>> {
+    let (args, value) = take_flag(args, "--speed", "a factor, such as 0.9")?;
+    let Some(value) = value else { return Ok((args, None)) };
     let speed = value.parse::<f64>().ok().filter(|speed| SPEED_RANGE.contains(speed));
     let speed = speed.ok_or_else(|| {
         format!("--speed must be from {} to {}, not {value}", SPEED_RANGE.start(), SPEED_RANGE.end())
     })?;
-    args.drain(flag..=flag + 1);
     Ok((args, Some(speed)))
+}
+
+/// Takes `--reduction <dB>` out of the arguments, wherever it appears.
+fn take_reduction(args: Vec<String>) -> Result<(Vec<String>, Option<f32>), Box<dyn Error>> {
+    let (args, value) = take_flag(args, "--reduction", "a level in dB, such as 15")?;
+    let Some(value) = value else { return Ok((args, None)) };
+    let reduction = clean::parse_reduction(&value).ok_or_else(|| {
+        let range = clean::REDUCTION_RANGE;
+        format!("--reduction must be from {} to {} dB, not {value}", range.start(), range.end())
+    })?;
+    Ok((args, Some(reduction)))
+}
+
+/// Takes `<flag> <value>` out of the arguments, wherever it appears.
+fn take_flag(mut args: Vec<String>, flag: &str, needs: &str) -> Result<(Vec<String>, Option<String>), Box<dyn Error>> {
+    let Some(position) = args.iter().position(|arg| arg == flag) else {
+        return Ok((args, None));
+    };
+    let value = args.get(position + 1).ok_or_else(|| format!("{flag} needs {needs}"))?.clone();
+    args.drain(position..=position + 1);
+    Ok((args, Some(value)))
 }
 
 #[cfg(test)]
@@ -127,7 +159,7 @@ mod tests {
         for command in SPEED_COMMANDS {
             assert!(takes_speed(Some(command)), "{command}");
         }
-        for command in ["retake", "play", "chapters", "speakers"] {
+        for command in ["retake", "play", "chapters", "speakers", "clean"] {
             assert!(!takes_speed(Some(command)), "{command}");
         }
         assert!(!takes_speed(None));
@@ -144,5 +176,23 @@ mod tests {
             assert!(take_speed(args(&["book", "--speed", bad])).is_err(), "{bad}");
         }
         assert!(take_speed(args(&["book", "--speed"])).is_err());
+    }
+
+    #[test]
+    fn reduction_is_taken_from_any_position() {
+        let (rest, reduction) = take_reduction(args(&["clean", "--reduction", "20", "r", "1", "2", "o"])).unwrap();
+        assert_eq!(rest, args(&["clean", "r", "1", "2", "o"]));
+        assert_eq!(reduction, Some(20.0));
+        let (rest, reduction) = take_reduction(args(&["clean", "r", "1", "2", "o"])).unwrap();
+        assert_eq!(rest, args(&["clean", "r", "1", "2", "o"]));
+        assert_eq!(reduction, None);
+    }
+
+    #[test]
+    fn a_missing_or_silly_reduction_is_an_error() {
+        for bad in ["0", "-15", "101", "lots"] {
+            assert!(take_reduction(args(&["clean", "--reduction", bad])).is_err(), "{bad}");
+        }
+        assert!(take_reduction(args(&["clean", "--reduction"])).is_err());
     }
 }

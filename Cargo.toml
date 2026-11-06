@@ -15,9 +15,13 @@ any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "d92eef45315791ef
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
+# Noise cleaning for voice samples: DeepFilterNet 3, built in, run on the CPU with tract.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"] }
 epub = "2"
 flate2 = "1"
 mdns-sd = "0.21"
+# The version deep_filter uses, for passing audio to it.
+ndarray = "0.15"
 rust_cast = "0.21"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 scraper = "0.29.0"
