@@ -8,7 +8,9 @@ use any_tts::AudioSamples;
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::{Array2, ArrayView2, Axis};
 use std::error::Error;
-use std::path::Path;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 /// How much noise cleaning removes at most. 15 dB keeps the voice most like the
 /// speaker: on one outdoor recording, cleaning harder made takes quieter but
@@ -58,6 +60,13 @@ pub fn clean(
         measured.seconds,
         measured.peak_db,
     );
+    if let Some(old) = retire_transcript(output)? {
+        println!(
+            "Renamed {} to {}, since it describes the voice sample this replaced",
+            transcript_path(output).display(),
+            old.display()
+        );
+    }
     println!(
         "The first command to use it transcribes it to {}. Check that file's words.",
         transcript_path(output).display()
@@ -71,16 +80,33 @@ pub fn clean_samples(noisy: &[f32], reduction_db: f32) -> Result<Vec<f32>, Box<d
     to_voice_rate(&denoise(noisy, reduction_db)?)
 }
 
+/// Moves aside the transcript beside a voice sample just written at `sample`,
+/// if there is one, as `<name>.txt.old`, since it describes the audio that was
+/// there before. Otherwise the sample's first use would take it as its words.
+fn retire_transcript(sample: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let transcript = transcript_path(sample);
+    let old = transcript.with_extension("txt.old");
+    match fs::rename(&transcript, &old) {
+        Ok(()) => Ok(Some(old)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("couldn't move aside {}: {error}", transcript.display()).into()),
+    }
+}
+
 /// The `clean` command that makes a voice sample at `output` from `start` to
 /// `end` of `recording`. The times are text, so advice can show placeholders.
-pub fn command(recording: &Path, start: &str, end: &str, output: &Path, reduction_db: Option<f32>) -> String {
+pub fn command_line(recording: &Path, start: &str, end: &str, output: &Path, reduction_db: Option<f32>) -> String {
     let reduction = reduction_db.map(|db| format!(" --reduction {db}")).unwrap_or_default();
     format!("audio-berry clean {} {start} {end} {}{reduction}", shell_word(recording), shell_word(output))
 }
 
-/// A path as one shell word, quoted if it has anything a shell would split or expand.
-fn shell_word(path: &Path) -> String {
-    let text = path.display().to_string();
+/// A path as one shell word, quoted if it has anything a shell would split or
+/// expand, and starting `./` if it would otherwise be read as an option.
+pub fn shell_word(path: &Path) -> String {
+    let mut text = path.display().to_string();
+    if text.starts_with('-') {
+        text.insert_str(0, "./");
+    }
     let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c);
     if !text.is_empty() && text.chars().all(plain) {
         text
@@ -260,10 +286,33 @@ mod tests {
 
     #[test]
     fn a_clean_command_quotes_only_paths_that_need_it() {
-        let plain = command(Path::new("dad-raw.wav"), "20.1", "30.8", Path::new("voices/dad-raw-1.wav"), None);
+        let plain = command_line(Path::new("dad-raw.wav"), "20.1", "30.8", Path::new("voices/dad-raw-1.wav"), None);
         assert_eq!(plain, "audio-berry clean dad-raw.wav 20.1 30.8 voices/dad-raw-1.wav");
-        let quoted = command(Path::new("Dad's tape.mp3"), "<start>", "<end>", Path::new("voices/dad.wav"), Some(20.0));
+        let quoted = command_line(Path::new("Dad's tape.mp3"), "<start>", "<end>", Path::new("voices/dad.wav"), Some(20.0));
         assert_eq!(quoted, r"audio-berry clean 'Dad'\''s tape.mp3' <start> <end> voices/dad.wav --reduction 20");
+    }
+
+    #[test]
+    fn a_path_that_looks_like_an_option_is_made_relative() {
+        assert_eq!(shell_word(Path::new("-take 2.wav")), "'./-take 2.wav'");
+        assert_eq!(shell_word(Path::new("-take.wav")), "./-take.wav");
+    }
+
+    #[test]
+    fn a_new_voice_sample_moves_its_old_transcript_aside() {
+        let folder = std::env::temp_dir().join(format!("audio-berry-retire-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let sample = folder.join("dad.wav");
+        let nothing_to_move = retire_transcript(&sample).unwrap();
+        fs::write(folder.join("dad.txt"), "Words of the old sample.\n").unwrap();
+        let old = retire_transcript(&sample).unwrap();
+        let kept = old.as_ref().map(|old| fs::read_to_string(old).unwrap());
+        let transcript_left = folder.join("dad.txt").exists();
+        fs::remove_dir_all(&folder).unwrap();
+        assert_eq!(nothing_to_move, None);
+        assert_eq!(old, Some(folder.join("dad.txt.old")));
+        assert_eq!(kept.as_deref(), Some("Words of the old sample.\n"));
+        assert!(!transcript_left);
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! samples: whole phrases of clear, steady speech with few pauses and a quiet
 //! floor once cleaned. Finding them by ear is the slow part of adding a voice.
 
-use crate::audio::decode_audio;
-use crate::clean::{self, CLEANING_RATE, DEFAULT_REDUCTION_DB};
+use crate::audio::decode_audio_up_to;
+use crate::clean::{self, CLEANING_RATE, DEFAULT_REDUCTION_DB, shell_word};
 use crate::quality::{self, FRAME_SECONDS};
 use crate::transcribe::{CHECK_MODEL, Phrase, Transcriber};
 use crate::voice::SAMPLE_RATE;
@@ -22,11 +22,15 @@ pub const DEFAULT_COUNT: usize = 3;
 /// transcribes it with medium.en.
 const MODEL: &str = CHECK_MODEL;
 
+/// The longest recording looked through. Memory grows with length, since the
+/// whole recording is cleaned at once: on the CPU, 10 minutes took 3.5 minutes
+/// with a peak of 0.81 GB, and 20 took 7 with 1.07 GB.
+const MAX_RECORDING_SECONDS: f64 = 30.0 * 60.0;
+
 /// OmniVoice recommends 3-10 seconds of reference, and 11.4 is what's been
 /// tested for narration. Shorter sections hold too little of the voice.
 const MIN_SECONDS: f64 = 8.0;
 const MAX_SECONDS: f64 = 15.0;
-const IDEAL_SECONDS: f64 = 11.0;
 
 /// The silence kept before the first word and after the last, at most.
 const MARGIN_SECONDS: f64 = 0.2;
@@ -42,29 +46,83 @@ const TIMESTAMP_SLACK_SECONDS: f64 = 0.5;
 /// A pause this long is where a speaker breaks between phrases, so it's a
 /// good place to cut even where Whisper heard no break.
 const PHRASE_PAUSE_SECONDS: f64 = 0.6;
-/// Pauses up to this long are part of natural speech. Longer ones waste the
-/// reference on silence and teach the clone to hesitate. Both sections a
-/// person picked by ear from one recording held pauses of nearly a second.
-const NATURAL_PAUSE_SECONDS: f64 = 1.0;
 
 /// A frame is speech when it's this far from the recording's floor to its
 /// loudest speech. Cleaned outdoor recordings keep a floor of about -45 dB, so
 /// a fixed level, as `quality` uses for takes, would hear their pauses as speech.
 const SPEECH_FRACTION_OF_RANGE: f32 = 0.3;
+/// The loudest speech, as the level this fraction of frames are quieter than.
+const LOUD_FRACTION: f32 = 0.95;
 /// A frame whose raw peak reaches this is probably clipped.
 const CLIPPED_PEAK: f32 = 0.99;
 /// Whisper's confidence, as an average log probability, counted for time in a
 /// section where it heard no words, such as music or other noise.
 const UNHEARD_LOGPROB: f64 = -2.0;
 
+/// Frames are counted exactly, since `FRAME_SECONDS` as an `f32` isn't quite
+/// 0.05, and times are rounded to tenths.
+const FRAMES_PER_SECOND: f64 = 20.0;
+const _: () = assert!((FRAME_SECONDS as f64 * FRAMES_PER_SECOND - 1.0).abs() < 1e-6);
+/// Times this close are the same time: sums of frame times aren't exact.
+const TIME_EPSILON: f64 = 1e-6;
+
+// How sections are scored, in points. One point is about one noticeable flaw.
+// The weights were tuned on one 34 second outdoor recording, where they rank
+// the two sections a person picked by ear highest.
+
+/// For a section that's all speech, since silence holds none of the voice.
+const SPEECH_POINTS: f64 = 10.0;
+/// For each end between sentences, or between phrases, so the clone hears
+/// the speaker's phrasing whole.
+const SENTENCE_BREAK_POINTS: f64 = 1.0;
+const PHRASE_BREAK_POINTS: f64 = 0.5;
+/// Pauses up to this long are part of natural speech: both sections a person
+/// picked by ear held pauses of nearly a second.
+const NATURAL_PAUSE_SECONDS: f64 = 1.0;
+/// Lost per second of pause beyond that, which wastes the reference on silence
+/// and teaches the clone to hesitate.
+const LONG_PAUSE_POINTS_PER_SECOND: f64 = 4.0;
+/// A floor this quiet costs nothing: takes from it pass the default noise limit.
+const QUIET_FLOOR_DB: f32 = -60.0;
+/// Lost per dB of floor above that. Floors within a recording differ by a few
+/// dB, so this breaks ties rather than outweighing the speech.
+const FLOOR_POINTS_PER_DB: f64 = 0.1;
+/// Lost for any clipping, which every take copies.
+const CLIPPING_POINTS: f64 = 3.0;
+/// And per clipped frame, since some recordings clip all through, and then
+/// the fewest clipped frames is best.
+const CLIPPED_FRAME_POINTS: f64 = 0.1;
+/// Speech's level varies this much, as a standard deviation, in sections that
+/// sounded steady: 5 to 7 dB on one recording.
+const STEADY_SPREAD_DB: f32 = 6.0;
+/// Lost per dB of spread beyond that, for a voice that comes and goes.
+const SPREAD_POINTS_PER_DB: f64 = 0.5;
+/// Whisper's average log probability for clear speech is about -0.1 to -0.3.
+const CLEAR_LOGPROB: f64 = -0.3;
+/// Lost per unit of log probability below that, for speech that's hard to
+/// make out, or isn't speech.
+const UNCLEAR_POINTS: f64 = 5.0;
+/// The length aimed for, near the 11.4 seconds tested for narration.
+const IDEAL_SECONDS: f64 = 11.0;
+/// Lost per second away from it.
+const LENGTH_POINTS_PER_SECOND: f64 = 0.3;
+
 /// Suggests the best `count` sections of `recording` to use as a voice sample,
-/// with what's said in each and the `clean` command that makes it.
-pub fn suggest(recording: &Path, count: usize) -> Result<(), Box<dyn Error>> {
+/// with what's said in each and the `clean` command that makes it, cleaning
+/// with `reduction_db` if given, as `clean` would.
+pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    let noisy = decode_audio(recording, CLEANING_RATE)?;
-    let cleaned = clean::clean_samples(&noisy, DEFAULT_REDUCTION_DB)?;
-    let length = cleaned.len() as f64 / f64::from(SAMPLE_RATE);
-    println!("Cleaned {length:.1}s of {} in {:.1}s", recording.display(), started.elapsed().as_secs_f32());
+    let noisy = decode_audio_up_to(recording, CLEANING_RATE, MAX_RECORDING_SECONDS + 1.0)?;
+    let length = noisy.len() as f64 / f64::from(CLEANING_RATE);
+    if length > MAX_RECORDING_SECONDS {
+        return Err(too_long(recording).into());
+    }
+    println!("Cleaning {length:.1}s of {}, then finding its phrases with Whisper {MODEL}", recording.display());
+    let cleaned = clean::clean_samples(&noisy, reduction_db.unwrap_or(DEFAULT_REDUCTION_DB))?;
+    let frames = Frames::measure(&noisy, &cleaned);
+    // The raw recording is the largest thing held, and isn't needed again.
+    drop(noisy);
+    println!("Cleaned in {:.1}s", started.elapsed().as_secs_f32());
 
     let started = Instant::now();
     let audio = AudioSamples::new(cleaned, SAMPLE_RATE);
@@ -73,14 +131,13 @@ pub fn suggest(recording: &Path, count: usize) -> Result<(), Box<dyn Error>> {
     let cleaned = audio.samples;
     println!("Found {} phrases in {:.1}s", phrases.len(), started.elapsed().as_secs_f32());
 
-    let frames = Frames::measure(&noisy, &cleaned);
-    drop(noisy);
     let samples_between = |start: f64, end: f64| {
         let index = |seconds: f64| ((seconds * f64::from(SAMPLE_RATE)).round() as usize).min(cleaned.len());
         &cleaned[index(start)..index(end)]
     };
     let floor_of = |start: f64, end: f64| quality::measure(samples_between(start, end), SAMPLE_RATE).floor_db;
-    let sections = best_sections(&phrases, &frames, count, floor_of);
+    let length = cleaned.len() as f64 / f64::from(SAMPLE_RATE);
+    let sections = best_sections(&phrases, &frames, length, count, floor_of);
     if sections.is_empty() {
         return Err(format!(
             "found no stretch of {MIN_SECONDS:.0} to {MAX_SECONDS:.0} seconds of speech in {} that starts and \
@@ -90,34 +147,57 @@ pub fn suggest(recording: &Path, count: usize) -> Result<(), Box<dyn Error>> {
         .into());
     }
 
+    // Heard again, section by section, because Whisper's phrases cross the
+    // cuts: joining them would show words from outside a section, or miss
+    // some. This takes a few seconds, and gives the words the sample holds.
     let started = Instant::now();
     let mut heard = Vec::new();
     for section in &sections {
         // Clamped as clean saves it, so this is heard as the voice sample will be.
-        let samples = samples_between(section.start(), section.end()).iter().map(|s| s.clamp(-1.0, 1.0)).collect();
+        let samples = samples_between(section.start, section.end).iter().map(|s| s.clamp(-1.0, 1.0)).collect();
         heard.push(transcriber.transcribe(&AudioSamples::new(samples, SAMPLE_RATE))?);
     }
-    println!("Transcribed the best {} in {:.1}s", sections.len(), started.elapsed().as_secs_f32());
+    println!("Transcribed them in {:.1}s", started.elapsed().as_secs_f32());
 
     println!();
+    if sections.len() < count {
+        println!("Found {} sections that don't overlap, of the {count} asked for:", sections.len());
+    }
     for (number, (section, text)) in (1..).zip(sections.iter().zip(heard)) {
-        let output = sample_path(recording, number);
+        let output = sample_path(recording, section.start);
         println!("{number}. {}", section.summary());
         println!("   Roughly: \"{text}\"");
-        println!("   {}", clean::command(recording, &section.start_text(), &section.end_text(), &output, None));
+        let (start, end) = (format!("{:.1}", section.start), format!("{:.1}", section.end));
+        println!("   {}", clean::command_line(recording, &start, &end, &output, reduction_db));
     }
     println!(
         "\nMake each with its clean command, then hear how each clones with audition, and keep the one most \
          like the speaker:\n    audio-berry audition {}",
-        sample_path(recording, 1).display()
+        shell_word(&sample_path(recording, sections[0].start))
     );
     Ok(())
 }
 
-/// Where the `number`th suggestion's voice sample goes: `voices/<recording's name>-<number>.wav`.
-fn sample_path(recording: &Path, number: usize) -> PathBuf {
+/// Why `recording` is refused for being too long, and how to cut a stretch of it.
+fn too_long(recording: &Path) -> String {
+    let part = Path::new(recording.file_stem().unwrap_or_default()).with_extension("part.wav");
+    format!(
+        "{} is longer than {:.0} minutes, the most sections looks through at once. Cut a stretch of it \
+         first, such as 10 minutes starting 5 minutes in, and look through that:\n    \
+         ffmpeg -ss 300 -t 600 -i {} {}",
+        recording.display(),
+        MAX_RECORDING_SECONDS / 60.0,
+        shell_word(recording),
+        shell_word(&part)
+    )
+}
+
+/// Where the voice sample of the section starting at `start` goes, named by
+/// its start so it stays the same section whatever the ranking:
+/// `voices/<recording's name>-<start>s.wav`.
+fn sample_path(recording: &Path, start: f64) -> PathBuf {
     let stem = recording.file_stem().unwrap_or_default().to_string_lossy();
-    Path::new("voices").join(format!("{stem}-{number}.wav"))
+    Path::new("voices").join(format!("{stem}-{start:.1}s.wav"))
 }
 
 /// The cleaned recording's level and whether the raw recording clipped, in
@@ -131,32 +211,22 @@ impl Frames {
     /// Measures `noisy`, at the cleaning rate, and `cleaned`, at the voice sample rate.
     fn measure(noisy: &[f32], cleaned: &[f32]) -> Frames {
         let levels_db = quality::frame_levels_db(cleaned, SAMPLE_RATE);
-        let size = (CLEANING_RATE as f32 * FRAME_SECONDS) as usize;
-        let peak = |frame: &[f32]| frame.iter().fold(0f32, |peak, sample| peak.max(sample.abs()));
-        let clipped = noisy.chunks(size).map(|frame| peak(frame) >= CLIPPED_PEAK).collect();
+        let size = quality::frame_size(CLEANING_RATE);
+        let clipped = noisy.chunks(size).map(|frame| quality::peak(frame) >= CLIPPED_PEAK).collect();
         Frames { levels_db, clipped }
     }
 
-    /// Which frames are speech, judged against the recording's own floor and
-    /// loudest speech.
+    /// Which frames are speech, judged against the whole recording's floor
+    /// and loudest speech.
     fn speaking(&self) -> Vec<bool> {
         let mut sorted = self.levels_db.clone();
         sorted.sort_by(f32::total_cmp);
-        let at = |fraction: f32| sorted.get((sorted.len() as f32 * fraction) as usize).copied().unwrap_or(0.0);
-        let (floor, loud) = (at(0.05), at(0.95));
+        let floor = quality::floor_of_sorted(&sorted).unwrap_or(0.0);
+        let loud = sorted.get((sorted.len() as f32 * LOUD_FRACTION) as usize).copied().unwrap_or(0.0);
         let threshold = floor + SPEECH_FRACTION_OF_RANGE * (loud - floor);
         self.levels_db.iter().map(|level| *level > threshold).collect()
     }
-
-    fn seconds(&self) -> f64 {
-        seconds_at(self.levels_db.len())
-    }
 }
-
-/// Counted exactly, since `FRAME_SECONDS` as an `f32` isn't quite 0.05, and
-/// times are rounded to tenths.
-const FRAMES_PER_SECOND: f64 = 20.0;
-const _: () = assert!((FRAME_SECONDS as f64 * FRAMES_PER_SECOND - 1.0).abs() < 1e-6);
 
 fn frame_at(seconds: f64) -> usize {
     (seconds * FRAMES_PER_SECOND).round().max(0.0) as usize
@@ -164,6 +234,16 @@ fn frame_at(seconds: f64) -> usize {
 
 fn seconds_at(frame: usize) -> f64 {
     frame as f64 / FRAMES_PER_SECOND
+}
+
+/// Rounds a start down to a tenth of a second, into the pause before it.
+fn tenth_before(seconds: f64) -> f64 {
+    (seconds * 10.0 + TIME_EPSILON).floor() / 10.0
+}
+
+/// Rounds an end up to a tenth of a second, into the pause after it.
+fn tenth_after(seconds: f64) -> f64 {
+    (seconds * 10.0 - TIME_EPSILON).ceil() / 10.0
 }
 
 /// A stretch of silence, in frames `start..end`.
@@ -211,8 +291,8 @@ impl Break {
     /// How much a section gains from starting or ending here.
     fn points(self) -> f64 {
         match self {
-            Break::Sentence => 1.0,
-            Break::Phrase => 0.5,
+            Break::Sentence => SENTENCE_BREAK_POINTS,
+            Break::Phrase => PHRASE_BREAK_POINTS,
             Break::Word => 0.0,
         }
     }
@@ -266,10 +346,10 @@ fn cuts(phrases: &[Phrase], speaking: &[bool]) -> Vec<Cut> {
                 Some(true) => Break::Sentence,
                 Some(false) => Break::Phrase,
                 None if pause.seconds() > PHRASE_PAUSE_SECONDS => Break::Phrase,
-                None if pause.seconds() >= MIN_WORD_GAP_SECONDS - 1e-9 => Break::Word,
+                None if pause.seconds() >= MIN_WORD_GAP_SECONDS - TIME_EPSILON => Break::Word,
                 None => return None,
             };
-            (pause.seconds() >= MIN_CUT_PAUSE_SECONDS - 1e-9).then_some(Cut { pause, at })
+            (pause.seconds() >= MIN_CUT_PAUSE_SECONDS - TIME_EPSILON).then_some(Cut { pause, at })
         })
         .collect()
 }
@@ -278,8 +358,11 @@ fn cuts(phrases: &[Phrase], speaking: &[bool]) -> Vec<Cut> {
 /// to another, and what makes it good or bad.
 #[derive(Clone, Debug, PartialEq)]
 struct Section {
-    from: Cut,
-    to: Cut,
+    /// In seconds, to a tenth, in the pauses either side.
+    start: f64,
+    end: f64,
+    from: Break,
+    to: Break,
     /// The fraction of frames that are speech.
     speech: f64,
     /// Silence beyond `NATURAL_PAUSE_SECONDS` in its pauses, in seconds.
@@ -295,50 +378,65 @@ struct Section {
 }
 
 impl Section {
-    /// Times are given to a tenth of a second, rounded outwards into the
-    /// pause either side, which `MIN_CUT_PAUSE_SECONDS` leaves room for.
-    fn start(&self) -> f64 {
-        (self.from.start() * 10.0 + 1e-6).floor() / 10.0
-    }
+    /// Measures the section from `start` to `end`, between `from` and `to`.
+    fn measure(phrases: &[Phrase], speaking: &[bool], frames: &Frames, (start, end): (f64, f64), (from, to): (Break, Break), floor_db: f32) -> Section {
+        let span = frame_at(start).min(speaking.len())..frame_at(end).min(speaking.len());
+        let inside = &speaking[span.clone()];
+        let speech = inside.iter().filter(|speaking| **speaking).count() as f64 / inside.len().max(1) as f64;
+        let excess_pause = pauses(inside).iter().map(|pause| (pause.seconds() - NATURAL_PAUSE_SECONDS).max(0.0)).sum();
 
-    fn end(&self) -> f64 {
-        (self.to.end() * 10.0 - 1e-6).ceil() / 10.0
-    }
+        let levels: Vec<f32> = span.clone().filter(|&frame| speaking[frame]).map(|frame| frames.levels_db[frame]).collect();
+        let count = levels.len().max(1) as f32;
+        let mean = levels.iter().sum::<f32>() / count;
+        let variance = levels.iter().map(|level| (level - mean).powi(2)).sum::<f32>() / count;
+        let clipped_frames = span.filter(|&frame| frames.clipped.get(frame).copied().unwrap_or(false)).count();
 
-    fn start_text(&self) -> String {
-        format!("{:.1}", self.start())
-    }
-
-    fn end_text(&self) -> String {
-        format!("{:.1}", self.end())
+        let overlap = |phrase: &Phrase| (phrase.end.min(end) - phrase.start.max(start)).max(0.0);
+        let heard: f64 = phrases.iter().map(overlap).sum();
+        let unheard = (end - start - heard).max(0.0);
+        let logprob = (phrases.iter().map(|phrase| phrase.average_logprob * overlap(phrase)).sum::<f64>()
+            + UNHEARD_LOGPROB * unheard)
+            / (heard + unheard).max(TIME_EPSILON);
+        Section {
+            start,
+            end,
+            from,
+            to,
+            speech,
+            excess_pause,
+            level_spread_db: variance.sqrt(),
+            clipped_frames,
+            logprob,
+            floor_db,
+        }
     }
 
     fn seconds(&self) -> f64 {
-        self.end() - self.start()
+        self.end - self.start
     }
 
-    /// Higher is better. Each part is in points, about one for a noticeable
-    /// flaw. Weighed on one 34 second outdoor recording, where they rank the
-    /// sections a person picked by ear highest.
+    /// Higher is better. See the weights above.
     fn score(&self) -> f64 {
-        let speech = 10.0 * self.speech;
-        let whole = self.from.at.points() + self.to.at.points();
-        let pauses = 4.0 * self.excess_pause;
-        let floor = 0.1 * f64::from((self.floor_db + 60.0).max(0.0));
-        // Some recordings clip all through, so the fewest clipped frames still counts.
-        let clipping = if self.clipped_frames > 0 { 3.0 + 0.1 * self.clipped_frames as f64 } else { 0.0 };
-        let spread = 0.5 * f64::from((self.level_spread_db - 6.0).max(0.0));
-        let unclear = 5.0 * (-0.3 - self.logprob).max(0.0);
-        let length = 0.3 * (self.seconds() - IDEAL_SECONDS).abs();
+        let speech = SPEECH_POINTS * self.speech;
+        let whole = self.from.points() + self.to.points();
+        let pauses = LONG_PAUSE_POINTS_PER_SECOND * self.excess_pause;
+        let floor = FLOOR_POINTS_PER_DB * f64::from((self.floor_db - QUIET_FLOOR_DB).max(0.0));
+        let clipping = match self.clipped_frames {
+            0 => 0.0,
+            frames => CLIPPING_POINTS + CLIPPED_FRAME_POINTS * frames as f64,
+        };
+        let spread = SPREAD_POINTS_PER_DB * f64::from((self.level_spread_db - STEADY_SPREAD_DB).max(0.0));
+        let unclear = UNCLEAR_POINTS * (CLEAR_LOGPROB - self.logprob).max(0.0);
+        let length = LENGTH_POINTS_PER_SECOND * (self.seconds() - IDEAL_SECONDS).abs();
         speech + whole - pauses - floor - clipping - spread - unclear - length
     }
 
     fn summary(&self) -> String {
         let clipped = if self.clipped_frames > 0 { ", clipped" } else { "" };
         format!(
-            "{}-{} ({:.1}s), floor {:.1} dB, {:.0}% speech{clipped}",
-            self.start_text(),
-            self.end_text(),
+            "{:.1}-{:.1} ({:.1}s), floor {:.1} dB, {:.0}% speech{clipped}",
+            self.start,
+            self.end,
             self.seconds(),
             self.floor_db,
             100.0 * self.speech
@@ -347,69 +445,48 @@ impl Section {
 }
 
 /// Every section from one cut to another lasting `MIN_SECONDS` to
-/// `MAX_SECONDS`, measured, with its floor from `floor_of`, given a start and
-/// end in seconds.
-fn sections(phrases: &[Phrase], frames: &Frames, floor_of: impl Fn(f64, f64) -> f32) -> Vec<Section> {
+/// `MAX_SECONDS`, in a recording `length` seconds long, measured, with its
+/// floor from `floor_of`, given a start and end in seconds.
+fn sections(phrases: &[Phrase], frames: &Frames, length: f64, floor_of: impl Fn(f64, f64) -> f32) -> Vec<Section> {
     let speaking = frames.speaking();
     let cuts = cuts(phrases, &speaking);
+    // clean refuses an end past the recording's, so the last pause ends here.
+    let last = tenth_before(length);
     let mut sections = Vec::new();
-    for (index, &from) in cuts.iter().enumerate() {
-        for &to in &cuts[index + 1..] {
-            let mut section = measure(phrases, &speaking, frames, from, to);
-            if section.seconds() > MAX_SECONDS || section.end() > frames.seconds() + 1e-9 {
+    for (index, from) in cuts.iter().enumerate() {
+        let start = tenth_before(from.start());
+        for to in &cuts[index + 1..] {
+            let end = tenth_after(to.end()).min(last);
+            if end - start > MAX_SECONDS + TIME_EPSILON {
                 break;
             }
-            if section.seconds() >= MIN_SECONDS - 1e-9 {
-                section.floor_db = floor_of(section.start(), section.end());
-                sections.push(section);
+            // Ending before the pause would cut the last word.
+            if end - start < MIN_SECONDS - TIME_EPSILON || end < seconds_at(to.pause.start) - TIME_EPSILON {
+                continue;
             }
+            let floor_db = floor_of(start, end);
+            sections.push(Section::measure(phrases, &speaking, frames, (start, end), (from.at, to.at), floor_db));
         }
     }
     sections
 }
 
-/// Measures the section from `from` to `to`, all but its floor.
-fn measure(phrases: &[Phrase], speaking: &[bool], frames: &Frames, from: Cut, to: Cut) -> Section {
-    let (start, end) = (from.start(), to.end());
-    let span = frame_at(start).min(speaking.len())..frame_at(end).min(speaking.len());
-    let inside = &speaking[span.clone()];
-    let speech = inside.iter().filter(|speaking| **speaking).count() as f64 / inside.len().max(1) as f64;
-    let excess_pause = pauses(inside).iter().map(|pause| (pause.seconds() - NATURAL_PAUSE_SECONDS).max(0.0)).sum();
-
-    let levels: Vec<f32> = span.clone().filter(|&frame| speaking[frame]).map(|frame| frames.levels_db[frame]).collect();
-    let count = levels.len().max(1) as f32;
-    let mean = levels.iter().sum::<f32>() / count;
-    let variance = levels.iter().map(|level| (level - mean).powi(2)).sum::<f32>() / count;
-    let clipped_frames = span.filter(|&frame| frames.clipped.get(frame).copied().unwrap_or(false)).count();
-
-    let overlap = |phrase: &Phrase| (phrase.end.min(end) - phrase.start.max(start)).max(0.0);
-    let heard: f64 = phrases.iter().map(overlap).sum();
-    let unheard = (end - start - heard).max(0.0);
-    let logprob = (phrases.iter().map(|phrase| phrase.average_logprob * overlap(phrase)).sum::<f64>()
-        + UNHEARD_LOGPROB * unheard)
-        / (heard + unheard).max(f64::EPSILON);
-    Section {
-        from,
-        to,
-        speech,
-        excess_pause,
-        level_spread_db: variance.sqrt(),
-        clipped_frames,
-        logprob,
-        floor_db: 0.0,
-    }
-}
-
 /// The best `count` sections that don't overlap, best first.
-fn best_sections(phrases: &[Phrase], frames: &Frames, count: usize, floor_of: impl Fn(f64, f64) -> f32) -> Vec<Section> {
-    let mut candidates = sections(phrases, frames, floor_of);
+fn best_sections(
+    phrases: &[Phrase],
+    frames: &Frames,
+    length: f64,
+    count: usize,
+    floor_of: impl Fn(f64, f64) -> f32,
+) -> Vec<Section> {
+    let mut candidates = sections(phrases, frames, length, floor_of);
     candidates.sort_by(|a, b| b.score().total_cmp(&a.score()));
     let mut chosen: Vec<Section> = Vec::new();
     for candidate in candidates {
         if chosen.len() == count {
             break;
         }
-        if chosen.iter().all(|section| candidate.end() <= section.start() || candidate.start() >= section.end()) {
+        if chosen.iter().all(|section| candidate.end <= section.start || candidate.start >= section.end) {
             chosen.push(candidate);
         }
     }
@@ -428,6 +505,7 @@ mod tests {
     struct Recording {
         phrases: Vec<Phrase>,
         frames: Frames,
+        length: f64,
     }
 
     fn recording(length: f64, spoken: &[(f64, f64)], phrases: &[(f64, f64, &str)]) -> Recording {
@@ -439,6 +517,7 @@ mod tests {
         Recording {
             phrases: phrases.iter().map(|&(start, end, text)| phrase(start, end, text)).collect(),
             frames: Frames { levels_db, clipped: vec![false; frames] },
+            length,
         }
     }
 
@@ -454,7 +533,7 @@ mod tests {
 
     impl Recording {
         fn best(&self, count: usize) -> Vec<Section> {
-            best_sections(&self.phrases, &self.frames, count, |_, _| -50.0)
+            best_sections(&self.phrases, &self.frames, self.length, count, |_, _| -50.0)
         }
 
         fn cuts(&self) -> Vec<Cut> {
@@ -506,8 +585,17 @@ mod tests {
         let best = &recording.best(1)[0];
         // Two of the three close sentences, about 11 seconds, rather than all
         // three, which run past 15.
-        assert!(best.start() == 0.8 || best.start() == 6.8, "{best:?}");
+        assert!(best.start == 0.8 || best.start == 6.8, "{best:?}");
         assert!((best.seconds() - 11.4).abs() < 1e-6, "{best:?}");
+    }
+
+    #[test]
+    fn a_section_ending_in_the_last_pause_keeps_to_the_recording() {
+        // The last pause runs from 11.75 to the end at 11.95, so rounding the
+        // end up would pass the end of the recording.
+        let best = sentences(11.95, &[(0.5, 5.0), (5.4, 11.75)]).best(1);
+        assert_eq!(best.len(), 1);
+        assert_eq!((best[0].start, best[0].end), (0.3, 11.9));
     }
 
     #[test]
@@ -522,12 +610,12 @@ mod tests {
     #[test]
     fn whole_sentences_clear_speech_and_a_quiet_floor_score_higher() {
         let base = sentences(14.0, &[(0.5, 6.0), (6.4, 11.0)]).best(1)[0].clone();
-        let words = |cut: Cut| Cut { at: Break::Word, ..cut };
-        let mid_sentence = Section { from: words(base.from), to: words(base.to), ..base.clone() };
+        let mid_sentence = Section { from: Break::Word, to: Break::Word, ..base.clone() };
         let unclear = Section { logprob: -0.9, ..base.clone() };
         let noisy = Section { floor_db: -35.0, ..base.clone() };
         let clipped = Section { clipped_frames: 2, ..base.clone() };
-        for worse in [mid_sentence, unclear, noisy, clipped] {
+        let uneven = Section { level_spread_db: 10.0, ..base.clone() };
+        for worse in [mid_sentence, unclear, noisy, clipped, uneven] {
             assert!(base.score() > worse.score() + 1.0, "{worse:?}");
         }
     }
@@ -539,7 +627,7 @@ mod tests {
         assert_eq!(best.len(), 3);
         for (index, a) in best.iter().enumerate() {
             for b in &best[index + 1..] {
-                assert!(a.end() <= b.start() || a.start() >= b.end(), "{a:?} overlaps {b:?}");
+                assert!(a.end <= b.start || a.start >= b.end, "{a:?} overlaps {b:?}");
             }
         }
     }
@@ -549,7 +637,17 @@ mod tests {
         let mut recording = sentences(30.0, &[(0.5, 5.0), (5.4, 10.5), (15.5, 20.0), (20.4, 25.5)]);
         recording.frames.clipped[frame_at(3.0)] = true;
         let best = &recording.best(1)[0];
-        assert!(best.start() > 15.0, "{best:?}");
+        assert!(best.start > 15.0, "{best:?}");
+    }
+
+    #[test]
+    fn time_with_no_words_heard_counts_as_unclear() {
+        // Speech-level sound from 6.4 to 11, such as music, with no phrase there.
+        let spoken = [(0.5, 6.0), (6.4, 11.0)];
+        let music = recording(14.0, &spoken, &[(0.5, 6.0, "A sentence.")]).best(1)[0].clone();
+        let speech = sentences(14.0, &spoken).best(1)[0].clone();
+        assert!(music.logprob < -0.9, "{music:?}");
+        assert!(speech.score() > music.score() + 3.0);
     }
 
     #[test]
@@ -559,24 +657,22 @@ mod tests {
 
     #[test]
     fn times_round_outwards_into_the_pauses() {
-        let cut = |start: usize, end: usize| Cut { pause: Pause { start, end }, at: Break::Sentence };
-        // Speech from 20.15 to 30.7: with the margins, 19.95 to 30.9.
-        let section = Section {
-            from: cut(390, 403),
-            to: cut(614, 640),
-            speech: 1.0,
-            excess_pause: 0.0,
-            level_spread_db: 0.0,
-            clipped_frames: 0,
-            logprob: -0.2,
-            floor_db: -50.0,
-        };
-        assert_eq!((section.start_text(), section.end_text()), ("19.9".to_string(), "30.9".to_string()));
+        assert_eq!(tenth_before(20.15), 20.1);
+        assert_eq!(tenth_before(2.9), 2.9);
+        assert_eq!(tenth_after(30.71), 30.8);
+        assert_eq!(tenth_after(14.2), 14.2);
     }
 
     #[test]
-    fn samples_are_named_after_the_recording() {
-        assert_eq!(sample_path(Path::new("/tmp/dad-raw.wav"), 2), Path::new("voices/dad-raw-2.wav"));
+    fn a_long_recording_is_refused_with_a_way_to_cut_it() {
+        let refusal = too_long(Path::new("tapes/Dad interview.mp3"));
+        assert!(refusal.contains("longer than 30 minutes"), "{refusal}");
+        assert!(refusal.ends_with("ffmpeg -ss 300 -t 600 -i 'tapes/Dad interview.mp3' 'Dad interview.part.wav'"), "{refusal}");
+    }
+
+    #[test]
+    fn samples_are_named_after_the_recording_and_their_start() {
+        assert_eq!(sample_path(Path::new("/tmp/dad-raw.wav"), 20.1), Path::new("voices/dad-raw-20.1s.wav"));
     }
 
     #[test]

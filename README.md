@@ -105,11 +105,9 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    first 15, ending at a pause. `voices/` is ignored by git, so recordings stay
    out of the repo.
 
-   To find the best stretches, `sections` suggests them, best first. It cleans
-   the whole recording as `clean` does, finds the phrases with Whisper base.en,
-   and looks for 8 to 15 seconds of steady, clear speech that starts and ends in
-   a pause, ideally between sentences, with no pause over a second, no clipping
-   and a quiet floor. Add a number to get more or fewer than 3:
+   To find the best stretches, `sections` suggests them, best first, each
+   with the `clean` command that makes it. Add a number to get more or fewer
+   than 3:
 
    ```sh
    ./target/release/audio-berry sections recording.mp3
@@ -118,16 +116,19 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ```text
    1. 20.1-30.7 (10.6s), floor -45.2 dB, 70% speech
       Roughly: "Used to work on the reverse sail most times. Very late times. ..."
-      audio-berry clean recording.mp3 20.1 30.7 voices/recording-1.wav
+      audio-berry clean recording.mp3 20.1 30.7 voices/recording-20.1s.wav
    ```
 
-   Each comes with the `clean` command that makes it. The words are only a rough
-   guide: the sample's first use transcribes it properly. It can't tell voices
-   apart, so with more than one speaker, check each suggestion is the right one.
-   It took 20 seconds for a 34 second recording and 39 seconds for 1:42, on the
-   CPU. On that recording, it suggested 20.1-30.7 and 3.1-14.1 where a person
-   had picked 20.1-30.8 and 2.9-14.2 by ear. Make two or three and compare them
-   with `audition` (step 4).
+   It cleans the whole recording as `clean` does, then scores each 8 to 15
+   second stretch that starts and ends in a pause. Mostly speech, whole
+   sentences and clear words score higher. Long pauses, clipping, a noisy floor
+   and an uneven level score lower, but don't rule a stretch out, so check the
+   floor and any `clipped` mark. The words are only a rough guide: the sample's
+   first use transcribes it properly. It can't tell voices apart, so with more
+   than one speaker, check each suggestion is the right one. It looks through
+   at most 30 minutes, so cut a longer recording first.
+
+   Make two or three with `clean`, then compare them with `audition` (step 4).
 
    To cut a clean recording without `clean`, take 10 seconds starting 3 minutes
    in with:
@@ -214,16 +215,19 @@ audio-berry retake <voice-sample> <book.epub> <output-dir> <words or chunk numbe
 audio-berry speakers
 audio-berry play <speaker> <file>...
 audio-berry audition <voice-sample> [speaker] [--speed <factor>]
-audio-berry sections <recording> [count]
+audio-berry sections <recording> [count] [--reduction <dB>]
 audio-berry clean <recording> <start> <end> <output.wav> [--reduction <dB>]
 ```
 
 `sections` suggests the best `count` stretches of a recording to use as a voice
-sample, 3 by default, each with the `clean` command that makes it. See
+sample, 3 by default, each with the `clean` command that makes it. With
+`--reduction`, it cleans as `clean` would with it. See
 [Adding a voice](#adding-a-voice).
 
 `clean` makes a voice sample from a noisy recording: it removes background noise
 from the whole recording, then saves `start` to `end` as 24 kHz mono 16-bit WAV.
+If the output already has a `.txt` beside it, it renames that to `.txt.old`,
+since it describes the old audio, so the first use transcribes the new sample.
 See [Adding a voice](#adding-a-voice).
 
 `audition` says a voice sample's own words, from its `.txt` file, in the cloned

@@ -88,7 +88,7 @@ impl SampleCheck {
                 // to have, as -50 was for a -45.3 dB sample.
                 let raised = ((floor - NOISY_ABOVE_LIMIT_DB) / 5.0).ceil() * 5.0;
                 let path = path.display();
-                let clean = clean::command(Path::new("recording.mp3"), "<start>", "<end>", &cleaned, Some(20.0));
+                let clean = clean::command_line(Path::new("recording.mp3"), "<start>", "<end>", &cleaned, Some(20.0));
                 Some(format!(
                     "The voice sample's floor is {floor:.1} dB. Takes copy it, a few dB quieter, so many \
                      will have floors above {limit} and be retried, up to {MAX_TAKES} takes per chunk. \
@@ -106,7 +106,7 @@ impl SampleCheck {
             Verdict::Raw => {
                 // Rounded down, since clean refuses an end past the recording's.
                 let end = (seconds * 10.0).floor() / 10.0;
-                let clean = clean::command(path, "0", &format!("{end:.1}"), &cleaned, None);
+                let clean = clean::command_line(path, "0", &format!("{end:.1}"), &cleaned, None);
                 Some(format!(
                     "The voice sample's floor is {floor:.1} dB, loud enough to hear in every take. If it's \
                      a raw recording, clean it into a new voice sample first:\n    \

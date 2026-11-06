@@ -57,8 +57,24 @@ fn from_db(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// How many samples a `FRAME_SECONDS` frame holds at `sample_rate`.
+pub fn frame_size(sample_rate: u32) -> usize {
+    ((sample_rate as f32 * FRAME_SECONDS) as usize).max(1)
+}
+
+/// The largest absolute sample, as a linear level.
+pub fn peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0f32, |peak, sample| peak.max(sample.abs()))
+}
+
+/// The floor of frame levels sorted quietest first: the level of the quietest
+/// 5%. Linear or in dB, it's the same frame.
+pub fn floor_of_sorted(levels: &[f32]) -> Option<f32> {
+    levels.get(levels.len() / 20).copied()
+}
+
 fn frame_levels(samples: &[f32], sample_rate: u32) -> Vec<f32> {
-    let size = ((sample_rate as f32 * FRAME_SECONDS) as usize).max(1);
+    let size = frame_size(sample_rate);
     samples
         .chunks_exact(size)
         .map(|frame| (frame.iter().map(|s| s * s).sum::<f32>() / size as f32).sqrt())
@@ -73,7 +89,7 @@ pub fn frame_levels_db(samples: &[f32], sample_rate: u32) -> Vec<f32> {
 pub fn measure(samples: &[f32], sample_rate: u32) -> Quality {
     let mut levels = frame_levels(samples, sample_rate);
     levels.sort_by(f32::total_cmp);
-    let floor = levels.get(levels.len() / 20).copied().unwrap_or(0.0);
+    let floor = floor_of_sorted(&levels).unwrap_or(0.0);
     let threshold = from_db(SILENCE_DB);
     let active: Vec<f32> = levels.into_iter().filter(|level| *level > threshold).collect();
     let speech = if active.is_empty() {
@@ -84,7 +100,7 @@ pub fn measure(samples: &[f32], sample_rate: u32) -> Quality {
     Quality {
         floor_db: to_db(floor),
         speech_db: to_db(speech),
-        peak_db: to_db(samples.iter().fold(0f32, |peak, sample| peak.max(sample.abs()))),
+        peak_db: to_db(peak(samples)),
         seconds: samples.len() as f32 / sample_rate as f32,
     }
 }
@@ -112,7 +128,7 @@ pub fn plausible_length_at(characters: usize, seconds: f32, speed: f64) -> bool 
 
 /// Removes leading and trailing silence, so gaps between chunks are consistent.
 pub fn trim_silence(samples: &[f32], sample_rate: u32) -> &[f32] {
-    let size = ((sample_rate as f32 * FRAME_SECONDS) as usize).max(1);
+    let size = frame_size(sample_rate);
     let threshold = from_db(SILENCE_DB);
     let levels = frame_levels(samples, sample_rate);
     let Some(first) = levels.iter().position(|level| *level > threshold) else {

@@ -8,8 +8,22 @@ use std::process::{Command, Stdio};
 
 /// Decodes any audio file ffmpeg understands into mono f32 PCM.
 pub fn decode_audio(path: &Path, sample_rate: u32) -> Result<Vec<f32>, Box<dyn Error>> {
+    decode(path, sample_rate, None)
+}
+
+/// Decodes at most the first `seconds` of an audio file, so a long one can be
+/// refused without holding all of it.
+pub fn decode_audio_up_to(path: &Path, sample_rate: u32, seconds: f64) -> Result<Vec<f32>, Box<dyn Error>> {
+    decode(path, sample_rate, Some(seconds))
+}
+
+fn decode(path: &Path, sample_rate: u32, seconds: Option<f64>) -> Result<Vec<f32>, Box<dyn Error>> {
     let mut ffmpeg = Command::new("ffmpeg");
-    ffmpeg.args(["-v", "error", "-i"]).arg(path);
+    ffmpeg.args(["-v", "error"]);
+    if let Some(seconds) = seconds {
+        ffmpeg.args(["-t", &seconds.to_string()]);
+    }
+    ffmpeg.arg("-i").arg(path);
     run(ffmpeg, None, sample_rate, &format!("ffmpeg failed on {}", path.display()))
 }
 

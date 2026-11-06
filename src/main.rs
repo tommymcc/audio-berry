@@ -29,7 +29,7 @@ const USAGE: &str = "usage:
   audio-berry speakers
   audio-berry play <speaker> <file>...
   audio-berry audition <voice-sample> [speaker] [--speed <factor>]
-  audio-berry sections <recording> [count]
+  audio-berry sections <recording> [count] [--reduction <dB>]
   audio-berry clean <recording> <start> <end> <output.wav> [--reduction <dB>]";
 
 /// Rust ignores SIGPIPE, so printing to a reader that has gone, such as `head`, panics.
@@ -80,10 +80,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         ["audition", voice] => audition::audition(Path::new(voice), None, speed),
         ["audition", voice, speaker] => audition::audition(Path::new(voice), Some(speaker), speed),
-        ["sections", recording] => sections::suggest(Path::new(recording), sections::DEFAULT_COUNT),
+        ["sections", recording] => sections::suggest(Path::new(recording), sections::DEFAULT_COUNT, reduction),
         ["sections", recording, count] => {
             let count = count.parse::<usize>().ok().filter(|count| *count > 0);
-            sections::suggest(Path::new(recording), count.ok_or("the count of sections must be a whole number from 1")?)
+            let count = count.ok_or("the count of sections must be a whole number from 1")?;
+            sections::suggest(Path::new(recording), count, reduction)
         }
         ["clean", recording, start, end, output] => {
             let (start, end) = (clean::parse_time(start)?, clean::parse_time(end)?);
@@ -114,7 +115,7 @@ const SPEED: Flag = Flag {
 const REDUCTION: Flag = Flag {
     name: "--reduction",
     value: "a level in dB, such as 15",
-    commands: &["clean"],
+    commands: &["clean", "sections"],
     refused_note: "",
 };
 
@@ -200,6 +201,16 @@ mod tests {
         let (rest, reduction) = take(&REDUCTION, &words, clean::parse_reduction).unwrap();
         assert_eq!(rest, args(&["clean", "r", "1", "2", "o"]));
         assert_eq!(reduction, Some(20.0));
+    }
+
+    #[test]
+    fn reduction_is_for_commands_that_clean() {
+        let (rest, reduction) = take(&REDUCTION, &["sections", "r", "--reduction", "20"], clean::parse_reduction).unwrap();
+        assert_eq!(rest, args(&["sections", "r"]));
+        assert_eq!(reduction, Some(20.0));
+        for command in ["speak", "book", "audition", "retake"] {
+            assert!(!REDUCTION.accepted_by(Some(command)), "{command}");
+        }
     }
 
     #[test]
