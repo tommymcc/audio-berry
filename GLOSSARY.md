@@ -19,3 +19,7 @@
 **Floor:** a take's background level, measured as its quietest 5% of 50 ms frames. Takes below 6 seconds aren't judged on it, because they barely pause.
 
 **Noise limit:** the highest floor a take can have and still pass, -55 dB unless `AUDIO_BERRY_NOISE_LIMIT_DB` sets it. The output directory saves it in `narration.txt`, so it's given once, and giving a new value replaces the saved one. It isn't a render setting: it decides which take is kept, not how a take sounds, so changing it keeps the audio already rendered.
+
+**Voice sample:** the recording a narration's voice is cloned from, such as `voices/me.wav`, with what's said in it in a `.txt` file beside it. `clean` makes one from a noisy recording.
+
+**Reduction:** the most noise `clean` removes from a recording when making a voice sample, in dB, 15 unless `--reduction` sets it. It's DeepFilterNet's attenuation limit. It changes the voice sample, unlike the floor and noise limit, which measure and judge takes. A higher reduction gives quieter takes but a clone less like the speaker.

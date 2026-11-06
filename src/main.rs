@@ -41,18 +41,9 @@ fn stop_quietly_when_output_closes() {}
 
 fn main() -> Result<(), Box<dyn Error>> {
     stop_quietly_when_output_closes();
-    let (args, speed) = take_speed(std::env::args().skip(1).collect())?;
-    let (args, reduction) = take_reduction(args)?;
-    if reduction.is_some() && args.first().map(String::as_str) != Some("clean") {
-        return Err("--reduction only works with clean".into());
-    }
-    if speed.is_some() && !takes_speed(args.first().map(String::as_str)) {
-        return Err(format!(
-            "--speed only works with {}; retake uses the speed saved in the output directory",
-            SPEED_COMMANDS.join(", ")
-        )
-        .into());
-    }
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let speed = SPEED.take(&mut args)?.map(|value| parse_speed(&value)).transpose()?;
+    let reduction = REDUCTION.take(&mut args)?.map(|value| clean::parse_reduction(&value)).transpose()?;
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         ["speak", voice, text, output] => narrator::speak(Path::new(voice), text, Path::new(output), speed),
         ["chapters", book] => book::list_chapters(Path::new(book)),
@@ -86,54 +77,62 @@ fn main() -> Result<(), Box<dyn Error>> {
         ["audition", voice] => audition::audition(Path::new(voice), None, speed),
         ["audition", voice, speaker] => audition::audition(Path::new(voice), Some(speaker), speed),
         ["clean", recording, start, end, output] => {
-            let time = |text: &str| {
-                clean::parse_time(text)
-                    .ok_or_else(|| format!("{text} isn't a time in seconds, such as 20.1, or minutes and seconds, such as 1:05"))
-            };
+            let (start, end) = (clean::parse_time(start)?, clean::parse_time(end)?);
             let reduction = reduction.unwrap_or(clean::DEFAULT_REDUCTION_DB);
-            clean::clean(Path::new(recording), time(start)?, time(end)?, Path::new(output), reduction)
+            clean::clean(Path::new(recording), start, end, Path::new(output), reduction)
         }
         _ => Err(USAGE.into()),
     }
 }
 
-/// The commands that accept `--speed`. `retake` doesn't, as it reuses the saved speed.
-const SPEED_COMMANDS: [&str; 3] = ["speak", "book", "audition"];
-
-fn takes_speed(command: Option<&str>) -> bool {
-    command.is_some_and(|command| SPEED_COMMANDS.contains(&command))
+/// An option some commands take, given as `<name> <value>` anywhere in the arguments.
+struct Flag {
+    name: &'static str,
+    /// What the value is, for when it's missing.
+    value: &'static str,
+    commands: &'static [&'static str],
+    /// Added when another command is given it.
+    refused_note: &'static str,
 }
 
-/// Takes `--speed <factor>` out of the arguments, wherever it appears.
-fn take_speed(args: Vec<String>) -> Result<(Vec<String>, Option<f64>), Box<dyn Error>> {
-    let (args, value) = take_flag(args, "--speed", "a factor, such as 0.9")?;
-    let Some(value) = value else { return Ok((args, None)) };
+const SPEED: Flag = Flag {
+    name: "--speed",
+    value: "a factor, such as 0.9",
+    commands: &["speak", "book", "audition"],
+    refused_note: "; retake uses the speed saved in the output directory",
+};
+
+const REDUCTION: Flag = Flag {
+    name: "--reduction",
+    value: "a level in dB, such as 15",
+    commands: &["clean"],
+    refused_note: "",
+};
+
+impl Flag {
+    fn accepted_by(&self, command: Option<&str>) -> bool {
+        command.is_some_and(|command| self.commands.contains(&command))
+    }
+
+    /// Takes the flag and its value out of the arguments, if given, refusing it
+    /// for a command that doesn't take it.
+    fn take(&self, args: &mut Vec<String>) -> Result<Option<String>, Box<dyn Error>> {
+        let Some(position) = args.iter().position(|arg| arg == self.name) else {
+            return Ok(None);
+        };
+        let value = args.get(position + 1).cloned();
+        args.drain(position..(position + 2).min(args.len()));
+        if !self.accepted_by(args.first().map(String::as_str)) {
+            let commands = self.commands.join(", ");
+            return Err(format!("{} only works with {commands}{}", self.name, self.refused_note).into());
+        }
+        Ok(Some(value.ok_or_else(|| format!("{} needs {}", self.name, self.value))?))
+    }
+}
+
+fn parse_speed(value: &str) -> Result<f64, String> {
     let speed = value.parse::<f64>().ok().filter(|speed| SPEED_RANGE.contains(speed));
-    let speed = speed.ok_or_else(|| {
-        format!("--speed must be from {} to {}, not {value}", SPEED_RANGE.start(), SPEED_RANGE.end())
-    })?;
-    Ok((args, Some(speed)))
-}
-
-/// Takes `--reduction <dB>` out of the arguments, wherever it appears.
-fn take_reduction(args: Vec<String>) -> Result<(Vec<String>, Option<f32>), Box<dyn Error>> {
-    let (args, value) = take_flag(args, "--reduction", "a level in dB, such as 15")?;
-    let Some(value) = value else { return Ok((args, None)) };
-    let reduction = clean::parse_reduction(&value).ok_or_else(|| {
-        let range = clean::REDUCTION_RANGE;
-        format!("--reduction must be from {} to {} dB, not {value}", range.start(), range.end())
-    })?;
-    Ok((args, Some(reduction)))
-}
-
-/// Takes `<flag> <value>` out of the arguments, wherever it appears.
-fn take_flag(mut args: Vec<String>, flag: &str, needs: &str) -> Result<(Vec<String>, Option<String>), Box<dyn Error>> {
-    let Some(position) = args.iter().position(|arg| arg == flag) else {
-        return Ok((args, None));
-    };
-    let value = args.get(position + 1).ok_or_else(|| format!("{flag} needs {needs}"))?.clone();
-    args.drain(position..=position + 1);
-    Ok((args, Some(value)))
+    speed.ok_or_else(|| format!("--speed must be from {} to {}, not {value}", SPEED_RANGE.start(), SPEED_RANGE.end()))
 }
 
 #[cfg(test)]
@@ -144,55 +143,69 @@ mod tests {
         words.iter().map(|word| word.to_string()).collect()
     }
 
+    /// Takes a flag, then parses its value as main does.
+    fn take<T>(flag: &Flag, words: &[&str], parse: fn(&str) -> Result<T, String>) -> Result<(Vec<String>, Option<T>), Box<dyn Error>> {
+        let mut rest = args(words);
+        let value = flag.take(&mut rest)?.map(|value| parse(&value)).transpose()?;
+        Ok((rest, value))
+    }
+
     #[test]
     fn speed_is_taken_from_any_position() {
-        let (rest, speed) = take_speed(args(&["book", "--speed", "0.9", "v", "b", "o", "3"])).unwrap();
+        let (rest, speed) = take(&SPEED, &["book", "--speed", "0.9", "v", "b", "o", "3"], parse_speed).unwrap();
         assert_eq!(rest, args(&["book", "v", "b", "o", "3"]));
         assert_eq!(speed, Some(0.9));
-        let (rest, speed) = take_speed(args(&["book", "v", "b", "o", "--speed", "1.2"])).unwrap();
+        let (rest, speed) = take(&SPEED, &["book", "v", "b", "o", "--speed", "1.2"], parse_speed).unwrap();
         assert_eq!(rest, args(&["book", "v", "b", "o"]));
         assert_eq!(speed, Some(1.2));
     }
 
     #[test]
     fn speed_is_for_commands_that_render_at_a_chosen_speed() {
-        for command in SPEED_COMMANDS {
-            assert!(takes_speed(Some(command)), "{command}");
+        for command in ["speak", "book", "audition"] {
+            assert!(SPEED.accepted_by(Some(command)), "{command}");
         }
         for command in ["retake", "play", "chapters", "speakers", "clean"] {
-            assert!(!takes_speed(Some(command)), "{command}");
+            assert!(!SPEED.accepted_by(Some(command)), "{command}");
         }
-        assert!(!takes_speed(None));
+        assert!(!SPEED.accepted_by(None));
     }
 
     #[test]
-    fn no_flag_means_no_speed() {
-        assert_eq!(take_speed(args(&["chapters", "b"])).unwrap().1, None);
+    fn no_flag_means_no_value() {
+        assert_eq!(take(&SPEED, &["chapters", "b"], parse_speed).unwrap().1, None);
+        assert_eq!(take(&REDUCTION, &["clean", "r", "1", "2", "o"], clean::parse_reduction).unwrap().1, None);
     }
 
     #[test]
     fn a_missing_or_silly_speed_is_an_error() {
         for bad in ["0", "-1", "0.4", "2.1", "fast", "NaN"] {
-            assert!(take_speed(args(&["book", "--speed", bad])).is_err(), "{bad}");
+            assert!(take(&SPEED, &["book", "--speed", bad], parse_speed).is_err(), "{bad}");
         }
-        assert!(take_speed(args(&["book", "--speed"])).is_err());
+        assert!(take(&SPEED, &["book", "--speed"], parse_speed).is_err());
     }
 
     #[test]
     fn reduction_is_taken_from_any_position() {
-        let (rest, reduction) = take_reduction(args(&["clean", "--reduction", "20", "r", "1", "2", "o"])).unwrap();
+        let words = ["clean", "--reduction", "20", "r", "1", "2", "o"];
+        let (rest, reduction) = take(&REDUCTION, &words, clean::parse_reduction).unwrap();
         assert_eq!(rest, args(&["clean", "r", "1", "2", "o"]));
         assert_eq!(reduction, Some(20.0));
-        let (rest, reduction) = take_reduction(args(&["clean", "r", "1", "2", "o"])).unwrap();
-        assert_eq!(rest, args(&["clean", "r", "1", "2", "o"]));
-        assert_eq!(reduction, None);
     }
 
     #[test]
     fn a_missing_or_silly_reduction_is_an_error() {
         for bad in ["0", "-15", "101", "lots"] {
-            assert!(take_reduction(args(&["clean", "--reduction", bad])).is_err(), "{bad}");
+            assert!(take(&REDUCTION, &["clean", "--reduction", bad], clean::parse_reduction).is_err(), "{bad}");
         }
-        assert!(take_reduction(args(&["clean", "--reduction"])).is_err());
+        assert!(take(&REDUCTION, &["clean", "--reduction"], clean::parse_reduction).is_err());
+    }
+
+    #[test]
+    fn a_flag_for_another_command_is_refused_by_name_whatever_its_value() {
+        for (flag, words) in [(&REDUCTION, ["book", "--reduction", "lots"]), (&SPEED, ["clean", "--speed", "fast"])] {
+            let error = flag.take(&mut args(&words)).unwrap_err().to_string();
+            assert!(error.starts_with(&format!("{} only works with", flag.name)), "{error}");
+        }
     }
 }

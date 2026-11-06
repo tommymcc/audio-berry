@@ -111,26 +111,22 @@ Only clone your own voice, or the voice of someone who has agreed to it.
 
    If the recording has background noise, such as birds or wind, clean it as you
    cut it. `clean` cleans the whole recording with DeepFilterNet 3, which is built
-   in and runs on the CPU, then takes 20.1 to 30.8 seconds as a voice sample:
+   in and runs on the CPU, then takes 20.1 to 30.8 seconds as a voice sample. It
+   reproduces the earlier Python DeepFilterNet 0.5.6 result:
 
    ```sh
    ./target/release/audio-berry clean recording.mp3 20.1 30.8 voices/me.wav
    ```
 
    Times can also be minutes and seconds, such as `1:05.5`. Pick the start and end
-   in pauses between words.
+   in pauses between words. It refuses an end before the start or past the end of
+   the recording.
 
-   `--reduction <dB>` caps how much noise is removed, and defaults to 15 dB, which
-   keeps the voice most like the speaker. More removes more of the background but
-   makes the clone sound less like them. On one outdoor recording, voice ID against
-   the speaker's own recording was 0.85 at 15 dB, 0.80 at 20, 0.75 at 30 and 0.74
-   with no limit (100), where two of the speaker's own recordings scored 0.91.
-   The default keeps a little room tone, which every take copies, so you may need a
-   higher [noise limit](#noise-limit).
-
-   `scripts/clean_sample.sh` does the same with DeepFilterNet's Python version, and
-   is kept only to reproduce samples made with it. On one recording the two agreed
-   to within 0.01 dB of floor, with their difference 41 dB below the voice.
+   `--reduction <dB>` caps how much noise is removed, 15 dB by default. More
+   removes more background but makes the clone sound less like the speaker: on one
+   outdoor recording, voice ID was 0.85 at 15 dB, 0.80 at 20 and 0.74 at 100 (no
+   limit). The default keeps a little room tone, which every take copies, so you
+   may need a higher [noise limit](#noise-limit).
 
 3. **Check the levels.** `max_volume` should be below 0 dB. If it reads 0.0 dB,
    the recording is probably clipped, so pick another section or record it

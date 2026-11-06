@@ -10,7 +10,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-const SAMPLE_RATE: u32 = 24_000;
+/// The rate voice samples are kept at, as OmniVoice hears them.
+pub const SAMPLE_RATE: u32 = 24_000;
 /// OmniVoice recommends 3-10 seconds of reference and warns above 20, so longer
 /// samples are cut to 15 at a pause.
 const MAX_VOICE_SECONDS: f32 = 15.0;
