@@ -1,7 +1,7 @@
 //! An output directory: one narration of one book, in one voice, with one set
 //! of render settings. Owns chunk numbering, the cache key and the files.
 
-use crate::quality::{MAX_FLOOR_DB, valid_noise_limit};
+use crate::quality::{DEFAULT_NOISE_LIMIT_DB, valid_noise_limit};
 use crate::accuracy::contains_phrase;
 use any_tts::{AudioSamples, DeviceSelection};
 use any_tts::models::omnivoice::{OmniVoiceRuntimeChoice, preferred_runtime_choice};
@@ -188,7 +188,7 @@ struct SettledNoiseLimit {
 fn settle_noise_limit(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> SettledNoiseLimit {
     let path = out.join(MANIFEST);
     let Some(saved) = saved else {
-        let limit_db = given.unwrap_or(MAX_FLOOR_DB);
+        let limit_db = given.unwrap_or(DEFAULT_NOISE_LIMIT_DB);
         let note = given.map(|limit| format!("Noise limit: {limit} dB"));
         return SettledNoiseLimit { limit_db, saved: Some(limit_db), save_now: false, note };
     };
@@ -209,14 +209,14 @@ fn settle_noise_limit(saved: Option<&Manifest>, given: Option<f32>, out: &Path) 
             limit_db: old,
             saved: Some(old),
             save_now: false,
-            note: (given.is_some() || old != MAX_FLOOR_DB).then(|| format!("Noise limit: {old} dB")),
+            note: (given.is_some() || old != DEFAULT_NOISE_LIMIT_DB).then(|| format!("Noise limit: {old} dB")),
         },
         (None, None) => SettledNoiseLimit {
-            limit_db: MAX_FLOOR_DB,
+            limit_db: DEFAULT_NOISE_LIMIT_DB,
             saved: None,
             save_now: false,
             note: Some(format!(
-                "Noise limit: {MAX_FLOOR_DB} dB. {} has no saved limit, so if this output directory \
+                "Noise limit: {DEFAULT_NOISE_LIMIT_DB} dB. {} has no saved limit, so if this output directory \
                  was rendered with {}, give it once more to save it.",
                 path.display(),
                 crate::quality::NOISE_LIMIT_VAR,
@@ -258,7 +258,7 @@ impl NarrationStore {
             out: out.to_path_buf(),
             chunks: chunks_of(chapters, &manifest.voice, manifest.speed),
             speed: manifest.speed,
-            noise_limit_db: manifest.noise_limit_db.unwrap_or(MAX_FLOOR_DB),
+            noise_limit_db: manifest.noise_limit_db.unwrap_or(DEFAULT_NOISE_LIMIT_DB),
             manifest,
         })
     }
@@ -869,7 +869,7 @@ mod tests {
         // It may have been rendered with a limit that wasn't saved, so writing the
         // default would quietly judge its takes against the wrong one.
         let dir = folder_without_a_saved_limit("limit-older");
-        assert_eq!(open_with_limit(&dir, None).noise_limit_db(), MAX_FLOOR_DB);
+        assert_eq!(open_with_limit(&dir, None).noise_limit_db(), DEFAULT_NOISE_LIMIT_DB);
         assert_eq!(fs::read_to_string(dir.join(MANIFEST)).unwrap(), OLDER_MANIFEST);
         let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), None, dir.path());
         assert!(settled.note.unwrap().contains("give it once"));

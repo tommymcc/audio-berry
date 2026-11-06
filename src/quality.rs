@@ -4,14 +4,15 @@
 pub const FRAME_SECONDS: f32 = 0.05;
 const SILENCE_DB: f32 = -55.0;
 
-/// A quiet-frame level above this means something is playing behind the voice.
-/// Takes heard as clean measured about -91 to -96 dB, and noisy ones -34 to -48.
-pub const MAX_FLOOR_DB: f32 = -55.0;
+/// The noise limit unless one is given: a floor above this means something is
+/// playing behind the voice. Takes heard as clean measured about -91 to -96 dB,
+/// and noisy ones -34 to -48.
+pub const DEFAULT_NOISE_LIMIT_DB: f32 = -55.0;
 
-/// Overrides `MAX_FLOOR_DB`, and is saved with the output directory. A sample
-/// with faint room tone, such as a denoised outdoor recording, passes a little
-/// of it to every take: one voice's takes measured -51 to -57 dB and were heard
-/// as clean on a Cast speaker.
+/// Overrides `DEFAULT_NOISE_LIMIT_DB`, and is saved with the output directory.
+/// A sample with faint room tone, such as a denoised outdoor recording, passes a
+/// little of it to every take: one voice's takes measured -51 to -57 dB and were
+/// heard as clean on a Cast speaker.
 pub const NOISE_LIMIT_VAR: &str = "AUDIO_BERRY_NOISE_LIMIT_DB";
 
 /// The noise limit given in the environment, if any. An invalid value is
@@ -174,8 +175,8 @@ mod tests {
         clean.extend(vec![0.0; 12_000]);
         let mut noisy = tone(3.0, 0.2);
         noisy.extend(tone(0.5, 0.02));
-        assert!(measure(&clean, 24_000).floor_db < MAX_FLOOR_DB);
-        assert!(measure(&noisy, 24_000).floor_db > MAX_FLOOR_DB);
+        assert!(measure(&clean, 24_000).floor_db < DEFAULT_NOISE_LIMIT_DB);
+        assert!(measure(&noisy, 24_000).floor_db > DEFAULT_NOISE_LIMIT_DB);
     }
 
     #[test]
@@ -200,8 +201,8 @@ mod tests {
 
     #[test]
     fn short_takes_are_not_judged_on_their_floor() {
-        assert!(measure(&tone(1.5, 0.2), 24_000).clean(MAX_FLOOR_DB));
-        assert!(!measure(&tone(8.0, 0.2), 24_000).clean(MAX_FLOOR_DB));
+        assert!(measure(&tone(1.5, 0.2), 24_000).clean(DEFAULT_NOISE_LIMIT_DB));
+        assert!(!measure(&tone(8.0, 0.2), 24_000).clean(DEFAULT_NOISE_LIMIT_DB));
     }
 
     #[test]

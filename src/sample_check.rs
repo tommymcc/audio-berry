@@ -3,7 +3,7 @@
 
 use crate::book::MAX_TAKES;
 use crate::clean::{self, DEFAULT_REDUCTION_DB};
-use crate::quality::{self, MAX_FLOOR_DB, NOISE_LIMIT_VAR};
+use crate::quality::{self, DEFAULT_NOISE_LIMIT_DB, NOISE_LIMIT_VAR};
 use crate::voice::SAMPLE_RATE;
 use std::path::Path;
 
@@ -49,7 +49,7 @@ impl SampleCheck {
     }
 
     fn from_floor(floor_db: f32, noise_limit_db: Option<f32>) -> SampleCheck {
-        let limit = noise_limit_db.unwrap_or(MAX_FLOOR_DB);
+        let limit = noise_limit_db.unwrap_or(DEFAULT_NOISE_LIMIT_DB);
         let verdict = if floor_db > RAW_SAMPLE_DB {
             Verdict::Raw
         } else if floor_db > limit + NOISY_ABOVE_LIMIT_DB {
@@ -82,7 +82,7 @@ impl SampleCheck {
             Verdict::Noisy => {
                 let limit = match self.noise_limit_db {
                     Some(limit) => format!("the noise limit of {limit} dB set by {NOISE_LIMIT_VAR}"),
-                    None => format!("the default noise limit of {MAX_FLOOR_DB} dB"),
+                    None => format!("the default noise limit of {DEFAULT_NOISE_LIMIT_DB} dB"),
                 };
                 // The next multiple of 5 dB above the floor takes are expected
                 // to have, as -50 was for a -45.3 dB sample.
