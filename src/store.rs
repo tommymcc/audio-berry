@@ -225,7 +225,44 @@ fn settle_noise_limit(saved: Option<&Manifest>, given: Option<f32>, out: &Path) 
     }
 }
 
+/// Numbers the chunks and keys each by its text, voice and speed.
+fn chunks_of(chapters: &[Vec<String>], voice: &str, speed: f64) -> Vec<Chunk> {
+    // Normal speed keeps the original key, so older chunks stay valid.
+    let speed_key = if speed == NORMAL_SPEED { String::new() } else { format!("speed={speed}\n") };
+    let mut chunks = Vec::new();
+    for (chapter, texts) in chapters.iter().enumerate() {
+        for (position, text) in texts.iter().enumerate() {
+            let key = format!("{CACHE_VERSION}\n{voice}\n{speed_key}{text}");
+            chunks.push(Chunk {
+                chapter,
+                position,
+                hash: format!("{:016x}", fnv(key.as_bytes(), 0)),
+                text: text.clone(),
+            });
+        }
+    }
+    chunks
+}
+
 impl NarrationStore {
+    /// Opens an output directory only to read what has been rendered there, in
+    /// the voice and settings it saved, changing nothing.
+    pub fn read(out: &Path, book_title: &str, chapters: &[Vec<String>]) -> Result<Self, Box<dyn Error>> {
+        let manifest = read_manifest(out)?
+            .ok_or_else(|| format!("{} has no {MANIFEST}, so nothing has been rendered there", out.display()))?;
+        let book = book_title.replace('\n', " ");
+        if manifest.book != book {
+            return Err(format!("{} narrates {}, not {book}", out.display(), manifest.book).into());
+        }
+        Ok(Self {
+            out: out.to_path_buf(),
+            chunks: chunks_of(chapters, &manifest.voice, manifest.speed),
+            speed: manifest.speed,
+            noise_limit_db: manifest.noise_limit_db.unwrap_or(MAX_FLOOR_DB),
+            manifest,
+        })
+    }
+
     pub fn open(
         out: &Path,
         book_title: &str,
@@ -237,20 +274,7 @@ impl NarrationStore {
         let saved = read_manifest(out)?;
         let speed = settings.speed.or(saved.as_ref().map(|saved| saved.speed)).unwrap_or(NORMAL_SPEED);
         let noise_limit = settle_noise_limit(saved.as_ref(), given_noise_limit, out);
-        // Normal speed keeps the original key, so older chunks stay valid.
-        let speed_key = if speed == NORMAL_SPEED { String::new() } else { format!("speed={speed}\n") };
-        let mut chunks = Vec::new();
-        for (chapter, texts) in chapters.iter().enumerate() {
-            for (position, text) in texts.iter().enumerate() {
-                let key = format!("{CACHE_VERSION}\n{voice:x}\n{speed_key}{text}");
-                chunks.push(Chunk {
-                    chapter,
-                    position,
-                    hash: format!("{:016x}", fnv(key.as_bytes(), 0)),
-                    text: text.clone(),
-                });
-            }
-        }
+        let chunks = chunks_of(chapters, &format!("{voice:x}"), speed);
         fs::create_dir_all(out.join("chunks"))?;
         let manifest = Manifest {
             book: book_title.replace('\n', " "),
@@ -905,6 +929,24 @@ mod tests {
         store.store(chunk, &tone(), "heard\tthis\nline", 2).unwrap();
         assert!(store.has_audio(chunk));
         assert_eq!(store.check(chunk).unwrap(), Check { takes: 2, transcript: "heard this line".into() });
+    }
+
+    #[test]
+    fn reading_a_folder_finds_its_takes_at_its_saved_speed() {
+        let dir = TempDir::new("read");
+        render_at(&dir, Some(0.9));
+        let store = NarrationStore::read(&dir.0, "A Book", &chapters(&[&["Hello there."]])).unwrap();
+        assert_eq!(store.speed(), 0.9);
+        assert_eq!(store.check(&store.chunks()[0]).unwrap(), Check { takes: 1, transcript: "a".into() });
+        assert!(NarrationStore::read(&dir.0, "Another Book", &chapters(&[&["Hello there."]])).is_err());
+    }
+
+    #[test]
+    fn reading_a_folder_with_nothing_rendered_is_an_error_that_changes_nothing() {
+        let dir = TempDir::new("read-empty");
+        let error = NarrationStore::read(&dir.0, "A Book", &chapters(&[&["a"]])).err().unwrap().to_string();
+        assert!(error.ends_with("has no narration.txt, so nothing has been rendered there"), "{error}");
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
     }
 
     #[test]

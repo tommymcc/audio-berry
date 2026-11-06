@@ -25,16 +25,16 @@ const SPEECH_TARGET_DB: f32 = -21.0;
 const CHUNK_GAP_SECONDS: f32 = 0.35;
 const CHAPTER_GAP_SECONDS: f32 = 1.2;
 
+/// Each chapter's chunks, as narrated.
+pub fn chapter_chunks(book: &Book) -> Vec<Vec<String>> {
+    book.chapters.iter().map(|chapter| chunk(&chapter.paragraphs, MAX_CHUNK_CHARS)).collect()
+}
+
 fn open_store(book: &Book, voice: &Voice, out: &Path, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
-    let chapters: Vec<Vec<String>> = book
-        .chapters
-        .iter()
-        .map(|chapter| chunk(&chapter.paragraphs, MAX_CHUNK_CHARS))
-        .collect();
     NarrationStore::open(
         out,
         &book.title,
-        &chapters,
+        &chapter_chunks(book),
         voice.hash(),
         &RenderSettings::from_env(speed),
         quality::noise_limit_from_env(),
@@ -295,7 +295,7 @@ pub fn narrate(
 
     let voice = Voice::load(voice_sample)?;
     let store = open_store(&book, &voice, out, speed)?;
-    let standard = Standard::of(&store);
+    let standard = Standard::of(&store, voice.allowances());
 
     let text_dir = out.join("text");
     fs::create_dir_all(&text_dir)?;
@@ -378,7 +378,7 @@ pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) ->
     let book = read_book(epub)?;
     let voice = Voice::load(voice_sample)?;
     let store = open_store(&book, &voice, out, None)?;
-    let standard = Standard::of(&store);
+    let standard = Standard::of(&store, voice.allowances());
     let wanted = store.select(targets)?;
 
     let mut recorder = Recorder::load(&voice, &store, &standard)?;

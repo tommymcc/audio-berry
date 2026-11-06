@@ -1,5 +1,8 @@
 //! Compares what was heard in a take with the text it should say, word by word,
-//! forgiving the differences in spelling a transcriber makes.
+//! forgiving the differences in spelling a transcriber makes, and the words a
+//! voice's allowances say it hears as others.
+
+use std::collections::HashSet;
 
 /// Passages the user approved by ear scored 0.98-1.00 recall with 0.00-0.02 extra.
 const MIN_RECALL: f32 = 0.92;
@@ -34,8 +37,55 @@ impl Accuracy {
     }
 }
 
+/// Words the transcriber hears as other words in one voice, such as a speaker
+/// whose "in" is heard as "and". Each is one-way: the text's word may be heard
+/// as the other, not the reverse.
+#[derive(Clone, Debug, Default)]
+pub struct Allowances {
+    /// (text word, heard word), normalised as `words` does.
+    pairs: HashSet<(String, String)>,
+}
+
+impl Allowances {
+    /// Reads lines like `in = and`, meaning the text's "in" may be heard as "and".
+    /// `#` starts a comment, and blank lines are skipped. Errors name the line.
+    pub fn parse(text: &str) -> Result<Allowances, String> {
+        let mut pairs = HashSet::new();
+        for (index, line) in text.lines().enumerate() {
+            let number = index + 1;
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (written, heard) = line
+                .split_once('=')
+                .ok_or_else(|| format!("line {number}: \"{line}\" isn't in the form \"in = and\""))?;
+            let one_word = |side: &str| match words(side).as_slice() {
+                [word] => Ok(word.clone()),
+                _ => Err(format!("line {number}: \"{}\" isn't one word", side.trim())),
+            };
+            let (written, heard) = (one_word(written)?, one_word(heard)?);
+            if written == heard {
+                return Err(format!("line {number}: \"{written}\" is the same word on both sides"));
+            }
+            pairs.insert((written, heard));
+        }
+        Ok(Allowances { pairs })
+    }
+
+    /// Whether the text's `written` word may be heard as `heard`, both normalised
+    /// as `words` does.
+    pub fn allows(&self, written: &str, heard: &str) -> bool {
+        self.pairs.contains(&(written.to_string(), heard.to_string()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+}
+
 /// Lowercases into words, spelling out small numbers so "1" matches "one".
-fn words(text: &str) -> Vec<String> {
+pub fn words(text: &str) -> Vec<String> {
     let cleaned: String = text
         .to_lowercase()
         .chars()
@@ -59,21 +109,20 @@ fn words(text: &str) -> Vec<String> {
     out
 }
 
-fn common_subsequence(a: &[String], b: &[String]) -> usize {
-    let mut row = vec![0usize; b.len() + 1];
-    for word in a {
-        let mut diagonal = 0;
-        for (j, other) in b.iter().enumerate() {
-            let above = row[j + 1];
-            row[j + 1] = if word == other {
-                diagonal + 1
+/// How many words, in order, `expected[i..]` and `heard[j..]` have in common, as
+/// `table[i][j]`. A word matches itself, or a word the allowances let it be heard as.
+fn common_subsequences(expected: &[String], heard: &[String], allowances: &Allowances) -> Vec<Vec<usize>> {
+    let mut table = vec![vec![0usize; heard.len() + 1]; expected.len() + 1];
+    for (i, word) in expected.iter().enumerate().rev() {
+        for (j, other) in heard.iter().enumerate().rev() {
+            table[i][j] = if word == other || allowances.allows(word, other) {
+                table[i + 1][j + 1] + 1
             } else {
-                above.max(row[j])
+                table[i + 1][j].max(table[i][j + 1])
             };
-            diagonal = above;
         }
     }
-    row[b.len()]
+    table
 }
 
 /// Joins neighbouring words where `other` has them as one word, so "quarter
@@ -96,17 +145,61 @@ fn join_split_words(words: &[String], other: &[String]) -> Vec<String> {
     out
 }
 
-/// How much of `text` was heard in `transcript`, and how much more besides.
-pub fn compare(text: &str, transcript: &str) -> Accuracy {
+/// The words of a text and of its transcript, ready to line up.
+fn aligned_words(text: &str, transcript: &str) -> (Vec<String>, Vec<String>) {
     let (expected, heard) = (words(text), words(transcript));
     let expected = join_split_words(&expected, &heard);
     let heard = join_split_words(&heard, &expected);
-    let matched = common_subsequence(&expected, &heard);
+    (expected, heard)
+}
+
+/// How much of `text` was heard in `transcript`, and how much more besides. A
+/// word heard as another that `allowances` allow counts as heard.
+pub fn compare(text: &str, transcript: &str, allowances: &Allowances) -> Accuracy {
+    let (expected, heard) = aligned_words(text, transcript);
+    let matched = common_subsequences(&expected, &heard, allowances)[0][0];
     let length = expected.len().max(1) as f32;
     Accuracy {
         recall: matched as f32 / length,
         extra: heard.len().saturating_sub(matched) as f32 / length,
         transcript: transcript.to_string(),
+    }
+}
+
+/// Each place one word of `text` was heard as one other word in `transcript`,
+/// as (text word, heard word), such as ("in", "and"). Words missed or added, and
+/// several words heard for one, aren't included.
+pub fn substitutions(text: &str, transcript: &str) -> Vec<(String, String)> {
+    let (expected, heard) = aligned_words(text, transcript);
+    let table = common_subsequences(&expected, &heard, &Allowances::default());
+    let mut found = Vec::new();
+    // The words between two matches, on each side.
+    let (mut missed, mut instead): (Vec<&String>, Vec<&String>) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let at_end = i == expected.len() || j == heard.len();
+        if at_end {
+            missed.extend(&expected[i..]);
+            instead.extend(&heard[j..]);
+        }
+        if at_end || expected[i] == heard[j] {
+            if let ([written], [other]) = (missed.as_slice(), instead.as_slice()) {
+                found.push((written.to_string(), other.to_string()));
+            }
+            missed.clear();
+            instead.clear();
+            if at_end {
+                return found;
+            }
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            missed.push(&expected[i]);
+            i += 1;
+        } else {
+            instead.push(&heard[j]);
+            j += 1;
+        }
     }
 }
 
@@ -120,9 +213,21 @@ pub fn contains_phrase(text: &str, phrase: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn none() -> Allowances {
+        Allowances::default()
+    }
+
+    fn allow(lines: &str) -> Allowances {
+        Allowances::parse(lines).unwrap()
+    }
+
+    fn pairs(found: &[(&str, &str)]) -> Vec<(String, String)> {
+        found.iter().map(|(written, heard)| (written.to_string(), heard.to_string())).collect()
+    }
+
     #[test]
     fn matching_ignores_case_punctuation_and_digit_style() {
-        let accuracy = compare("Chapter 12. Down the Rabbit-Hole!", "chapter twelve, down the rabbit hole");
+        let accuracy = compare("Chapter 12. Down the Rabbit-Hole!", "chapter twelve, down the rabbit hole", &none());
         assert_eq!(accuracy.recall, 1.0);
         assert_eq!(accuracy.extra, 0.0);
         assert!(accuracy.acceptable());
@@ -136,11 +241,11 @@ mod tests {
             ("This eBook is for the use of anyone", "this e-book is for the use of anyone"),
             ("a rose bud in the grub worm's way", "a rosebud in the grubworm's way"),
         ] {
-            let accuracy = compare(text, heard);
+            let accuracy = compare(text, heard, &none());
             assert_eq!((accuracy.recall, accuracy.extra), (1.0, 0.0), "{text} / {heard}");
         }
         // Joining is only forgiven when the joined word is really there.
-        assert!(compare("the quarter deck", "the quarter").recall < 1.0);
+        assert!(compare("the quarter deck", "the quarter", &none()).recall < 1.0);
     }
 
     #[test]
@@ -153,10 +258,69 @@ mod tests {
     #[test]
     fn nonsense_and_repeats_are_rejected() {
         let text = "the quick brown fox jumps over the lazy dog";
-        assert!(!compare(text, "in what trade setups and cost free workers").acceptable());
+        assert!(!compare(text, "in what trade setups and cost free workers", &none()).acceptable());
         let repeated = format!("{text} {text}");
-        let accuracy = compare(text, &repeated);
+        let accuracy = compare(text, &repeated, &none());
         assert_eq!(accuracy.recall, 1.0);
         assert!(!accuracy.acceptable());
+    }
+
+    #[test]
+    fn allowances_are_read_a_pair_a_line_and_normalised_like_the_words_compared() {
+        let allowances = allow("# Dad's accent\n\nIn = AND   # heard all through Moby-Dick\n  at=had\n7 = 'seven's'\n");
+        assert_eq!(allowances.len(), 3);
+        assert!(allowances.allows("in", "and"));
+        assert!(allowances.allows("at", "had"));
+        assert!(allowances.allows("seven", "seven's"));
+        assert_eq!(allow("# nothing yet\n\n").len(), 0);
+    }
+
+    #[test]
+    fn an_allowance_is_one_way() {
+        let allowances = allow("in = and");
+        assert!(allowances.allows("in", "and"));
+        assert!(!allowances.allows("and", "in"));
+    }
+
+    #[test]
+    fn a_bad_allowance_line_is_an_error_that_names_it() {
+        for (text, wanted) in [
+            ("in = and\nin and", "line 2: \"in and\" isn't in the form \"in = and\""),
+            ("# two words\n\nin = and so", "line 3: \"and so\" isn't one word"),
+            ("= and", "line 1: \"\" isn't one word"),
+            ("in = ...", "line 1: \"...\" isn't one word"),
+            ("In = in", "line 1: \"in\" is the same word on both sides"),
+        ] {
+            assert_eq!(Allowances::parse(text).unwrap_err(), wanted, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_allowed_mishearing_counts_as_heard() {
+        let text = "He sat in the boat in silence, and in the end he slept.";
+        let heard = "He sat and the boat and silence, and and the end he slept.";
+        assert!(!compare(text, heard, &none()).acceptable());
+        let allowed = compare(text, heard, &allow("in = and"));
+        assert_eq!((allowed.recall, allowed.extra), (1.0, 0.0));
+    }
+
+    #[test]
+    fn an_allowance_forgives_nothing_the_other_way_round_or_for_other_words() {
+        let allowances = allow("in = and");
+        assert!(compare("salt and pepper", "salt in pepper", &allowances).recall < 1.0);
+        assert!(compare("in the boat", "on the boat", &allowances).recall < 1.0);
+    }
+
+    #[test]
+    fn substitutions_are_one_word_heard_as_one_other() {
+        let found = substitutions(
+            "Call me Ishmael, in the boat, by the old harpooneer.",
+            "Call me Ishmael, and the boat, by the harpaneer. Amen",
+        );
+        // "old harpooneer." heard as "harpaneer. Amen" isn't one word for one.
+        assert_eq!(found, pairs(&[("in", "and")]));
+        let found = substitutions("Ye see the sea now, Bildad", "You see the see now, bill dad");
+        assert_eq!(found, pairs(&[("ye", "you"), ("sea", "see")]));
+        assert!(substitutions("all heard", "all heard").is_empty());
     }
 }
