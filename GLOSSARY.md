@@ -18,6 +18,8 @@
 
 **Floor:** a take's background level, measured as its quietest 5% of 50 ms frames. Takes below 6 seconds aren't judged on it, because they barely pause. A voice sample's floor is measured the same way on its first use, since takes copy it.
 
+**Floor ignoring digital silence:** the floor of a take's frames that aren't exact digital silence. Takes start with about 0.1 s of zeros, which in a short take are more than its quietest 5%, so the floor would be the zeros rather than the room tone. Assembly trims each take against this floor, keeping what rises well above it and the soft edges joined to that, so a voice's room tone doesn't lengthen the gaps.
+
 **Noise limit:** the highest floor a take can have and still pass, -55 dB unless `--noise-limit` sets it. The output directory saves it in `narration.txt`, so it's given once, and giving a new value replaces the saved one. It isn't a render setting: it decides which take is kept, not how a take sounds, so changing it keeps the audio already rendered.
 
 **Take policy:** how many takes of a chunk `book` and `retake` render and which they keep: the first good enough unless `--takes` asks for the best of a set number. What's good enough depends on the takes' goal: for `book` a take that passes, of up to 5, and for `retake` a flawless one with its phrases heard, of up to 6 new ones. Like the noise limit, it's saved in `narration.txt` and isn't a render setting.

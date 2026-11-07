@@ -114,11 +114,14 @@ pub fn plausible_length_at(characters: usize, seconds: f32, speed: f64) -> bool 
     plausible_length(characters, seconds * speed as f32)
 }
 
-/// Trimming takes frames this far above the take's floor as speech, or above
-/// `SPEECH_CAP_DB` if that's lower, so a take with no pause to measure a floor in
-/// keeps its speech. Room tone before the first word measured up to 16 dB above
-/// the floor in a noisy voice's takes, and first words rose 30 dB or more above it.
+/// Trimming takes frames this far above the take's floor as speech. Room tone
+/// before the first word measured up to 16 dB above the floor in a noisy voice's
+/// takes, and first words rose 30 dB or more above it.
 const SPEECH_ABOVE_FLOOR_DB: f32 = 20.0;
+/// The most that trimming's levels can be, whatever the floor: a take with no
+/// pause to measure a floor in has its quietest speech as its floor, and this
+/// keeps that speech. First words in three voices peaked at -8 to -15 dB within
+/// 0.3 s.
 const SPEECH_CAP_DB: f32 = -30.0;
 /// From the speech, trimming keeps frames this far above the floor, which catches
 /// a word's soft start and fading end but not the room tone around them.
@@ -126,39 +129,61 @@ const EDGE_ABOVE_FLOOR_DB: f32 = 6.0;
 /// Frames kept either side of that, for soft consonants quieter still: a first
 /// word's "f" measured within the floor's 6 dB for up to 50 ms.
 const EDGE_PAD_FRAMES: usize = 2;
+/// Frames at or below this linear level are digital silence: `to_db` reads them
+/// all as -100 dB.
+const DIGITAL_SILENCE: f32 = 1e-5;
 
-/// The floor of a take's sound, ignoring the digital silence takes start with,
-/// which in a short take is more than 5% of its frames.
-fn sound_floor(levels: &[f32]) -> Option<f32> {
-    let mut sound: Vec<f32> = levels.iter().copied().filter(|level| to_db(*level) > -100.0).collect();
+/// The floor of a take's frames that aren't digital silence. Takes start with
+/// about 0.1 s of it, which in a short take is more than the quietest 5% of its
+/// frames, so `measure`'s floor would be that rather than the room tone.
+fn floor_ignoring_digital_silence(levels: &[f32]) -> Option<f32> {
+    let mut sound: Vec<f32> = levels.iter().copied().filter(|level| *level > DIGITAL_SILENCE).collect();
     sound.sort_by(f32::total_cmp);
     floor_of_sorted(&sound).map(to_db)
 }
 
+/// The last frame of speech ending at `last`, given which frames are above the
+/// edge level. A last word ending in a stop, as in "watch", goes quiet for its
+/// closure and then releases, so straight after speech one frame below the edge
+/// level is stepped over if the next is above it. Only straight after speech: a
+/// fading end then reaches room tone, whose flicker this would step through.
+/// Only at the end, too: a first stop's closure is silence before any sound.
+fn speech_end(last: usize, above_edge: impl Fn(usize) -> bool) -> usize {
+    let mut end = last;
+    if !above_edge(end + 1) && above_edge(end + 2) {
+        end += 2;
+    }
+    while above_edge(end + 1) {
+        end += 1;
+    }
+    end
+}
+
 /// Removes leading and trailing silence, so gaps between chunks are consistent.
-/// Silence is judged against the take's own floor, so a voice with room tone
-/// loses it too; a clean take's floor is far below `SILENCE_DB`, which then
-/// decides as before.
+/// Speech is what rises `SPEECH_ABOVE_FLOOR_DB` above the take's floor, ignoring
+/// digital silence, and the trim keeps what joins it above `EDGE_ABOVE_FLOOR_DB`,
+/// plus `EDGE_PAD_FRAMES` either side. So a voice with room tone loses it too.
+/// Both levels are at least `SILENCE_DB`, so for a clean take, with a floor below
+/// about -75 dB, speech is what rises above it as before; the trim then keeps one
+/// more frame either side than it used to, and soft edges down to the floor + 6
+/// dB once the floor is above -61 dB.
 pub fn trim_silence(samples: &[f32], sample_rate: u32) -> &[f32] {
     let size = frame_size(sample_rate);
     let levels = frame_levels(samples, sample_rate);
-    let floor = sound_floor(&levels).unwrap_or(f32::NEG_INFINITY);
+    let floor = floor_ignoring_digital_silence(&levels).unwrap_or(f32::NEG_INFINITY);
+    // Capping the edge level as well as the speech level is deliberate: the edge
+    // must stay below the speech it extends from.
     let above_floor = |margin: f32| from_db((floor + margin).clamp(SILENCE_DB, SPEECH_CAP_DB));
     let speech = above_floor(SPEECH_ABOVE_FLOOR_DB);
     let edge = above_floor(EDGE_ABOVE_FLOOR_DB);
     let Some(mut first) = levels.iter().position(|level| *level > speech) else {
         return samples;
     };
-    let mut last = levels.iter().rposition(|level| *level > speech).unwrap_or(first);
+    let last = levels.iter().rposition(|level| *level > speech).unwrap_or(first);
     while first > 0 && levels[first - 1] > edge {
         first -= 1;
     }
-    // A last word ending in a stop, as in "watch", can dip for a frame before
-    // its release, so the end steps over a single quiet frame.
-    let edge_at = |frame: usize| levels.get(frame).is_some_and(|level| *level > edge);
-    while edge_at(last + 1) || edge_at(last + 2) {
-        last += 1;
-    }
+    let last = speech_end(last, |frame| levels.get(frame).is_some_and(|level| *level > edge));
     let start = first.saturating_sub(EDGE_PAD_FRAMES) * size;
     let end = ((last + 1 + EDGE_PAD_FRAMES) * size).min(samples.len());
     &samples[start..end]
@@ -233,6 +258,7 @@ mod tests {
         samples.extend(tone(1.0, 0.2));
         samples.extend(vec![0.0; 24_000]);
         let trimmed = trim_silence(&samples, 24_000);
+        // Two frames are kept either side, 4,800 samples; before, one was.
         assert!(trimmed.len() >= 24_000 && trimmed.len() < 30_000, "{}", trimmed.len());
     }
 
@@ -240,6 +266,8 @@ mod tests {
     fn noise(seconds: f32, db: f32) -> Vec<f32> {
         // Uniform noise from -1 to 1 has an RMS of 1/sqrt(3).
         let scale = from_db(db) * 3f32.sqrt();
+        // A linear congruential generator with the Numerical Recipes constants,
+        // from a fixed seed, so every run gets the same noise.
         let mut state = 12_345u32;
         (0..(24_000.0 * seconds) as usize)
             .map(|_| {
@@ -254,7 +282,16 @@ mod tests {
         let trimmed = trim_silence(samples, 24_000);
         let start = trimmed.as_ptr() as usize - samples.as_ptr() as usize;
         let start = start / std::mem::size_of::<f32>();
-        (start / 1_200, (start + trimmed.len()) / 1_200)
+        let size = frame_size(24_000);
+        (start / size, (start + trimmed.len()) / size)
+    }
+
+    /// A 900 Hz tone at `db`, like the squeak some takes start with.
+    fn squeak(seconds: f32, db: f32) -> Vec<f32> {
+        let amplitude = from_db(db) * 2f32.sqrt();
+        (0..(24_000.0 * seconds) as usize)
+            .map(|i| amplitude * (i as f32 * std::f32::consts::TAU * 900.0 / 24_000.0).sin())
+            .collect()
     }
 
     #[test]
@@ -279,6 +316,30 @@ mod tests {
         samples.extend(noise(0.5, -45.0));
         // Speech is frames 10 to 19, and the release frame 21.
         assert_eq!(trimmed_frames(&samples), (8, 24));
+    }
+
+    #[test]
+    fn trimming_stops_at_room_tone_after_a_fading_end() {
+        let mut samples = noise(0.5, -45.0);
+        samples.extend(tone(0.5, 0.2));
+        samples.extend(noise(0.05, -36.0));
+        samples.extend(noise(0.05, -45.0));
+        samples.extend(noise(0.05, -37.0));
+        samples.extend(noise(0.5, -45.0));
+        // Speech is frames 10 to 19, fading in 20; the flicker in 22 is room tone.
+        assert_eq!(trimmed_frames(&samples), (8, 23));
+    }
+
+    #[test]
+    fn trimming_drops_a_squeak_before_the_room_tone() {
+        let mut samples = vec![0.0; 2_400];
+        samples.extend(noise(0.1, -45.0));
+        samples.extend(squeak(0.2, -35.0));
+        samples.extend(noise(0.4, -45.0));
+        samples.extend(tone(0.5, 0.2));
+        samples.extend(noise(0.5, -45.0));
+        // The squeak is frames 4 to 7, 10 dB above the floor; the speech is 16 to 25.
+        assert_eq!(trimmed_frames(&samples), (14, 28));
     }
 
     #[test]
