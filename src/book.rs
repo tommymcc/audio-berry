@@ -44,17 +44,17 @@ impl Session {
     fn open(voice_sample: &Path, book: Book, out: &Path, speed: Option<f64>, given: KeepSettings) -> Result<Session> {
         let allowances = read_allowances_saying_so(voice_sample)?;
         let settled = store::settle(out, given)?;
-        let keep = *settled.keep();
-        let voice = Voice::load(voice_sample, Some(keep.noise_limit_db))?;
+        let rules = *settled.rules();
+        let voice = Voice::load(voice_sample, settled.sample_noise_limit())?;
         let store = settled.open(&book.title, &book.chunks(), voice.hash(), &RenderSettings::from_env(speed))?;
-        let standard = Standard::of(&keep, store.speed(), allowances);
-        Ok(Session { book, voice, store, standard, takes: keep.takes })
+        let standard = Standard::of(&rules, store.speed(), allowances);
+        Ok(Session { book, voice, store, standard, takes: rules.takes })
     }
 }
 
 /// The take's pitch range for the progress output, when ranked by it.
 fn pitch_range_note(standard: &Standard, verdict: &Verdict) -> String {
-    match (standard.pitch_target(), verdict.pitch_range) {
+    match (standard.pitch_range_target(), verdict.pitch_range) {
         (None, _) => String::new(),
         (Some(_), Some(range)) => format!(", pitch range {range:.1} st"),
         (Some(_), None) => ", pitch range unmeasured".into(),

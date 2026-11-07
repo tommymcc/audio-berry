@@ -28,6 +28,8 @@
 
 **Nearness:** how near a take's pitch range is to the target: the smaller of the two ratios between range and target, 1 when exact. It ranks in steps of 0.05, so takes in the same step are ranked by how they're heard. It only ranks takes that pass. Like the take policy, the target is saved in `narration.txt` and isn't a render setting.
 
+**Keep settings:** the noise limit, take policy and pitch range target: what decides which take of a chunk is kept, rather than how it sounds, so none of them is a render setting. Each one given replaces the one saved in `narration.txt`, and each one not given is the saved one, or its default in a new output directory. A run settles them before loading the voice, since the voice sample is judged against the noise limit.
+
 **Voice sample:** the recording a narration's voice is cloned from, such as `voices/me.wav`, with what's said in it in a `.txt` file beside it. `clean` makes one from a noisy recording.
 
 **Section:** a stretch of a recording, from one pause to another, that `sections` suggests making into a voice sample.

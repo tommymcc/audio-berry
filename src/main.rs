@@ -196,7 +196,7 @@ struct Takes {
 impl Takes {
     /// What decides which take is kept, with the noise limit given.
     fn keep(&self, noise_limit_db: Option<f32>) -> store::KeepSettings {
-        store::KeepSettings { noise_limit_db, takes: self.policy, pitch_range_st: self.pitch_range }
+        store::KeepSettings { noise_limit_db, takes: self.policy, pitch_range_target: self.pitch_range }
     }
 }
 
@@ -523,7 +523,7 @@ mod tests {
         let Ok(Command::Book { takes, model, .. }) = parse(&words) else { panic!() };
         let keep = takes.keep(model.noise_limit);
         assert_eq!(
-            (keep.pitch_range_st, keep.takes, keep.noise_limit_db),
+            (keep.pitch_range_target, keep.takes, keep.noise_limit_db),
             (Some(12.4), Some(takes::TakePolicy::BestOf(5)), Some(-50.0))
         );
         let Ok(Command::Retake { takes, .. }) = parse(&["retake", "v", "b", "o", "3.12", "--pitch-range", "9"]) else { panic!() };

@@ -3,7 +3,7 @@
 
 use crate::pitch;
 use crate::quality::{self, Quality};
-use crate::store::Keep;
+use crate::store::KeepRules;
 use crate::accuracy::{self, Accuracy, Allowances};
 use crate::takes::Judged;
 use any_tts::AudioSamples;
@@ -13,7 +13,7 @@ pub struct Standard {
     speed: f64,
     noise_limit_db: f32,
     /// The pitch range wanted, in semitones, if any; see `Verdict::rank`.
-    pitch_target: Option<f32>,
+    pitch_range_target: Option<f32>,
     allowances: Allowances,
 }
 
@@ -67,24 +67,26 @@ enum Aim {
 }
 
 impl Standard {
-    /// The standard of an output directory, from its noise limit and pitch range in
-    /// `keep` and the `speed` it narrates at, and of its voice, from the words that
-    /// voice may be heard saying as others.
-    pub fn of(keep: &Keep, speed: f64, allowances: Allowances) -> Standard {
-        Standard { speed, noise_limit_db: keep.noise_limit_db, pitch_target: keep.pitch_target, allowances }
+    /// The standard of an output directory, from the noise limit and pitch range
+    /// target in its `rules` and the `speed` it narrates at, and of its voice, from
+    /// the words that voice may be heard saying as others.
+    pub fn of(rules: &KeepRules, speed: f64, allowances: Allowances) -> Standard {
+        let KeepRules { noise_limit_db, pitch_range_target, .. } = *rules;
+        Standard { speed, noise_limit_db, pitch_range_target, allowances }
     }
 
-    /// The pitch range takes are ranked by nearness to, if any.
-    pub fn pitch_target(&self) -> Option<f32> {
-        self.pitch_target
+    /// The pitch range target takes are ranked by nearness to, if any.
+    pub fn pitch_range_target(&self) -> Option<f32> {
+        self.pitch_range_target
     }
 
     /// Measures a take of `text` for `goal`, given what was heard in it.
     pub fn judge(&self, goal: &Goal, text: &str, audio: &AudioSamples, transcript: &str) -> Verdict {
         let quality = quality::measure(&audio.samples, audio.sample_rate);
         let characters = text.chars().count();
-        let pitch_range = self.pitch_target.and_then(|_| pitch::range_semitones(&audio.samples, audio.sample_rate));
-        let nearness = match (pitch_range, self.pitch_target) {
+        let target = self.pitch_range_target;
+        let pitch_range = target.and_then(|_| pitch::range_semitones(&audio.samples, audio.sample_rate));
+        let nearness = match (pitch_range, target) {
             (Some(range), Some(target)) => pitch::nearness(range, target),
             _ => 0.0,
         };
@@ -210,7 +212,7 @@ mod tests {
     }
 
     fn standard(speed: f64) -> Standard {
-        Standard { speed, noise_limit_db: -55.0, pitch_target: None, allowances: Allowances::default() }
+        Standard { speed, noise_limit_db: -55.0, pitch_range_target: None, allowances: Allowances::default() }
     }
 
     const TEXT: &str = "The quick brown fox jumps over the lazy dog, again and again and again.";
@@ -307,7 +309,7 @@ mod tests {
         let hum = (0..96_000).map(|i| (i as f32 * std::f32::consts::TAU * 120.0 / 24_000.0).sin() * 0.3).collect();
         let audio = AudioSamples::new(hum, 24_000);
         assert_eq!(standard(1.0).judge(&Goal::Book, TEXT, &audio, TEXT).pitch_range, None);
-        let targeted = Standard { pitch_target: Some(12.4), ..standard(1.0) };
+        let targeted = Standard { pitch_range_target: Some(12.4), ..standard(1.0) };
         let verdict = targeted.judge(&Goal::Book, TEXT, &audio, TEXT);
         let range = verdict.pitch_range.unwrap();
         assert!(range < 0.5, "a steady hum is flat: {range}");
