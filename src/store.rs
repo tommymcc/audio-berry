@@ -82,27 +82,193 @@ fn read_manifest(out: &Path) -> Result<Option<Manifest>> {
     read_if_present(&out.join(MANIFEST))?.map(|text| Manifest::parse(&text)).transpose()
 }
 
-/// The keep settings given on the command line, each `None` when not given, so
-/// the output directory's saved one is used. `settle` turns them into the
-/// `KeepRules` a run follows. None of them is a render setting, so they can
-/// change without touching the audio.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct KeepSettings {
-    pub noise_limit_db: Option<f32>,
-    pub takes: Option<TakePolicy>,
-    /// In semitones.
-    pub pitch_range_target: Option<f32>,
+/// A setting saved in `narration.txt` that decides which take is kept. None is
+/// a render setting, so each can change without touching the audio. A run uses
+/// the one given, else the one saved, else `DEFAULT`, and saves a given one.
+pub trait KeepSetting {
+    type Value: Copy + PartialEq;
+    /// Its key in `narration.txt`.
+    const KEY: &'static str;
+    /// What a run uses with none given or saved.
+    const DEFAULT: Self::Value;
+    /// What `narration.txt` may hold, as the error for a bad line says.
+    fn valid() -> String;
+    /// Reads what `saved` wrote, if it's valid.
+    fn from_saved(text: &str) -> Option<Self::Value>;
+    /// How `narration.txt` saves `value`, or `None` to leave its line out.
+    fn saved(value: Self::Value) -> Option<String>;
+    /// How a note names `value`, or `None` for no value, which isn't noted.
+    fn shown(value: Self::Value) -> Option<String>;
+    /// The note that a run uses the value a note names `shown`.
+    fn using(shown: &str) -> String;
 }
 
-/// The keep settings a run follows, settled from those given and those saved, with
-/// defaults filled in: the noise limit takes must pass, the take policy, and the
-/// pitch range target that takes which pass are ranked by nearness to, if any.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct KeepRules {
-    pub noise_limit_db: f32,
-    pub takes: TakePolicy,
-    /// In semitones.
-    pub pitch_range_target: Option<f32>,
+/// The noise limit takes must pass, in dB.
+pub struct NoiseLimit;
+
+impl KeepSetting for NoiseLimit {
+    type Value = f32;
+    const KEY: &'static str = "noise_limit_db";
+    const DEFAULT: f32 = DEFAULT_NOISE_LIMIT_DB;
+    fn valid() -> String {
+        "a level from -100 to 0 dB".into()
+    }
+    fn from_saved(text: &str) -> Option<f32> {
+        valid_noise_limit(text)
+    }
+    fn saved(limit: f32) -> Option<String> {
+        Some(limit.to_string())
+    }
+    fn shown(limit: f32) -> Option<String> {
+        Some(format!("{limit} dB"))
+    }
+    fn using(shown: &str) -> String {
+        format!("Noise limit: {shown}")
+    }
+}
+
+/// The take policy.
+pub struct Takes;
+
+impl KeepSetting for Takes {
+    type Value = TakePolicy;
+    const KEY: &'static str = "takes";
+    const DEFAULT: TakePolicy = TakePolicy::FirstPassing;
+    fn valid() -> String {
+        format!("first-passing or best-of-{} to best-of-{}", TAKES_RANGE.start(), TAKES_RANGE.end())
+    }
+    fn from_saved(text: &str) -> Option<TakePolicy> {
+        TakePolicy::from_saved(text)
+    }
+    fn saved(policy: TakePolicy) -> Option<String> {
+        Some(policy.saved())
+    }
+    fn shown(policy: TakePolicy) -> Option<String> {
+        Some(policy.to_string())
+    }
+    fn using(shown: &str) -> String {
+        format!("Takes: keeping {shown}")
+    }
+}
+
+/// The pitch range target in semitones that takes which pass are ranked by
+/// nearness to, if any.
+pub struct PitchRange;
+
+impl KeepSetting for PitchRange {
+    type Value = Option<f32>;
+    const KEY: &'static str = "pitch_range_st";
+    const DEFAULT: Option<f32> = None;
+    fn valid() -> String {
+        format!("a range from {} to {} semitones", PITCH_RANGE_LIMITS.start(), PITCH_RANGE_LIMITS.end())
+    }
+    fn from_saved(text: &str) -> Option<Option<f32>> {
+        valid_pitch_range(text).map(Some)
+    }
+    fn saved(range: Option<f32>) -> Option<String> {
+        range.map(|range| range.to_string())
+    }
+    fn shown(range: Option<f32>) -> Option<String> {
+        Self::saved(range)
+    }
+    fn using(shown: &str) -> String {
+        format!("Pitch range: aiming for {shown} semitones")
+    }
+}
+
+/// Declares the keep settings, each as `field: KeepSetting`, in the order
+/// `narration.txt` saves them: `KeepSettings` and `KeepRules` get a field for
+/// each, and `KeepRules` reads, saves and settles each.
+macro_rules! keep_settings {
+    ($($field:ident: $setting:ident,)*) => {
+        /// The keep settings given on the command line, each `None` when not
+        /// given, so the output directory's saved one is used. `settle` turns
+        /// them into the `KeepRules` a run follows.
+        #[derive(Clone, Copy, Debug, Default, PartialEq)]
+        pub struct KeepSettings {
+            $(#[doc = concat!("See `", stringify!($setting), "`.")]
+            pub $field: Option<<$setting as KeepSetting>::Value>,)*
+        }
+
+        /// The keep settings a run follows, settled from those given and those
+        /// saved, with defaults filled in.
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        pub struct KeepRules {
+            $(#[doc = concat!("See `", stringify!($setting), "`.")]
+            pub $field: <$setting as KeepSetting>::Value,)*
+        }
+
+        impl KeepRules {
+            /// Reads each setting from its line, which `line` finds, with the
+            /// default for one that's missing.
+            fn parse(line: impl Fn(&str) -> Option<String>) -> Result<Self> {
+                Ok(Self { $($field: parse_setting::<$setting>(line($setting::KEY))?,)* })
+            }
+
+            /// Appends the lines `narration.txt` saves the settings as to `text`.
+            fn render(&self, text: &mut String) {
+                $(render_setting::<$setting>(self.$field, text);)*
+            }
+
+            /// Settles each setting from the one given and the one `saved` in the
+            /// `narration.txt` at `path`, if there is one.
+            fn settle(saved: Option<&Self>, given: KeepSettings, path: &Path, changes: &mut Changes) -> Self {
+                Self { $($field: settle_setting::<$setting>(saved.map(|saved| saved.$field), given.$field, path, changes),)* }
+            }
+        }
+    };
+}
+
+keep_settings! {
+    noise_limit_db: NoiseLimit,
+    takes: Takes,
+    pitch_range_target: PitchRange,
+}
+
+fn parse_setting<S: KeepSetting>(saved: Option<String>) -> Result<S::Value> {
+    let Some(text) = saved else { return Ok(S::DEFAULT) };
+    S::from_saved(&text).ok_or_else(|| {
+        eyre!("{MANIFEST} has {}={text}, which isn't {}. Correct or delete that line", S::KEY, S::valid())
+    })
+}
+
+fn render_setting<S: KeepSetting>(value: S::Value, text: &mut String) {
+    if let Some(saved) = S::saved(value) {
+        text.push_str(&format!("{}={saved}\n", S::KEY));
+    }
+}
+
+/// What settling the keep settings found to save and say.
+#[derive(Default)]
+struct Changes {
+    /// Whether to rewrite an existing `narration.txt` now. A new output
+    /// directory saves its file with the first take instead.
+    save_now: bool,
+    /// What the run will use.
+    notes: Vec<String>,
+}
+
+/// A given setting wins, and is saved if it differs from the one `saved` in the
+/// `narration.txt` at `path`; otherwise the saved one is used, or the default
+/// with none saved. Notes a value given, or saved and not the default.
+fn settle_setting<S: KeepSetting>(
+    saved: Option<S::Value>,
+    given: Option<S::Value>,
+    path: &Path,
+    changes: &mut Changes,
+) -> S::Value {
+    let using = |value| S::shown(value).map(|shown| S::using(&shown));
+    let (value, note) = match (saved, given) {
+        (None, given) => (given.unwrap_or(S::DEFAULT), given.and_then(using)),
+        (Some(old), Some(new)) if old != new => {
+            changes.save_now = true;
+            let change = S::shown(old).map_or("now saved".into(), |old| format!("replacing {old}"));
+            (new, using(new).map(|note| format!("{note}, {change} in {}", path.display())))
+        }
+        (Some(old), given) => (old, (given.is_some() || old != S::DEFAULT).then(|| using(old)).flatten()),
+    };
+    changes.notes.extend(note);
+    value
 }
 
 /// An output directory whose `KeepRules` are settled but which isn't open yet,
@@ -112,36 +278,24 @@ pub struct SettledDir {
     out: PathBuf,
     saved: Option<Manifest>,
     rules: KeepRules,
-    /// What `narration.txt` should hold for the noise limit: `None` in one saved
-    /// before limits were, until a limit is given.
-    saved_noise_limit: Option<f32>,
     /// The noise limit given, else the one saved, else `None` for the default.
     sample_noise_limit: Option<f32>,
-    /// Whether to rewrite an existing `narration.txt` when opened.
-    save_now: bool,
-    /// What the run will use, printed when opened.
-    notes: Vec<String>,
+    changes: Changes,
 }
 
 /// Settles the keep settings for a run in `out` from those `given` and those
 /// `narration.txt` saved there, reading it once, so a bad line in it fails here.
 pub fn settle(out: &Path, given: KeepSettings) -> Result<SettledDir> {
     let saved = read_manifest(out)?;
-    let noise_limit = settle_noise_limit(saved.as_ref(), given.noise_limit_db, out);
-    let takes = settle_takes(saved.as_ref(), given.takes, out);
-    let pitch_range = settle_pitch_range(saved.as_ref(), given.pitch_range_target, out);
+    let saved_rules = saved.as_ref().map(|saved| &saved.keep);
+    let mut changes = Changes::default();
+    let rules = KeepRules::settle(saved_rules, given, &out.join(MANIFEST), &mut changes);
     Ok(SettledDir {
         out: out.to_path_buf(),
-        sample_noise_limit: given.noise_limit_db.or(saved.as_ref().and_then(|saved| saved.noise_limit_db)),
+        sample_noise_limit: given.noise_limit_db.or(saved_rules.map(|saved| saved.noise_limit_db)),
         saved,
-        rules: KeepRules {
-            noise_limit_db: noise_limit.value.unwrap_or(DEFAULT_NOISE_LIMIT_DB),
-            takes: takes.value,
-            pitch_range_target: pitch_range.value,
-        },
-        saved_noise_limit: noise_limit.value,
-        save_now: noise_limit.save_now || takes.save_now || pitch_range.save_now,
-        notes: [noise_limit.note, takes.note, pitch_range.note].into_iter().flatten().collect(),
+        rules,
+        changes,
     })
 }
 
@@ -175,16 +329,14 @@ impl SettledDir {
             voice: format!("{voice:x}"),
             precision: render.precision.clone(),
             speed,
-            noise_limit_db: self.saved_noise_limit,
-            takes: self.rules.takes,
-            pitch_range_target: self.rules.pitch_range_target,
+            keep: self.rules,
         };
         let store = NarrationStore { out: self.out, chunks, speed, manifest };
         store.require_same(self.saved)?;
-        if self.save_now {
+        if self.changes.save_now {
             store.write_manifest()?;
         }
-        for note in &self.notes {
+        for note in &self.changes.notes {
             eprintln!("{note}");
         }
         Ok(store)
@@ -213,16 +365,7 @@ struct Manifest {
     voice: String,
     precision: String,
     speed: f64,
-    /// Not a render setting: it only decides which take is kept, so it can
-    /// change without touching the audio. `None` in output directories saved
-    /// before it was, until a limit is given.
-    noise_limit_db: Option<f32>,
-    /// Not a render setting either: it decides which take is kept. Output
-    /// directories saved before it was keep the first take that passes, as they did.
-    takes: TakePolicy,
-    /// Not a render setting either. `None` ranks takes without one, as output
-    /// directories saved before it was did.
-    pitch_range_target: Option<f32>,
+    keep: KeepRules,
 }
 
 impl Manifest {
@@ -231,48 +374,21 @@ impl Manifest {
             "book={}\nvoice={}\nprecision={}\nspeed={}\n",
             self.book, self.voice, self.precision, self.speed
         );
-        if let Some(limit) = self.noise_limit_db {
-            text.push_str(&format!("noise_limit_db={limit}\n"));
-        }
-        text.push_str(&format!("takes={}\n", self.takes.saved()));
-        if let Some(range) = self.pitch_range_target {
-            text.push_str(&format!("pitch_range_st={range}\n"));
-        }
+        self.keep.render(&mut text);
         text
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let field = |name: &str| {
-            text.lines()
-                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
-                .map(str::to_string)
-                .ok_or_else(|| eyre!("{MANIFEST} has no {name}"))
+        let line = |name: &str| {
+            text.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix('=')).map(str::to_string)
         };
+        let field = |name: &str| line(name).ok_or_else(|| eyre!("{MANIFEST} has no {name}"));
         Ok(Self {
             book: field("book")?,
             voice: field("voice")?,
             precision: field("precision")?,
-            speed: field("speed").map_or(Ok(NORMAL_SPEED), |speed| speed.parse())?,
-            noise_limit_db: match field("noise_limit_db") {
-                Ok(value) => Some(valid_noise_limit(&value).ok_or_else(|| {
-                    eyre!("{MANIFEST} has noise_limit_db={value}, which isn't a level from -100 to 0 dB. Correct or delete that line")
-                })?),
-                Err(_) => None,
-            },
-            takes: match field("takes") {
-                Ok(value) => TakePolicy::from_saved(&value).ok_or_else(|| {
-                    let (fewest, most) = (TAKES_RANGE.start(), TAKES_RANGE.end());
-                    eyre!("{MANIFEST} has takes={value}, which isn't first-passing or best-of-{fewest} to best-of-{most}. Correct or delete that line")
-                })?,
-                Err(_) => TakePolicy::default(),
-            },
-            pitch_range_target: match field("pitch_range_st") {
-                Ok(value) => Some(valid_pitch_range(&value).ok_or_else(|| {
-                    let (lowest, highest) = (PITCH_RANGE_LIMITS.start(), PITCH_RANGE_LIMITS.end());
-                    eyre!("{MANIFEST} has pitch_range_st={value}, which isn't a range from {lowest} to {highest} semitones. Correct or delete that line")
-                })?),
-                Err(_) => None,
-            },
+            speed: line("speed").map_or(Ok(NORMAL_SPEED), |speed| speed.parse())?,
+            keep: KeepRules::parse(line)?,
         })
     }
 
@@ -300,99 +416,6 @@ pub struct NarrationStore {
     chunks: Vec<Chunk>,
     speed: f64,
     manifest: Manifest,
-}
-
-/// A setting that decides which take is kept, as a run settles it from the one
-/// given and the one saved in `narration.txt`.
-struct Resolved<T> {
-    value: T,
-    /// Whether to rewrite an existing `narration.txt` now. A new output
-    /// directory saves its file with the first take instead.
-    save_now: bool,
-    note: Option<String>,
-}
-
-/// How a setting given on the command line compares with the one saved.
-enum Change<T> {
-    /// A new output directory, with what was given, if anything.
-    New { given: Option<T> },
-    /// Given, and different from the saved setting, which it replaces.
-    Replacing { old: T, new: T },
-    /// The saved setting, whether or not it was given again.
-    Kept { old: T, given: bool },
-}
-
-impl<T: PartialEq> Resolved<T> {
-    /// A given setting wins and is saved; otherwise the saved one is used, or
-    /// `default` in a new output directory. `note` says what the run will use.
-    fn settle(saved: Option<T>, given: Option<T>, default: T, note: impl FnOnce(&Change<T>) -> Option<String>) -> Self {
-        let change = match (saved, given) {
-            (None, given) => Change::New { given },
-            (Some(old), Some(new)) if old != new => Change::Replacing { old, new },
-            (Some(old), given) => Change::Kept { old, given: given.is_some() },
-        };
-        let note = note(&change);
-        let (value, save_now) = match change {
-            Change::New { given } => (given.unwrap_or(default), false),
-            Change::Replacing { new, .. } => (new, true),
-            Change::Kept { old, .. } => (old, false),
-        };
-        Resolved { value, save_now, note }
-    }
-}
-
-/// What `narration.txt` should hold for the noise limit, from which the run's
-/// limit follows, with `None` for the default. A given limit wins and is saved;
-/// otherwise the saved one is used. An output directory saved before limits were
-/// gets the default without it being written, because it may have been rendered
-/// with a limit that wasn't saved.
-fn settle_noise_limit(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> Resolved<Option<f32>> {
-    let path = out.join(MANIFEST);
-    let saved = saved.map(|saved| saved.noise_limit_db);
-    Resolved::settle(saved, given.map(Some), Some(DEFAULT_NOISE_LIMIT_DB), |change| match *change {
-        Change::New { given } => given.flatten().map(|limit| format!("Noise limit: {limit} dB")),
-        Change::Replacing { old, new } => new.map(|new| match old {
-            Some(old) => format!("Noise limit: {new} dB, replacing {old} dB in {}", path.display()),
-            None => format!("Noise limit: {new} dB, now saved in {}", path.display()),
-        }),
-        Change::Kept { old: Some(old), given } => {
-            (given || old != DEFAULT_NOISE_LIMIT_DB).then(|| format!("Noise limit: {old} dB"))
-        }
-        Change::Kept { old: None, .. } => Some(format!(
-            "Noise limit: {DEFAULT_NOISE_LIMIT_DB} dB. {} has no saved limit, so if this output directory \
-             was rendered with --noise-limit, give it once more to save it.",
-            path.display(),
-        )),
-    })
-}
-
-/// The take policy a run uses: the default in a new output directory or one
-/// saved before policies were.
-fn settle_takes(saved: Option<&Manifest>, given: Option<TakePolicy>, out: &Path) -> Resolved<TakePolicy> {
-    let saved = saved.map(|saved| saved.takes);
-    Resolved::settle(saved, given, TakePolicy::default(), |change| match *change {
-        Change::New { given } => given.map(|policy| format!("Takes: keeping {policy}")),
-        Change::Replacing { old, new } => {
-            Some(format!("Takes: keeping {new}, replacing {old} in {}", out.join(MANIFEST).display()))
-        }
-        Change::Kept { old, given } => (given || old != TakePolicy::default()).then(|| format!("Takes: keeping {old}")),
-    })
-}
-
-/// The pitch range target a run uses: none in a new output directory or one
-/// saved before targets were.
-fn settle_pitch_range(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> Resolved<Option<f32>> {
-    let aiming = |range: f32| format!("Pitch range: aiming for {range} semitones");
-    let path = out.join(MANIFEST);
-    let saved = saved.map(|saved| saved.pitch_range_target);
-    Resolved::settle(saved, given.map(Some), None, |change| match *change {
-        Change::New { given } => given.flatten().map(aiming),
-        Change::Replacing { old, new } => new.map(|new| match old {
-            Some(old) => format!("{}, replacing {old} in {}", aiming(new), path.display()),
-            None => format!("{}, now saved in {}", aiming(new), path.display()),
-        }),
-        Change::Kept { old, .. } => old.map(aiming),
-    })
 }
 
 /// Numbers the chunks and keys each by its text, voice and speed.
@@ -964,16 +987,13 @@ mod tests {
         *settle(dir.path(), given).unwrap().rules()
     }
 
-    fn given_limit(noise_limit: Option<f32>) -> KeepSettings {
-        KeepSettings { noise_limit_db: noise_limit, ..KeepSettings::default() }
-    }
-
-    fn given_takes(takes: Option<TakePolicy>) -> KeepSettings {
-        KeepSettings { takes, ..KeepSettings::default() }
-    }
-
-    fn given_pitch_range(range: Option<f32>) -> KeepSettings {
-        KeepSettings { pitch_range_target: range, ..KeepSettings::default() }
+    /// Every rule in `rules`, given.
+    fn given(rules: KeepRules) -> KeepSettings {
+        KeepSettings {
+            noise_limit_db: Some(rules.noise_limit_db),
+            takes: Some(rules.takes),
+            pitch_range_target: Some(rules.pitch_range_target),
+        }
     }
 
     /// The error from settling the keep settings in `dir`.
@@ -981,80 +1001,74 @@ mod tests {
         settle(dir.path(), KeepSettings::default()).err().unwrap().to_string()
     }
 
-    fn saved_limit(dir: &TempDir) -> Option<String> {
-        let text = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        text.lines().find_map(|line| line.strip_prefix("noise_limit_db=")).map(str::to_string)
+    /// The lines of `dir`'s `narration.txt` after book, voice, precision and speed.
+    fn saved_lines(dir: &TempDir) -> Vec<String> {
+        fs::read_to_string(dir.join(MANIFEST)).unwrap().lines().skip(4).map(str::to_string).collect()
+    }
+
+    const DEFAULT_RULES: KeepRules =
+        KeepRules { noise_limit_db: DEFAULT_NOISE_LIMIT_DB, takes: TakePolicy::FirstPassing, pitch_range_target: None };
+    const FIRST: KeepRules =
+        KeepRules { noise_limit_db: -50.0, takes: TakePolicy::BestOf(4), pitch_range_target: Some(12.4) };
+    const FIRST_LINES: [&str; 3] = ["noise_limit_db=-50", "takes=best-of-4", "pitch_range_st=12.4"];
+    const SECOND: KeepRules =
+        KeepRules { noise_limit_db: -48.5, takes: TakePolicy::BestOf(2), pitch_range_target: Some(10.0) };
+    const SECOND_LINES: [&str; 3] = ["noise_limit_db=-48.5", "takes=best-of-2", "pitch_range_st=10"];
+
+    #[test]
+    fn a_given_setting_wins_then_the_saved_one_then_the_default() {
+        let dir = TempDir::new("store-keep-for");
+        assert_eq!(rules(&dir, KeepSettings::default()), DEFAULT_RULES);
+        assert_eq!(rules(&dir, given(FIRST)), FIRST);
+        render_keeping(&dir, given(FIRST));
+        assert_eq!(rules(&dir, KeepSettings::default()), FIRST);
+        assert_eq!(rules(&dir, given(SECOND)), SECOND);
+        assert_eq!(saved_lines(&dir), FIRST_LINES, "only opening saves new settings");
+        open_keeping(&dir, KeepSettings::default());
+        assert_eq!(saved_lines(&dir), FIRST_LINES);
     }
 
     #[test]
-    fn the_noise_limit_for_a_run_is_the_given_one_then_the_saved_one() {
-        let dir = TempDir::new("store-limit-for");
-        let limit = |given| rules(&dir, given_limit(given)).noise_limit_db;
-        assert_eq!(limit(None), DEFAULT_NOISE_LIMIT_DB);
-        assert_eq!(limit(Some(-50.0)), -50.0);
-        render_keeping(&dir, given_limit(Some(-50.0)));
-        assert_eq!(limit(None), -50.0);
-        assert_eq!(limit(Some(-60.0)), -60.0);
-        assert_eq!(saved_limit(&dir).as_deref(), Some("-50"), "only opening saves a new limit");
-    }
-
-    #[test]
-    fn the_voice_sample_is_judged_against_the_given_or_saved_limit_or_the_default() {
-        let dir = TempDir::new("store-limit-sample");
-        let limit = |given| settle(dir.path(), given_limit(given)).unwrap().sample_noise_limit();
-        assert_eq!(limit(None), None, "so its advice can name the default");
-        assert_eq!(limit(Some(-50.0)), Some(-50.0));
-        render_keeping(&dir, given_limit(None));
-        assert_eq!(limit(None), Some(DEFAULT_NOISE_LIMIT_DB));
-        assert_eq!(limit(Some(-60.0)), Some(-60.0));
-        let older = folder_without_a_saved_limit("limit-sample-older");
-        assert_eq!(settle(older.path(), given_limit(None)).unwrap().sample_noise_limit(), None);
-    }
-
-    #[test]
-    fn the_noise_limit_is_saved_with_the_first_take() {
-        let dir = TempDir::new("store-limit-first");
-        assert_eq!(rules(&dir, given_limit(Some(-50.0))).noise_limit_db, -50.0);
-        let store = open_keeping(&dir, given_limit(Some(-50.0)));
+    fn the_settings_are_saved_with_the_first_take() {
+        let dir = TempDir::new("store-keep-first");
+        let store = open_keeping(&dir, given(FIRST));
         assert!(!dir.join(MANIFEST).exists());
         store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
-        assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
+        assert_eq!(saved_lines(&dir), FIRST_LINES);
     }
 
     #[test]
-    fn the_default_noise_limit_is_saved_when_none_is_given() {
-        let dir = TempDir::new("store-limit-default");
-        render_keeping(&dir, given_limit(None));
-        assert_eq!(saved_limit(&dir).as_deref(), Some("-55"));
+    fn the_defaults_are_saved_when_none_are_given_and_no_pitch_range_target() {
+        let dir = TempDir::new("store-keep-default");
+        render_keeping(&dir, KeepSettings::default());
+        assert_eq!(saved_lines(&dir), ["noise_limit_db=-55", "takes=first-passing"]);
+        assert_eq!(rules(&dir, KeepSettings::default()), DEFAULT_RULES);
     }
 
     #[test]
-    fn the_saved_noise_limit_is_used_when_none_is_given() {
-        let dir = TempDir::new("store-limit-reused");
-        render_keeping(&dir, given_limit(Some(-50.0)));
-        open_keeping(&dir, given_limit(None));
-        assert_eq!(rules(&dir, given_limit(None)).noise_limit_db, -50.0);
-        assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
+    fn a_new_setting_replaces_only_its_saved_line_and_keeps_the_audio() {
+        let changes = [
+            KeepRules { noise_limit_db: SECOND.noise_limit_db, ..FIRST },
+            KeepRules { takes: SECOND.takes, ..FIRST },
+            KeepRules { pitch_range_target: SECOND.pitch_range_target, ..FIRST },
+        ];
+        for (index, changed) in changes.into_iter().enumerate() {
+            let dir = TempDir::new(&format!("store-keep-changed-{index}"));
+            render_keeping(&dir, given(FIRST));
+            let before = fs::read_to_string(dir.join(MANIFEST)).unwrap();
+            let store = open_keeping(&dir, given(changed));
+            assert!(store.has_audio(&store.chunks()[0]), "the cached take should still be found");
+            assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "026926e6f4d06f3e.wav");
+            let after = fs::read_to_string(dir.join(MANIFEST)).unwrap();
+            assert_eq!(before.replace(FIRST_LINES[index], SECOND_LINES[index]), after);
+            assert_eq!(rules(&dir, KeepSettings::default()), changed);
+        }
     }
 
-    #[test]
-    fn a_new_noise_limit_replaces_the_saved_one_and_keeps_the_audio() {
-        let dir = TempDir::new("store-limit-changed");
-        render_keeping(&dir, given_limit(Some(-50.0)));
-        let before = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        let store = open_keeping(&dir, given_limit(Some(-48.5)));
-        assert!(store.has_audio(&store.chunks()[0]), "the cached take should still be found");
-        assert_eq!(store.audio_path(&store.chunks()[0]).file_name().unwrap(), "026926e6f4d06f3e.wav");
-        assert_eq!(saved_limit(&dir).as_deref(), Some("-48.5"));
-        let after = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        assert_eq!(before.replace("noise_limit_db=-50", "noise_limit_db=-48.5"), after);
-        assert_eq!(rules(&dir, given_limit(None)).noise_limit_db, -48.5);
-    }
-
-    /// A `narration.txt` as saved before the noise limit was.
+    /// A `narration.txt` with none of the keep settings.
     const OLDER_MANIFEST: &str = "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n";
 
-    fn folder_without_a_saved_limit(name: &str) -> TempDir {
+    fn folder_without_saved_settings(name: &str) -> TempDir {
         let dir = TempDir::new(name);
         fs::create_dir_all(dir.join("chunks")).unwrap();
         fs::write(dir.join(MANIFEST), OLDER_MANIFEST).unwrap();
@@ -1062,179 +1076,92 @@ mod tests {
     }
 
     #[test]
-    fn an_older_folder_uses_the_default_without_saving_it() {
-        // It may have been rendered with a limit that wasn't saved, so writing the
-        // default would quietly judge its takes against the wrong one.
-        let dir = folder_without_a_saved_limit("limit-older");
-        assert_eq!(rules(&dir, given_limit(None)).noise_limit_db, DEFAULT_NOISE_LIMIT_DB);
-        open_keeping(&dir, given_limit(None));
+    fn a_folder_without_saved_settings_uses_the_defaults_until_some_are_given() {
+        let dir = folder_without_saved_settings("keep-older");
+        assert_eq!(rules(&dir, KeepSettings::default()), DEFAULT_RULES);
+        open_keeping(&dir, KeepSettings::default());
         assert_eq!(fs::read_to_string(dir.join(MANIFEST)).unwrap(), OLDER_MANIFEST);
-        let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), None, dir.path());
-        assert!(settled.note.unwrap().contains("give it once"));
+        open_keeping(&dir, given(FIRST));
+        assert_eq!(saved_lines(&dir), FIRST_LINES);
+        assert_eq!(rules(&dir, KeepSettings::default()), FIRST);
     }
 
     #[test]
-    fn an_older_folder_saves_a_limit_when_one_is_given() {
-        let dir = folder_without_a_saved_limit("limit-older-new");
-        open_keeping(&dir, given_limit(Some(-50.0)));
-        assert_eq!(saved_limit(&dir).as_deref(), Some("-50"));
-        assert_eq!(rules(&dir, given_limit(None)).noise_limit_db, -50.0);
-        let settled = settle_noise_limit(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), Some(-50.0), dir.path());
-        let note = settled.note.unwrap();
-        assert!(note.contains("saved in") && !note.contains("replacing"), "{note}");
-    }
-
-    #[test]
-    fn the_note_names_the_limit_being_replaced() {
-        let saved = Manifest::parse(&format!("{OLDER_MANIFEST}noise_limit_db=-50\n")).unwrap();
-        let settled = settle_noise_limit(Some(&saved), Some(-48.0), Path::new("out"));
-        assert!(settled.note.unwrap().contains("replacing -50 dB"));
-        let unchanged = settle_noise_limit(Some(&saved), Some(-50.0), Path::new("out"));
-        assert!(!unchanged.save_now);
-    }
-
-    #[test]
-    fn a_bad_saved_noise_limit_is_an_error_that_says_how_to_fix_it() {
-        let dir = folder_without_a_saved_limit("limit-bad");
-        fs::write(dir.join(MANIFEST), format!("{OLDER_MANIFEST}noise_limit_db=loud\n")).unwrap();
-        let error = settle_error(&dir);
-        assert!(error.contains("noise_limit_db=loud") && error.contains("delete that line"), "{error}");
-    }
-
-    fn saved_takes(dir: &TempDir) -> Option<String> {
-        let text = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        text.lines().find_map(|line| line.strip_prefix("takes=")).map(str::to_string)
-    }
-
-    #[test]
-    fn the_take_policy_is_saved_with_the_first_take() {
-        let dir = TempDir::new("store-takes-first");
-        let best_of_3 = given_takes(Some(TakePolicy::BestOf(3)));
-        assert_eq!(rules(&dir, best_of_3).takes, TakePolicy::BestOf(3));
-        let store = open_keeping(&dir, best_of_3);
-        assert!(!dir.join(MANIFEST).exists());
-        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
-        assert_eq!(saved_takes(&dir).as_deref(), Some("best-of-3"));
-    }
-
-    #[test]
-    fn the_default_take_policy_is_saved_when_none_is_given() {
-        let dir = TempDir::new("store-takes-default");
-        render_keeping(&dir, given_takes(None));
-        assert_eq!(saved_takes(&dir).as_deref(), Some("first-passing"));
-        assert_eq!(rules(&dir, given_takes(None)).takes, TakePolicy::FirstPassing);
-    }
-
-    #[test]
-    fn the_saved_take_policy_is_used_when_none_is_given() {
-        let dir = TempDir::new("store-takes-reused");
-        render_keeping(&dir, given_takes(Some(TakePolicy::BestOf(4))));
-        open_keeping(&dir, given_takes(None));
-        assert_eq!(rules(&dir, given_takes(None)).takes, TakePolicy::BestOf(4));
-        assert_eq!(saved_takes(&dir).as_deref(), Some("best-of-4"));
-    }
-
-    #[test]
-    fn a_new_take_policy_replaces_the_saved_one_and_keeps_the_audio() {
-        let dir = TempDir::new("store-takes-changed");
-        render_keeping(&dir, given_takes(Some(TakePolicy::BestOf(4))));
-        let before = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        let store = open_keeping(&dir, given_takes(Some(TakePolicy::BestOf(2))));
-        assert!(store.has_audio(&store.chunks()[0]), "the cached take should still be found");
-        let after = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        assert_eq!(before.replace("takes=best-of-4", "takes=best-of-2"), after);
-        assert_eq!(rules(&dir, given_takes(None)).takes, TakePolicy::BestOf(2));
-        let settled = settle_takes(Some(&Manifest::parse(&before).unwrap()), Some(TakePolicy::BestOf(2)), dir.path());
-        assert!(settled.note.unwrap().contains("replacing the best of 4"));
-    }
-
-    #[test]
-    fn an_older_folder_keeps_the_first_take_that_passes() {
-        let dir = folder_without_a_saved_limit("takes-older");
-        assert_eq!(rules(&dir, given_takes(None)).takes, TakePolicy::FirstPassing);
-        open_keeping(&dir, given_takes(None));
-        assert_eq!(fs::read_to_string(dir.join(MANIFEST)).unwrap(), OLDER_MANIFEST);
-        open_keeping(&dir, given_takes(Some(TakePolicy::BestOf(3))));
-        assert_eq!(saved_takes(&dir).as_deref(), Some("best-of-3"));
-        assert_eq!(rules(&dir, given_takes(None)).takes, TakePolicy::BestOf(3));
-    }
-
-    #[test]
-    fn a_bad_saved_take_policy_is_an_error_that_says_how_to_fix_it() {
-        let dir = folder_without_a_saved_limit("takes-bad");
-        fs::write(dir.join(MANIFEST), format!("{OLDER_MANIFEST}takes=best-of-50\n")).unwrap();
-        let error = settle_error(&dir);
-        assert!(error.contains("takes=best-of-50") && error.contains("delete that line"), "{error}");
-    }
-
-    fn saved_pitch_range(dir: &TempDir) -> Option<String> {
-        let text = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        text.lines().find_map(|line| line.strip_prefix("pitch_range_st=")).map(str::to_string)
-    }
-
-    #[test]
-    fn the_pitch_range_target_is_saved_with_the_first_take() {
-        let dir = TempDir::new("store-pitch-first");
-        assert_eq!(rules(&dir, given_pitch_range(Some(12.4))).pitch_range_target, Some(12.4));
-        let store = open_keeping(&dir, given_pitch_range(Some(12.4)));
-        assert!(!dir.join(MANIFEST).exists());
-        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
-        assert_eq!(saved_pitch_range(&dir).as_deref(), Some("12.4"));
-        assert_eq!(rules(&dir, given_pitch_range(None)).pitch_range_target, Some(12.4));
-    }
-
-    #[test]
-    fn no_pitch_range_target_is_saved_when_none_is_given() {
-        let dir = TempDir::new("store-pitch-none");
-        render_keeping(&dir, given_pitch_range(None));
-        assert_eq!(saved_pitch_range(&dir), None);
-        assert_eq!(rules(&dir, given_pitch_range(None)).pitch_range_target, None);
-    }
-
-    #[test]
-    fn a_new_pitch_range_target_replaces_the_saved_one_and_keeps_the_audio() {
-        let dir = TempDir::new("store-pitch-changed");
-        render_keeping(&dir, given_pitch_range(Some(12.4)));
-        let before = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        let store = open_keeping(&dir, given_pitch_range(Some(10.0)));
-        assert!(store.has_audio(&store.chunks()[0]), "the cached take should still be found");
-        let after = fs::read_to_string(dir.join(MANIFEST)).unwrap();
-        assert_eq!(before.replace("pitch_range_st=12.4", "pitch_range_st=10"), after);
-        assert_eq!(rules(&dir, given_pitch_range(None)).pitch_range_target, Some(10.0));
-        let settled = settle_pitch_range(Some(&Manifest::parse(&before).unwrap()), Some(10.0), dir.path());
-        assert!(settled.note.unwrap().contains("replacing 12.4"));
-        let unchanged = settle_pitch_range(Some(&Manifest::parse(&after).unwrap()), Some(10.0), dir.path());
-        assert!(!unchanged.save_now);
-    }
-
-    #[test]
-    fn an_older_folder_has_no_pitch_range_target_until_one_is_given() {
-        let dir = folder_without_a_saved_limit("pitch-older");
-        assert_eq!(rules(&dir, given_pitch_range(None)).pitch_range_target, None);
-        open_keeping(&dir, given_pitch_range(None));
-        assert_eq!(fs::read_to_string(dir.join(MANIFEST)).unwrap(), OLDER_MANIFEST);
-        open_keeping(&dir, given_pitch_range(Some(12.4)));
-        assert_eq!(saved_pitch_range(&dir).as_deref(), Some("12.4"));
-        assert_eq!(rules(&dir, given_pitch_range(None)).pitch_range_target, Some(12.4));
-        let settled = settle_pitch_range(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), Some(12.4), dir.path());
-        assert!(settled.note.unwrap().contains("now saved in"));
-    }
-
-    #[test]
-    fn a_manifest_saved_before_pitch_ranges_still_loads() {
-        // As saved with a noise limit and take policy, before pitch ranges were.
+    fn a_manifest_is_saved_as_it_was_read() {
         let text = format!("{OLDER_MANIFEST}noise_limit_db=-50\ntakes=best-of-3\n");
         let manifest = Manifest::parse(&text).unwrap();
-        assert_eq!((manifest.pitch_range_target, manifest.takes), (None, TakePolicy::BestOf(3)));
-        assert_eq!(manifest.render(), text, "rewritten unchanged");
+        assert_eq!(manifest.keep, KeepRules { takes: TakePolicy::BestOf(3), pitch_range_target: None, ..FIRST });
+        assert_eq!(manifest.render(), text);
+    }
+
+    /// The note settling `S` from `saved` and `given` prints, and whether it saves.
+    fn note<S: KeepSetting>(saved: Option<S::Value>, given: Option<S::Value>) -> (Option<String>, bool) {
+        let mut changes = Changes::default();
+        settle_setting::<S>(saved, given, Path::new("out/narration.txt"), &mut changes);
+        (changes.notes.pop(), changes.save_now)
     }
 
     #[test]
-    fn a_bad_saved_pitch_range_is_an_error_that_says_how_to_fix_it() {
-        let dir = folder_without_a_saved_limit("pitch-bad");
-        fs::write(dir.join(MANIFEST), format!("{OLDER_MANIFEST}pitch_range_st=40\n")).unwrap();
-        let error = settle_error(&dir);
-        assert!(error.contains("pitch_range_st=40") && error.contains("delete that line"), "{error}");
+    fn notes_say_what_a_run_uses_and_what_it_replaces() {
+        let said = |text: &str| Some(text.to_string());
+        assert_eq!(note::<NoiseLimit>(None, None), (None, false));
+        assert_eq!(note::<NoiseLimit>(None, Some(-50.0)), (said("Noise limit: -50 dB"), false));
+        assert_eq!(
+            note::<NoiseLimit>(Some(-50.0), Some(-48.0)),
+            (said("Noise limit: -48 dB, replacing -50 dB in out/narration.txt"), true)
+        );
+        assert_eq!(note::<NoiseLimit>(Some(-50.0), Some(-50.0)), (said("Noise limit: -50 dB"), false));
+        assert_eq!(note::<NoiseLimit>(Some(-50.0), None), (said("Noise limit: -50 dB"), false));
+        assert_eq!(note::<NoiseLimit>(Some(DEFAULT_NOISE_LIMIT_DB), None), (None, false));
+
+        let (best_of_2, best_of_4) = (Some(TakePolicy::BestOf(2)), Some(TakePolicy::BestOf(4)));
+        assert_eq!(note::<Takes>(None, best_of_4), (said("Takes: keeping the best of 4"), false));
+        assert_eq!(
+            note::<Takes>(best_of_4, best_of_2),
+            (said("Takes: keeping the best of 2, replacing the best of 4 in out/narration.txt"), true)
+        );
+        assert_eq!(note::<Takes>(best_of_4, None), (said("Takes: keeping the best of 4"), false));
+        assert_eq!(note::<Takes>(Some(TakePolicy::FirstPassing), None), (None, false));
+
+        let (none, wide, narrow) = (Some(None), Some(Some(12.4)), Some(Some(10.0)));
+        assert_eq!(note::<PitchRange>(None, wide), (said("Pitch range: aiming for 12.4 semitones"), false));
+        assert_eq!(
+            note::<PitchRange>(none, wide),
+            (said("Pitch range: aiming for 12.4 semitones, now saved in out/narration.txt"), true)
+        );
+        assert_eq!(
+            note::<PitchRange>(wide, narrow),
+            (said("Pitch range: aiming for 10 semitones, replacing 12.4 in out/narration.txt"), true)
+        );
+        assert_eq!(note::<PitchRange>(narrow, narrow), (said("Pitch range: aiming for 10 semitones"), false));
+        assert_eq!(note::<PitchRange>(none, None), (None, false));
+    }
+
+    #[test]
+    fn a_bad_saved_setting_is_an_error_that_says_how_to_fix_it() {
+        let bad = [
+            ("noise_limit_db=loud", "a level from -100 to 0 dB"),
+            ("takes=best-of-50", "first-passing or best-of-1 to best-of-10"),
+            ("pitch_range_st=40", "a range from 2 to 30 semitones"),
+        ];
+        for (line, valid) in bad {
+            let dir = folder_without_saved_settings("keep-bad");
+            fs::write(dir.join(MANIFEST), format!("{OLDER_MANIFEST}{line}\n")).unwrap();
+            let error = settle_error(&dir);
+            assert_eq!(error, format!("narration.txt has {line}, which isn't {valid}. Correct or delete that line"));
+        }
+    }
+
+    #[test]
+    fn the_voice_sample_is_judged_against_the_given_or_saved_limit_or_the_default() {
+        let dir = TempDir::new("store-limit-sample");
+        let given_limit = |noise_limit_db| KeepSettings { noise_limit_db, ..KeepSettings::default() };
+        let limit = |given| settle(dir.path(), given_limit(given)).unwrap().sample_noise_limit();
+        assert_eq!(limit(None), None, "so its advice can name the default");
+        assert_eq!(limit(Some(-50.0)), Some(-50.0));
+        render_keeping(&dir, KeepSettings::default());
+        assert_eq!(limit(None), Some(DEFAULT_NOISE_LIMIT_DB));
+        assert_eq!(limit(Some(-60.0)), Some(-60.0));
     }
 
     #[test]
