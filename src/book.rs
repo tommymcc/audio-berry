@@ -7,7 +7,7 @@ use crate::checks::{Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
-use crate::store::{Chunk, NarrationStore, RenderSettings, fnv};
+use crate::store::{Chunk, NarrationStore, RenderSettings, fnv, noise_limit_for};
 use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
 use any_tts::AudioSamples;
@@ -180,7 +180,8 @@ pub fn narrate(
     };
 
     let allowances = read_allowances_saying_so(voice_sample)?;
-    let voice = Voice::load(voice_sample, noise_limit_db)?;
+    // Judge the sample against the limit its takes will be, which may be saved.
+    let voice = Voice::load(voice_sample, noise_limit_for(out, noise_limit_db)?)?;
     let store = open_store(&book, &voice, out, speed, noise_limit_db)?;
     let standard = Standard::of(&store, allowances);
 
@@ -265,7 +266,8 @@ pub fn retake(
 ) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
     let allowances = read_allowances_saying_so(voice_sample)?;
-    let voice = Voice::load(voice_sample, noise_limit_db)?;
+    // Judge the sample against the limit its takes will be, which may be saved.
+    let voice = Voice::load(voice_sample, noise_limit_for(out, noise_limit_db)?)?;
     let store = open_store(&book, &voice, out, None, noise_limit_db)?;
     let standard = Standard::of(&store, allowances);
     let wanted = store.select(targets)?;

@@ -84,6 +84,16 @@ fn read_manifest(out: &Path) -> Result<Option<Manifest>, Box<dyn Error>> {
     }
 }
 
+/// The noise limit a run in `out` will judge takes against when `given` is the
+/// one given on the command line, if any: the given one, or the one saved there,
+/// or `None` for the default. `open` settles it the same way.
+pub fn noise_limit_for(out: &Path, given: Option<f32>) -> Result<Option<f32>, Box<dyn Error>> {
+    match given {
+        Some(limit) => Ok(Some(limit)),
+        None => Ok(read_manifest(out)?.and_then(|saved| saved.noise_limit_db)),
+    }
+}
+
 /// Reads a chunk number such as `3.12` as its chapter and position.
 fn parse_number(target: &str) -> Option<(usize, usize)> {
     let (chapter, position) = target.split_once('.')?;
@@ -814,6 +824,16 @@ mod tests {
     fn saved_limit(dir: &TempDir) -> Option<String> {
         let text = fs::read_to_string(dir.join(MANIFEST)).unwrap();
         text.lines().find_map(|line| line.strip_prefix("noise_limit_db=")).map(str::to_string)
+    }
+
+    #[test]
+    fn the_noise_limit_for_a_run_is_the_given_one_then_the_saved_one() {
+        let dir = TempDir::new("store-limit-for");
+        assert_eq!(noise_limit_for(dir.path(), None).unwrap(), None);
+        assert_eq!(noise_limit_for(dir.path(), Some(-50.0)).unwrap(), Some(-50.0));
+        render_with_limit(&dir, Some(-50.0));
+        assert_eq!(noise_limit_for(dir.path(), None).unwrap(), Some(-50.0));
+        assert_eq!(noise_limit_for(dir.path(), Some(-60.0)).unwrap(), Some(-60.0));
     }
 
     #[test]

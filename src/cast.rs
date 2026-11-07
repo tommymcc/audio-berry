@@ -227,10 +227,10 @@ fn handle_request(mut stream: TcpStream, files: &[Resource]) -> std::io::Result<
         if reader.read_line(&mut header)? == 0 || header.trim().is_empty() {
             break;
         }
-        if let Some((name, value)) = header.split_once(':') {
-            if name.eq_ignore_ascii_case("range") {
-                range = Some(value.trim().to_string());
-            }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("range")
+        {
+            range = Some(value.trim().to_string());
         }
     }
     let mut parts = line.split_whitespace();

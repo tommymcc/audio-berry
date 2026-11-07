@@ -81,7 +81,7 @@ impl SampleCheck {
             Verdict::Fine => None,
             Verdict::Noisy => {
                 let limit = match self.noise_limit_db {
-                    Some(limit) => format!("the noise limit of {limit} dB you gave"),
+                    Some(limit) => format!("the noise limit of {limit} dB"),
                     None => format!("the default noise limit of {DEFAULT_NOISE_LIMIT_DB} dB"),
                 };
                 // The next multiple of 5 dB above the floor takes are expected

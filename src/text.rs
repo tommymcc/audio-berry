@@ -209,8 +209,8 @@ fn normalize(paragraph: &Paragraph) -> String {
         }
     }
     let mut text = text
-        .trim_start_matches(|c: char| c == ',' || c == ' ')
-        .trim_end_matches(|c: char| c == ',' || c == ' ')
+        .trim_start_matches([',', ' '])
+        .trim_end_matches([',', ' '])
         .to_string();
 
     if paragraph.heading {
