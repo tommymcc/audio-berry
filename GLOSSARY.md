@@ -20,6 +20,8 @@
 
 **Noise limit:** the highest floor a take can have and still pass, -55 dB unless `--noise-limit` sets it. The output directory saves it in `narration.txt`, so it's given once, and giving a new value replaces the saved one. It isn't a render setting: it decides which take is kept, not how a take sounds, so changing it keeps the audio already rendered.
 
+**Take policy:** how many takes of a chunk `book` and `retake` render and which they keep: the first that passes unless `--takes` asks for the best of a set number. Like the noise limit, it's saved in `narration.txt` and isn't a render setting.
+
 **Voice sample:** the recording a narration's voice is cloned from, such as `voices/me.wav`, with what's said in it in a `.txt` file beside it. `clean` makes one from a noisy recording.
 
 **Section:** a stretch of a recording, from one pause to another, that `sections` suggests making into a voice sample.

@@ -52,10 +52,42 @@ impl Verdict {
         self.plausible && self.clean && self.accuracy.acceptable()
     }
 
-    /// Orders takes: plausible length matters most, then clean audio, then accuracy.
-    pub fn rank(&self) -> (bool, bool, f32) {
-        (self.plausible, self.clean, self.accuracy.score())
+    /// Whether the take passes and every word was heard, with nothing more.
+    pub fn flawless(&self) -> bool {
+        self.plausible && self.clean && self.accuracy.exact()
     }
+
+    /// How the take ranks against others of the same chunk. `heard` is whether
+    /// the phrases a `retake` asks for were heard, and true when none were.
+    pub fn rank(&self, heard: bool) -> Rank {
+        Rank {
+            plausible: self.plausible,
+            clean: self.clean,
+            heard,
+            score: self.accuracy.score(),
+            quietness: if self.passes() { -self.quality.floor_db } else { 0.0 },
+        }
+    }
+}
+
+/// The one place that decides which of a chunk's takes is better, which
+/// compares greater. Passing takes beat failing ones before this is asked (see
+/// `takes::beats`), so the fields only order takes that both pass or both fail.
+///
+/// They compare in order: plausible length matters most, then clean audio, then
+/// hearing a `retake`'s phrases, then accuracy, as recall minus extra words, so
+/// that among takes that pass, the one heard most nearly as written wins. A lower
+/// floor breaks a tie between passing takes, as the quieter is cleaner. It's left
+/// out between failing takes, which keep the earlier take on a tie as they always
+/// have.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Rank {
+    plausible: bool,
+    clean: bool,
+    heard: bool,
+    score: f32,
+    /// How far below 0 dB the floor is, for passing takes only.
+    quietness: f32,
 }
 
 #[cfg(test)]
@@ -77,7 +109,8 @@ mod tests {
         let standard = standard(1.0);
         let verdict = standard.judge(TEXT, &silence(4.0), TEXT);
         assert!(verdict.passes());
-        assert_eq!(verdict.rank(), (true, true, 1.0));
+        let Rank { plausible, clean, heard, score, .. } = verdict.rank(true);
+        assert_eq!((plausible, clean, heard, score), (true, true, true, 1.0));
     }
 
     #[test]
@@ -94,7 +127,43 @@ mod tests {
         let standard = standard(1.0);
         let wrong = standard.judge(TEXT, &silence(4.0), "The quick brown cat.");
         assert!(!wrong.passes());
-        assert!(wrong.rank() < standard.judge(TEXT, &silence(4.0), TEXT).rank());
+        assert!(wrong.rank(true) < standard.judge(TEXT, &silence(4.0), TEXT).rank(true));
+    }
+
+    fn verdict(passes: bool, recall: f32, extra: f32, floor_db: f32) -> Verdict {
+        let quality = Quality { floor_db, speech_db: -20.0, peak_db: -2.0, seconds: 8.0 };
+        let accuracy = Accuracy { recall, extra, transcript: String::new() };
+        Verdict { quality, accuracy, plausible: true, clean: passes }
+    }
+
+    #[test]
+    fn among_passing_takes_the_most_accurate_then_the_quietest_ranks_higher() {
+        let ranks = |verdicts: &[Verdict]| verdicts.iter().map(|verdict| verdict.rank(true)).collect::<Vec<_>>();
+        let ranked = ranks(&[
+            verdict(true, 0.95, 0.05, -60.0),
+            verdict(true, 1.0, 0.0, -56.0),
+            verdict(true, 1.0, 0.0, -62.0),
+            verdict(true, 0.97, 0.0, -70.0),
+        ]);
+        assert!(ranked[1] > ranked[0], "higher recall and fewer extra words");
+        assert!(ranked[3] > ranked[0], "fewer extra words");
+        assert!(ranked[1] > ranked[3], "accuracy before the floor");
+        assert!(ranked[2] > ranked[1], "the lower floor breaks a tie");
+    }
+
+    #[test]
+    fn the_floor_breaks_no_tie_between_failing_takes() {
+        let noisy = verdict(false, 1.0, 0.0, -40.0);
+        let quieter = verdict(false, 1.0, 0.0, -50.0);
+        assert!(!noisy.passes() && !quieter.passes());
+        assert_eq!(noisy.rank(true), quieter.rank(true));
+    }
+
+    #[test]
+    fn a_retake_phrase_heard_ranks_above_accuracy() {
+        let heard = verdict(true, 0.95, 0.05, -60.0);
+        let missed = verdict(true, 1.0, 0.0, -60.0);
+        assert!(heard.rank(true) > missed.rank(false));
     }
 
     #[test]

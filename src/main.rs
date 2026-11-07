@@ -16,6 +16,7 @@ mod sample_check;
 mod sections;
 mod shell;
 mod store;
+mod takes;
 #[cfg(test)]
 mod test_dir;
 mod text;
@@ -80,6 +81,8 @@ enum Command {
         #[command(flatten)]
         speed: Speed,
         #[command(flatten)]
+        takes: Takes,
+        #[command(flatten)]
         model: ModelArgs,
     },
     /// Records new takes of chunks of a narrated book
@@ -101,6 +104,8 @@ enum Command {
         /// Refused with the reason, rather than as an unknown option
         #[arg(long = "speed", value_name = "factor", hide = true, value_parser = refuse_retake_speed)]
         refused_speed: Option<String>,
+        #[command(flatten)]
+        takes: Takes,
         #[command(flatten)]
         model: ModelArgs,
     },
@@ -173,6 +178,14 @@ struct Speed {
     /// Speaking speed from 0.5 to 2.0, where 0.8 is slower and 1.25 faster
     #[arg(long = "speed", value_name = "factor", value_parser = parse_speed)]
     factor: Option<f64>,
+}
+
+#[derive(clap::Args)]
+struct Takes {
+    /// Renders n takes of each chunk, from 1 to 10, and keeps the best, rather than
+    /// the first that passes; saved in the output directory
+    #[arg(long = "takes", value_name = "n", value_parser = takes::parse_takes)]
+    policy: Option<takes::TakePolicy>,
 }
 
 /// Options for the commands that load the model and a voice sample.
@@ -307,13 +320,13 @@ fn main() -> Result<()> {
             narrator::speak(&voice_sample, &text, &output, &say.settings(), say.model.noise_limit)
         }
         Command::Chapters { book } => book::list_chapters(&book),
-        Command::Book { voice_sample, book, output_dir, chapters, speed, model } => {
+        Command::Book { voice_sample, book, output_dir, chapters, speed, takes, model } => {
             let chapters = (!chapters.is_empty()).then_some(chapters);
-            book::narrate(&voice_sample, &book, &output_dir, chapters, speed.factor, model.noise_limit)
+            book::narrate(&voice_sample, &book, &output_dir, chapters, speed.factor, model.noise_limit, takes.policy)
         }
-        Command::Retake { voice_sample, book, output_dir, targets, model, .. } => {
+        Command::Retake { voice_sample, book, output_dir, targets, takes, model, .. } => {
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
-            book::retake(&voice_sample, &book, &output_dir, &targets, model.noise_limit)
+            book::retake(&voice_sample, &book, &output_dir, &targets, model.noise_limit, takes.policy)
         }
         Command::Mishearings { book, output_dir, voice_sample } => mishearings::list(&book, &output_dir, voice_sample.as_deref()),
         Command::Speakers => {
@@ -475,6 +488,21 @@ mod tests {
         let words = ["retake", "v", "b", "o", "3.12", "--noise-limit", "-50", "--", "-said she"];
         let Ok(Command::Retake { targets, model, .. }) = parse(&words) else { panic!() };
         assert_eq!((targets, model.noise_limit), (vec!["3.12".to_string(), "-said she".to_string()], Some(-50.0)));
+    }
+
+    #[test]
+    fn takes_are_for_book_and_retake_and_from_1_to_10() {
+        let Ok(Command::Book { takes, .. }) = parse(&["book", "v", "b", "o", "--takes", "3"]) else { panic!() };
+        assert_eq!(takes.policy, Some(takes::TakePolicy::BestOf(3)));
+        let Ok(Command::Retake { takes, .. }) = parse(&["retake", "v", "b", "o", "3.12", "--takes", "10"]) else { panic!() };
+        assert_eq!(takes.policy, Some(takes::TakePolicy::BestOf(10)));
+        let Ok(Command::Book { takes, .. }) = parse(&["book", "v", "b", "o"]) else { panic!() };
+        assert_eq!(takes.policy, None);
+        for bad in ["0", "11", "two"] {
+            let error = parse(&["book", "v", "b", "o", "--takes", bad]).err().unwrap().to_string();
+            assert!(error.contains("must be a whole number from 1 to 10"), "{error}");
+        }
+        assert!(parse(&["speak", "v", "t", "o", "--takes", "3"]).is_err());
     }
 
     #[test]

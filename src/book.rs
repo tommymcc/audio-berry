@@ -8,17 +8,18 @@ use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
 use crate::store::{Chunk, NarrationStore, RenderSettings, fnv, noise_limit_for};
+use crate::takes::{Kept, TakePolicy, beats};
 use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
 use any_tts::AudioSamples;
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Result, bail};
 use std::fmt::Write as _;
 use fs_err as fs;
 use std::path::Path;
 
-/// Takes tried per chunk by `book`.
+/// Takes tried per chunk by `book` until one passes.
 pub const MAX_TAKES: u64 = 5;
-/// New takes tried per chunk by `retake`.
+/// New takes tried per chunk by `retake` until one is flawless.
 const MAX_RETAKES: u64 = 6;
 
 /// Reads the voice's allowances, and says how many there are, since they change
@@ -37,8 +38,10 @@ fn open_store(
     out: &Path,
     speed: Option<f64>,
     noise_limit_db: Option<f32>,
+    takes: Option<TakePolicy>,
 ) -> Result<NarrationStore> {
-    NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &RenderSettings::from_env(speed), noise_limit_db)
+    let settings = RenderSettings::from_env(speed);
+    NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &settings, noise_limit_db, takes)
 }
 
 /// Prints each chapter's number, title and size.
@@ -90,33 +93,25 @@ impl<'a> Recorder<'a> {
         Ok(Take { audio, verdict })
     }
 
-    /// Renders takes until one passes, or returns the best of them with its take count.
-    /// Each rejected take is reported through `progress`.
-    fn best(&mut self, item: &Chunk, progress: &mut Progress) -> Result<(Take, u64)> {
-        let mut best: Option<Take> = None;
-        for take in 0..MAX_TAKES {
+    /// Renders takes as `policy` says and keeps the best. Each rejected take is
+    /// reported through `progress`.
+    fn best(&mut self, item: &Chunk, policy: TakePolicy, progress: &mut Progress) -> Result<Kept<Take>> {
+        let render = |take| {
             let current = self.take(item, take)?;
-            if current.verdict.passes() {
-                return Ok((current, take + 1));
+            if !current.verdict.passes() {
+                let Verdict { quality, accuracy, .. } = &current.verdict;
+                progress.line(&format!(
+                    "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}",
+                    take + 1,
+                    quality.floor_db,
+                    quality.seconds,
+                    accuracy.recall,
+                    accuracy.extra,
+                ))?;
             }
-            let Verdict { quality, accuracy, .. } = &current.verdict;
-            progress.line(&format!(
-                "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}",
-                take + 1,
-                quality.floor_db,
-                quality.seconds,
-                accuracy.recall,
-                accuracy.extra,
-            ))?;
-            let replace = best
-                .as_ref()
-                .is_none_or(|existing| current.verdict.rank() > existing.verdict.rank());
-            if replace {
-                best = Some(current);
-            }
-        }
-        let best = best.ok_or_else(|| eyre!("no takes were rendered"))?;
-        Ok((best, MAX_TAKES))
+            Ok(current)
+        };
+        policy.record(0, MAX_TAKES, render, |take| (take.verdict.passes(), take.verdict.rank(true)))
     }
 }
 
@@ -167,6 +162,7 @@ pub fn narrate(
     chapters: Option<Vec<usize>>,
     speed: Option<f64>,
     noise_limit_db: Option<f32>,
+    takes: Option<TakePolicy>,
 ) -> Result<()> {
     let book = read_book(epub)?;
     let selected: Vec<usize> = match chapters {
@@ -182,7 +178,7 @@ pub fn narrate(
     let allowances = read_allowances_saying_so(voice_sample)?;
     // Judge the sample against the limit its takes will be, which may be saved.
     let voice = Voice::load(voice_sample, noise_limit_for(out, noise_limit_db)?)?;
-    let store = open_store(&book, &voice, out, speed, noise_limit_db)?;
+    let store = open_store(&book, &voice, out, speed, noise_limit_db, takes)?;
     let standard = Standard::of(&store, allowances);
 
     let text_dir = out.join("text");
@@ -205,11 +201,13 @@ pub fn narrate(
         let mut recorder = Recorder::load(&voice, &store, &standard)?;
         let mut progress = Progress::new(total, total - pending.len());
         for item in &pending {
-            let (take, count) = recorder.best(item, &mut progress)?;
-            store.store(item, &take.audio, &take.verdict.accuracy.transcript, count)?;
+            let kept = recorder.best(item, store.takes(), &mut progress)?;
+            let take = &kept.take;
+            store.store(item, &take.audio, &take.verdict.accuracy.transcript, kept.rendered)?;
             progress.chunk_done(&format!(
-                "{:.0}s of audio, take {count}, recall {:.2}",
+                "{:.0}s of audio, {}, recall {:.2}",
                 take.audio.duration_secs(),
+                store.takes().describe(kept.number),
                 take.verdict.accuracy.recall,
             ))?;
         }
@@ -263,12 +261,13 @@ pub fn retake(
     out: &Path,
     targets: &[&str],
     noise_limit_db: Option<f32>,
+    takes: Option<TakePolicy>,
 ) -> Result<()> {
     let book = read_book(epub)?;
     let allowances = read_allowances_saying_so(voice_sample)?;
     // Judge the sample against the limit its takes will be, which may be saved.
     let voice = Voice::load(voice_sample, noise_limit_for(out, noise_limit_db)?)?;
-    let store = open_store(&book, &voice, out, None, noise_limit_db)?;
+    let store = open_store(&book, &voice, out, None, noise_limit_db, takes)?;
     let standard = Standard::of(&store, allowances);
     let wanted = store.select(targets)?;
 
@@ -282,11 +281,12 @@ pub fn retake(
             phrases.iter().all(|phrase| standard.heard(phrase, transcript))
         };
         // The check file holds the take count, so seeds already tried are skipped.
-        let (first_take, mut best_rank) = if store.has_audio(item) {
+        let (first_take, current) = if store.has_audio(item) {
             let check = store.check(item)?;
             let audio = AudioSamples::from_wav_file(&path)?;
-            let (plausible, clean, score) = standard.judge(&item.text, &audio, &check.transcript).rank();
-            (check.takes, Some((plausible, clean, heard_all(&check.transcript), score)))
+            let verdict = standard.judge(&item.text, &audio, &check.transcript);
+            let heard = heard_all(&check.transcript);
+            (check.takes, Some((verdict.flawless() && heard, verdict.rank(heard))))
         } else {
             (0, None)
         };
@@ -298,44 +298,41 @@ pub fn retake(
             item.text.chars().take(60).collect::<String>()
         ))?;
 
-        let mut best: Option<Take> = None;
-        let mut count = first_take;
-        for take in first_take..first_take + MAX_RETAKES {
+        let render = |take: u64| {
             let current = recorder.take(item, take)?;
-            count = take + 1;
             let Verdict { quality, accuracy, .. } = &current.verdict;
-            let (plausible, clean, score) = current.verdict.rank();
-            let heard = heard_all(&accuracy.transcript);
-            let rank = (plausible, clean, heard, score);
-            let done = plausible && clean && heard && accuracy.exact();
             progress.line(&format!(
-                "  take {count}: recall {:.2}, extra {:.2}, phrase heard {heard}, floor {:.0} dB",
-                accuracy.recall, accuracy.extra, quality.floor_db,
+                "  take {}: recall {:.2}, extra {:.2}, phrase heard {}, floor {:.0} dB",
+                take + 1,
+                accuracy.recall,
+                accuracy.extra,
+                heard_all(&accuracy.transcript),
+                quality.floor_db,
             ))?;
             progress.line(&format!("    heard: {}", accuracy.transcript))?;
-            if best_rank.is_none_or(|existing| rank > existing) {
-                best_rank = Some(rank);
-                best = Some(current);
+            Ok(current)
+        };
+        // Done once the phrases are heard and every word is, with nothing more.
+        let judge = |take: &Take| {
+            let heard = heard_all(&take.verdict.accuracy.transcript);
+            (take.verdict.flawless() && heard, take.verdict.rank(heard))
+        };
+        let kept = store.takes().record(first_take, MAX_RETAKES, render, judge)?;
+        let count = first_take + kept.rendered;
+        let better = current.as_ref().is_none_or(|current| beats(&judge(&kept.take), current));
+        let outcome = if better {
+            if store.has_audio(item) {
+                store.retire(item)?;
             }
-            if done {
-                break;
-            }
-        }
-        let outcome = match best {
-            Some(take) => {
-                if store.has_audio(item) {
-                    store.retire(item)?;
-                }
-                store.store(item, &take.audio, &take.verdict.accuracy.transcript, count)?;
-                progress.line(&format!("  replaced: {}", take.verdict.accuracy.transcript))?;
-                "replaced"
-            }
-            None => {
-                // Still counts the tried seeds, so the next retake tries new ones.
-                store.record_tried(item, count)?;
-                progress.line("  kept the current take; none was better")?;
-                "kept the current take"
-            }
+            let transcript = &kept.take.verdict.accuracy.transcript;
+            store.store(item, &kept.take.audio, transcript, count)?;
+            progress.line(&format!("  replaced with {}: {transcript}", store.takes().describe(kept.number)))?;
+            "replaced"
+        } else {
+            // Still counts the tried seeds, so the next retake tries new ones.
+            store.record_tried(item, count)?;
+            progress.line("  kept the current take; none was better")?;
+            "kept the current take"
         };
         progress.chunk_done(&format!("chunk {numbers}: {outcome}"))?;
     }
