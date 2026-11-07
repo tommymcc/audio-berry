@@ -185,11 +185,12 @@ Only clone your own voice, or the voice of someone who has agreed to it.
 
 6. **Listen to a test.** Judge it by ear, ideally on the speaker you'll use.
    To compare the clone with the original, `audition` says the sample's own
-   words in the cloned voice, then plays the sample and the clone in turn.
-   Keep the sample most like the speaker:
+   words in the cloned voice, then plays the sample and the clone in turn, here
+   or on a Cast speaker given with `--speaker`. Keep the sample most like the
+   speaker:
 
    ```sh
-   ./target/release/audio-berry audition voices/me.wav kitchen
+   ./target/release/audio-berry audition voices/me.wav --speaker kitchen
    ```
 
    To hear it say something else:
@@ -222,7 +223,7 @@ audio-berry retake [OPTIONS] <voice-sample> <book.epub> <output-dir> <target>...
 audio-berry mishearings <book.epub> <output-dir> [voice-sample]
 audio-berry speakers
 audio-berry play <speaker> <file>...
-audio-berry audition [OPTIONS] <voice-sample> [speaker]
+audio-berry audition [OPTIONS] <voice-sample>
 audio-berry sections [OPTIONS] <recording> [count]
 audio-berry clean [OPTIONS] <recording> <start> <end> <output.wav>
 ```
@@ -264,13 +265,14 @@ Pausing on the speaker doesn't count towards `play`'s time limit, which is the
 length the speaker reports plus a minute. Leave `play` running until playback ends.
 
 `audition` says a voice sample's own words, from its `.txt` file, in the cloned
-voice, then plays the sample and the clone in turn on the speaker, so you hear the
-same words in both. If there's no `.txt` yet, it transcribes the sample first.
+voice, then plays the sample and the clone in turn, so you hear the same words in
+both. They play on this computer with `ffplay`, which comes with ffmpeg, or on the
+Cast speaker matching `--speaker <name>`, as `play` matches it. If there's no `.txt` yet, it transcribes the sample first.
 It saves them in `output/audition`, so `voices/me.wav` gives `me-original.wav` and
 `me-clone.wav`. The original is the part of the sample the model hears, at 24 kHz
 mono, and trimmed to at most 15 seconds if the sample is over 20. If you wrote the
 `.txt` for a longer recording than that, it warns that the clone will say more
-than the original. Without a speaker, it only saves them. Like `speak`, it takes `--seed`.
+than the original. Like `speak`, it takes `--seed`.
 
 `sections` suggests the best `count` stretches of a recording to use as a voice
 sample, 3 by default, each with the `clean` command that makes it. With

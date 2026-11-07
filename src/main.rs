@@ -132,8 +132,8 @@ enum Command {
         /// A voice sample, such as voices/me.wav
         #[arg(value_name = "voice-sample")]
         voice_sample: PathBuf,
-        /// Part of the speaker's name; without one, the files are only saved
-        #[arg(value_name = "speaker")]
+        /// Plays on the Cast speaker with this in its name, ignoring case, rather than here
+        #[arg(long, value_name = "name")]
         speaker: Option<String>,
         #[command(flatten)]
         say: SayArgs,
@@ -490,13 +490,22 @@ mod tests {
     }
 
     #[test]
+    fn audition_names_a_speaker_with_an_option() {
+        let Ok(Command::Audition { speaker, .. }) = parse(&["audition", "v", "--speaker", "kitchen"]) else { panic!() };
+        assert_eq!(speaker.as_deref(), Some("kitchen"));
+        let Ok(Command::Audition { speaker, .. }) = parse(&["audition", "v"]) else { panic!() };
+        assert_eq!(speaker, None);
+        assert!(parse(&["audition", "v", "kitchen"]).is_err());
+    }
+
+    #[test]
     fn the_files_each_command_reads_are_checked() {
         let inputs = |words: &[&str]| -> Vec<PathBuf> {
             parse(words).unwrap().input_files().into_iter().map(Path::to_path_buf).collect()
         };
         let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
         assert_eq!(inputs(&["speak", "v.wav", "hi", "o.wav"]), paths(&["v.wav"]));
-        assert_eq!(inputs(&["audition", "v.wav", "kitchen"]), paths(&["v.wav"]));
+        assert_eq!(inputs(&["audition", "v.wav", "--speaker", "kitchen"]), paths(&["v.wav"]));
         assert_eq!(inputs(&["chapters", "b.epub"]), paths(&["b.epub"]));
         assert_eq!(inputs(&["book", "v.wav", "b.epub", "out"]), paths(&["v.wav", "b.epub"]));
         assert_eq!(inputs(&["retake", "v.wav", "b.epub", "out", "3.1"]), paths(&["v.wav", "b.epub"]));

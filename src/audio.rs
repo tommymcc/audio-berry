@@ -1,4 +1,4 @@
-//! Reads audio files of any format.
+//! Reads audio files of any format, and plays them here.
 
 use any_tts::AudioSamples;
 use color_eyre::eyre::{Report, Result, WrapErr, eyre};
@@ -74,11 +74,35 @@ pub const COULDNT_RUN: &str = "couldn't run ffmpeg; is it installed?";
 /// voices/me.wav", with what it said about it below, without the internal
 /// addresses it starts its lines with.
 pub fn ffmpeg_failed(doing: &str, stderr: &[u8]) -> Report {
-    let failed = eyre!("ffmpeg couldn't {doing}");
+    tool_failed("ffmpeg", doing, stderr)
+}
+
+/// As `ffmpeg_failed`, for `ffmpeg` or `ffplay`.
+fn tool_failed(tool: &str, doing: &str, stderr: &[u8]) -> Report {
+    let failed = eyre!("{tool} couldn't {doing}");
     match ffmpeg_said(stderr) {
-        Some(said) => failed.section(said.header("ffmpeg said:")),
+        Some(said) => failed.section(said.header(format!("{tool} said:"))),
         None => failed,
     }
+}
+
+/// Why ffplay failed to start. It comes with ffmpeg, but some packages leave it out.
+const COULDNT_RUN_FFPLAY: &str = "couldn't run ffplay, which plays audio here; is it installed with ffmpeg?";
+
+/// Plays an audio file on this computer, waiting until it ends.
+pub fn play_here(path: &Path) -> Result<()> {
+    let output = Command::new("ffplay")
+        .args(["-nodisp", "-autoexit", "-loglevel", "error"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .wrap_err(COULDNT_RUN_FFPLAY)?;
+    // ffplay exits successfully even when it can't read the file, but at this
+    // log level it only writes errors.
+    if !output.status.success() || !output.stderr.trim_ascii().is_empty() {
+        return Err(tool_failed("ffplay", &format!("play {}", path.display()), &output.stderr));
+    }
+    Ok(())
 }
 
 /// ffmpeg's error output without its addresses or blank lines, if it said anything.
@@ -113,6 +137,16 @@ mod tests {
             "Error opening input: No such file or directory\nError opening input file voices/me.wav."
         );
         assert_eq!(ffmpeg_said(b"\n  \n"), None);
+    }
+
+    #[test]
+    fn a_file_that_isnt_audio_fails_to_play_here_and_says_so() {
+        // Fails on reading the file, before any sound could be made.
+        let dir = TempDir::new("play-here");
+        let path = dir.join("not-audio.wav");
+        std::fs::write(&path, "not audio").unwrap();
+        let error = play_here(&path).unwrap_err().to_string();
+        assert!(error.contains("ffplay"), "{error}");
     }
 
     #[test]

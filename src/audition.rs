@@ -1,6 +1,7 @@
 //! Says a voice sample's own words in its cloned voice, so the clone and the
 //! original can be compared by ear, saying the same thing.
 
+use crate::audio::play_here;
 use crate::cast;
 use crate::narrator::{Narrator, SpeakSettings};
 use crate::voice::Voice;
@@ -34,7 +35,7 @@ fn pair_for(voice: &Path, dir: &Path) -> Result<Pair> {
 }
 
 /// Saves the sample as the model hears it and its transcript in the cloned voice,
-/// then plays the two in turn on `speaker`, if one is given.
+/// then plays the two in turn on `speaker`, or here if none is given.
 pub fn audition(
     voice_sample: &Path,
     speaker: Option<&str>,
@@ -57,11 +58,10 @@ pub fn audition(
     match speaker {
         Some(speaker) => cast::play(&speaker, vec![pair.original, pair.cloned]),
         None => {
-            println!(
-                "To hear them: audio-berry play <speaker> {} {}",
-                pair.original.display(),
-                pair.cloned.display()
-            );
+            for (which, file) in [("the original", &pair.original), ("the clone", &pair.cloned)] {
+                println!("Playing {which} ({})", file.display());
+                play_here(file)?;
+            }
             Ok(())
         }
     }
