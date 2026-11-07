@@ -7,6 +7,12 @@ use std::error::Error;
 use std::path::Path;
 use std::time::Instant;
 
+/// The model reads its precision from this, as f32, f16 or bf16, when it loads.
+pub const PRECISION_VAR: &str = "OMNIVOICE_DTYPE";
+
+/// The model picks a take from this seed, if set, and from the clock otherwise.
+pub const SEED_VAR: &str = "OMNIVOICE_SEED";
+
 pub struct Narrator {
     model: Box<dyn TtsModel>,
 }
@@ -20,12 +26,12 @@ impl Narrator {
     }
 
     /// Says `text` in `voice` at `speed`. A seed picks a repeatable take; without
-    /// one, the model picks it from `OMNIVOICE_SEED`, as it does by default.
+    /// one, the model picks it from `SEED_VAR`, as it does by default.
     pub fn say(&self, voice: &Voice, text: &str, speed: f64, seed: Option<u64>) -> Result<AudioSamples, Box<dyn Error>> {
         if let Some(seed) = seed {
             // SAFETY: nothing else reads or writes the environment during this
             // call, as the model is only used from this thread between requests.
-            unsafe { std::env::set_var("OMNIVOICE_SEED", seed.to_string()) };
+            unsafe { std::env::set_var(SEED_VAR, seed.to_string()) };
         }
         let mut request = SynthesisRequest::new(text).with_reference_audio(voice.reference().clone());
         // The model treats no speed as normal speed.
@@ -36,9 +42,9 @@ impl Narrator {
     }
 
     /// Says `text` in `voice`, saves it to `output` and reports how fast that was.
-    pub fn say_to_file(&self, voice: &Voice, text: &str, output: &Path, speed: f64) -> Result<(), Box<dyn Error>> {
+    pub fn say_to_file(&self, voice: &Voice, text: &str, output: &Path, take: &Take) -> Result<(), Box<dyn Error>> {
         let started = Instant::now();
-        let audio = self.say(voice, text, speed, None)?;
+        let audio = self.say(voice, text, take.speed.unwrap_or(1.0), take.seed)?;
         let elapsed = started.elapsed().as_secs_f32();
 
         audio.save_wav(output)?;
@@ -52,8 +58,18 @@ impl Narrator {
     }
 }
 
+/// How `speak` and `audition` say their one take.
+pub struct Take {
+    /// Normal speed if `None`.
+    pub speed: Option<f64>,
+    /// The clock picks one if `None`.
+    pub seed: Option<u64>,
+    /// What the voice sample is judged against; the default noise limit if `None`.
+    pub noise_limit_db: Option<f32>,
+}
+
 /// The `speak` command: says `text` in the voice sample's voice and saves it.
-pub fn speak(voice: &Path, text: &str, output: &Path, speed: Option<f64>) -> Result<(), Box<dyn Error>> {
-    let voice = Voice::load(voice)?;
-    Narrator::load()?.say_to_file(&voice, text, output, speed.unwrap_or(1.0))
+pub fn speak(voice: &Path, text: &str, output: &Path, take: &Take) -> Result<(), Box<dyn Error>> {
+    let voice = Voice::load(voice, take.noise_limit_db)?;
+    Narrator::load()?.say_to_file(&voice, text, output, take)
 }

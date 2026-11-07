@@ -204,7 +204,7 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    blaming the sample:
 
    ```sh
-   OMNIVOICE_SEED=2 ./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav
+   ./target/release/audio-berry speak voices/me.wav "Twinkle, twinkle, little star." output/test.wav --seed 2
    ```
 
 7. **Add allowances, if needed.** Once you've narrated some of a book, if
@@ -215,17 +215,27 @@ Only clone your own voice, or the voice of someone who has agreed to it.
 ## Commands
 
 ```text
-audio-berry speak <voice-sample> <text> <output.wav> [--speed <factor>]
+audio-berry speak [OPTIONS] <voice-sample> <text> <output.wav>
 audio-berry chapters <book.epub>
-audio-berry book <voice-sample> <book.epub> <output-dir> [chapter numbers, e.g. 2 3 7] [--speed <factor>]
-audio-berry retake <voice-sample> <book.epub> <output-dir> <words from the book, or a chunk number like 3.12>...
+audio-berry book [OPTIONS] <voice-sample> <book.epub> <output-dir> [chapter]...
+audio-berry retake [OPTIONS] <voice-sample> <book.epub> <output-dir> <target>...
 audio-berry mishearings <book.epub> <output-dir> [voice-sample]
 audio-berry speakers
 audio-berry play <speaker> <file>...
-audio-berry audition <voice-sample> [speaker] [--speed <factor>]
-audio-berry sections <recording> [count] [--reduction <dB>]
-audio-berry clean <recording> <start> <end> <output.wav> [--reduction <dB>]
+audio-berry audition [OPTIONS] <voice-sample> [speaker]
+audio-berry sections [OPTIONS] <recording> [count]
+audio-berry clean [OPTIONS] <recording> <start> <end> <output.wav>
 ```
+
+`audio-berry <command> --help` describes a command's arguments and options:
+`--speed <factor>` for `speak`, `book` and `audition`, `--seed <n>` for `speak`
+and `audition`, `--noise-limit <dB>` and `--precision <f32|f16|bf16>` for
+`speak`, `book`, `retake` and `audition`, and `--reduction <dB>` for `sections`
+and `clean`. An environment variable can give `--noise-limit`
+(`AUDIO_BERRY_NOISE_LIMIT_DB`), `--seed` (`OMNIVOICE_SEED`) or `--precision`
+(`OMNIVOICE_DTYPE`) instead, and the option wins if both are given. An invalid
+value in either stops the command. A `retake` target is words from the book, or a
+chunk number such as 3.12.
 
 `book` and `retake` are explained in [Narrating a book](#narrating-a-book) and
 [One output directory, one narration](#one-output-directory-one-narration).
@@ -255,8 +265,7 @@ It saves them in `output/audition`, so `voices/me.wav` gives `me-original.wav` a
 `me-clone.wav`. The original is the part of the sample the model hears, at 24 kHz
 mono, and trimmed to at most 15 seconds if the sample is over 20. If you wrote the
 `.txt` for a longer recording than that, it warns that the clone will say more
-than the original. Without a speaker, it only saves them. Like `speak`, it uses
-`OMNIVOICE_SEED` if set.
+than the original. Without a speaker, it only saves them. Like `speak`, it takes `--seed`.
 
 `sections` suggests the best `count` stretches of a recording to use as a voice
 sample, 3 by default, each with the `clean` command that makes it. With
@@ -332,10 +341,10 @@ default is **-55 dB**, which suits a voice sample recorded somewhere quiet. Take
 heard as clean have measured about -91 to -96 dB, and takes with audible
 background -34 to -48 dB.
 
-Set `AUDIO_BERRY_NOISE_LIMIT_DB` to change the limit, from -100 to 0 dB, where
-higher allows more background. An invalid value prints a warning and is ignored.
-It applies to `book` (whether a take passes), `retake` (which take wins) and the
-`CHECK` flags in `report.tsv`. `speak` doesn't check takes, so it ignores it.
+Give `--noise-limit <dB>` to change the limit, from -100 to 0 dB, where higher
+allows more background. It applies to `book` (whether a take passes), `retake`
+(which take wins) and the `CHECK` flags in `report.tsv`. `speak` and `audition`
+don't check takes, so they only judge the voice sample against it.
 
 **When to raise it.** The model copies the sample's background, so a sample with
 faint room tone, such as a noisy recording cleaned with a denoiser, gives every
@@ -358,7 +367,7 @@ use. If they sound clean, raise the limit to just above the floors you see. For
 a sample whose takes measure about -51 to -57 dB:
 
 ```sh
-AUDIO_BERRY_NOISE_LIMIT_DB=-50 ./target/release/audio-berry book voices/dad.wav book.epub output/book
+./target/release/audio-berry book voices/dad.wav book.epub output/book --noise-limit -50
 ```
 
 Don't raise it to get past noise you can hear. Pick a cleaner stretch of the
@@ -369,7 +378,7 @@ the speaker.
 such as a hum or faint music, lower the limit so they're retried:
 
 ```sh
-AUDIO_BERRY_NOISE_LIMIT_DB=-65 ./target/release/audio-berry book voices/me.wav book.epub output/book
+./target/release/audio-berry book voices/me.wav book.epub output/book --noise-limit -65
 ```
 
 **It's saved in the output directory.** The limit goes in `narration.txt` with
@@ -395,7 +404,7 @@ one, and the run says so. Its file isn't changed, because it may have been
 rendered with a limit that wasn't saved. If it was, give that limit once:
 
 ```sh
-AUDIO_BERRY_NOISE_LIMIT_DB=-50 ./target/release/audio-berry book voices/dad.wav book.epub output/book
+./target/release/audio-berry book voices/dad.wav book.epub output/book --noise-limit -50
 ```
 
 ## Allowances
@@ -469,7 +478,7 @@ Allow only what you've heard the speaker say right.
 ## One output directory, one narration
 
 An output directory holds one book in one voice, with one speed and model
-precision (`OMNIVOICE_DTYPE`). It saves them in `narration.txt` with its first take, and
+precision (`--precision`). It saves them in `narration.txt` with its first take, and
 later runs reuse the saved speed, so you don't have to repeat `--speed`. It also
 saves the [noise limit](#noise-limit), which can change at any time. A run
 with a different book, voice, speed or precision stops with an error rather than

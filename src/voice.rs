@@ -2,7 +2,6 @@
 
 use crate::accuracy::Allowances;
 use crate::audio::decode_audio;
-use crate::quality::noise_limit_from_env_quietly;
 use crate::sample_check::SampleCheck;
 use crate::store::fnv;
 use crate::transcribe::{Transcriber, VOICE_TRANSCRIPTION_MODEL};
@@ -30,8 +29,9 @@ pub struct Voice {
 impl Voice {
     /// Loads a voice sample and what's said in it. The text lives in a `.txt` file
     /// beside the sample, written by transcribing it the first time, and can be
-    /// corrected by hand.
-    pub fn load(path: &Path) -> Result<Voice, Box<dyn Error>> {
+    /// corrected by hand. The sample is judged against `noise_limit_db`, if given,
+    /// or the default noise limit.
+    pub fn load(path: &Path, noise_limit_db: Option<f32>) -> Result<Voice, Box<dyn Error>> {
         let recording = decode_audio(path, SAMPLE_RATE)?;
         let samples = trim_long_audio(
             &recording,
@@ -40,7 +40,7 @@ impl Voice {
             MIN_VOICE_SECONDS,
             TRIM_VOICE_ABOVE_SECONDS,
         );
-        let check = SampleCheck::of(&samples, noise_limit_from_env_quietly());
+        let check = SampleCheck::of(&samples, noise_limit_db);
         println!("Voice sample: using {:.1}s{}", seconds(&samples), check.summary());
 
         let transcript_path = transcript_path(path);

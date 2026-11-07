@@ -7,7 +7,6 @@ use crate::checks::{Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
-use crate::quality;
 use crate::store::{Chunk, NarrationStore, RenderSettings, fnv};
 use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
@@ -32,15 +31,14 @@ fn read_allowances_saying_so(voice_sample: &Path) -> Result<Allowances, Box<dyn 
     Ok(allowances)
 }
 
-fn open_store(book: &Book, voice: &Voice, out: &Path, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
-    NarrationStore::open(
-        out,
-        &book.title,
-        &book.chunks(),
-        voice.hash(),
-        &RenderSettings::from_env(speed),
-        quality::noise_limit_from_env(),
-    )
+fn open_store(
+    book: &Book,
+    voice: &Voice,
+    out: &Path,
+    speed: Option<f64>,
+    noise_limit_db: Option<f32>,
+) -> Result<NarrationStore, Box<dyn Error>> {
+    NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &RenderSettings::new(speed), noise_limit_db)
 }
 
 /// Prints each chapter's number, title and size.
@@ -168,6 +166,7 @@ pub fn narrate(
     out: &Path,
     chapters: Option<Vec<usize>>,
     speed: Option<f64>,
+    noise_limit_db: Option<f32>,
 ) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
     let selected: Vec<usize> = match chapters {
@@ -181,8 +180,8 @@ pub fn narrate(
     };
 
     let allowances = read_allowances_saying_so(voice_sample)?;
-    let voice = Voice::load(voice_sample)?;
-    let store = open_store(&book, &voice, out, speed)?;
+    let voice = Voice::load(voice_sample, noise_limit_db)?;
+    let store = open_store(&book, &voice, out, speed, noise_limit_db)?;
     let standard = Standard::of(&store, allowances);
 
     let text_dir = out.join("text");
@@ -257,11 +256,17 @@ fn print_missing(store: &NarrationStore) {
 /// Records new takes of only the chunks that `targets` name, keeping a new take
 /// only if it beats the current one. The old audio moves to `replaced/`. This leaves
 /// the M4B alone, so it's safe during playback; `book` rebuilds it afterwards.
-pub fn retake(voice_sample: &Path, epub: &Path, out: &Path, targets: &[&str]) -> Result<(), Box<dyn Error>> {
+pub fn retake(
+    voice_sample: &Path,
+    epub: &Path,
+    out: &Path,
+    targets: &[&str],
+    noise_limit_db: Option<f32>,
+) -> Result<(), Box<dyn Error>> {
     let book = read_book(epub)?;
     let allowances = read_allowances_saying_so(voice_sample)?;
-    let voice = Voice::load(voice_sample)?;
-    let store = open_store(&book, &voice, out, None)?;
+    let voice = Voice::load(voice_sample, noise_limit_db)?;
+    let store = open_store(&book, &voice, out, None, noise_limit_db)?;
     let standard = Standard::of(&store, allowances);
     let wanted = store.select(targets)?;
 

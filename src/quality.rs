@@ -9,28 +9,15 @@ const SILENCE_DB: f32 = -55.0;
 /// and noisy ones -34 to -48.
 pub const DEFAULT_NOISE_LIMIT_DB: f32 = -55.0;
 
-/// Overrides `DEFAULT_NOISE_LIMIT_DB`, and is saved with the output directory.
-/// A sample with faint room tone, such as a denoised outdoor recording, passes a
-/// little of it to every take: one voice's takes measured -51 to -57 dB and were
-/// heard as clean on a Cast speaker.
+/// Gives `--noise-limit`, which overrides `DEFAULT_NOISE_LIMIT_DB` and is saved
+/// with the output directory. A sample with faint room tone, such as a denoised
+/// outdoor recording, passes a little of it to every take: one voice's takes
+/// measured -51 to -57 dB and were heard as clean on a Cast speaker.
 pub const NOISE_LIMIT_VAR: &str = "AUDIO_BERRY_NOISE_LIMIT_DB";
 
-/// The noise limit given in the environment, if any. An invalid value is
-/// reported and ignored.
-pub fn noise_limit_from_env() -> Option<f32> {
-    let value = std::env::var(NOISE_LIMIT_VAR).ok()?;
-    let limit = valid_noise_limit(&value);
-    if limit.is_none() {
-        eprintln!("{NOISE_LIMIT_VAR}={value} isn't a level from -100 to 0 dB, so ignoring it");
-    }
-    limit
-}
-
-/// The noise limit given in the environment, without reporting an invalid value,
-/// for when something else reports it: when a voice sample loads, `book` and
-/// `retake` report it later.
-pub fn noise_limit_from_env_quietly() -> Option<f32> {
-    std::env::var(NOISE_LIMIT_VAR).ok().and_then(|value| valid_noise_limit(&value))
+/// A noise limit given on the command line.
+pub fn parse_noise_limit(value: &str) -> Result<f32, String> {
+    valid_noise_limit(value).ok_or_else(|| "must be a level from -100 to 0 dB".to_string())
 }
 
 /// A noise limit from text, if it's a level from -100 to 0 dB.

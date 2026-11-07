@@ -3,7 +3,7 @@
 
 use crate::book::MAX_TAKES;
 use crate::clean::{self, DEFAULT_REDUCTION_DB};
-use crate::quality::{self, DEFAULT_NOISE_LIMIT_DB, NOISE_LIMIT_VAR};
+use crate::quality::{self, DEFAULT_NOISE_LIMIT_DB};
 use crate::voice::SAMPLE_RATE;
 use std::path::Path;
 
@@ -81,7 +81,7 @@ impl SampleCheck {
             Verdict::Fine => None,
             Verdict::Noisy => {
                 let limit = match self.noise_limit_db {
-                    Some(limit) => format!("the noise limit of {limit} dB set by {NOISE_LIMIT_VAR}"),
+                    Some(limit) => format!("the noise limit of {limit} dB given"),
                     None => format!("the default noise limit of {DEFAULT_NOISE_LIMIT_DB} dB"),
                 };
                 // The next multiple of 5 dB above the floor takes are expected
@@ -95,7 +95,7 @@ impl SampleCheck {
                      Either:\n\
                      - keep this sample, and raise the limit when you narrate with book or retake, if test \
                      takes sound clean:\n    \
-                     {NOISE_LIMIT_VAR}={raised} audio-berry book {path} book.epub output/book\n\
+                     audio-berry book {path} book.epub output/book --noise-limit {raised}\n\
                      - or clean the original recording again into a new voice sample, with a higher \
                      --reduction than it had ({DEFAULT_REDUCTION_DB} dB by default). In tests, 20 dB gave \
                      takes about -56 dB and 30 about -59, with the clone less like the speaker:\n    \
@@ -164,7 +164,7 @@ mod tests {
         assert!(advice.contains("-45.3 dB"), "{advice}");
         assert!(advice.contains("default noise limit of -55 dB"), "{advice}");
         assert!(advice.contains("up to 5 takes per chunk"), "{advice}");
-        assert!(advice.contains("AUDIO_BERRY_NOISE_LIMIT_DB=-50 audio-berry book voices/dad.wav"), "{advice}");
+        assert!(advice.contains("audio-berry book voices/dad.wav book.epub output/book --noise-limit -50"), "{advice}");
         assert!(advice.contains("<end> voices/dad-clean.wav --reduction 20"), "{advice}");
         assert!(advice.contains("15 dB by default"), "{advice}");
         assert!(advice.contains("\"Noise limit\""), "{advice}");

@@ -2,7 +2,7 @@
 //! original can be compared by ear, saying the same thing.
 
 use crate::cast;
-use crate::narrator::Narrator;
+use crate::narrator::{Narrator, Take};
 use crate::voice::Voice;
 use std::error::Error;
 use std::fs;
@@ -35,10 +35,10 @@ fn pair_for(voice: &Path, dir: &Path) -> Result<Pair, Box<dyn Error>> {
 
 /// Saves the sample as the model hears it and its transcript in the cloned voice,
 /// then plays the two in turn on `speaker`, if one is given.
-pub fn audition(voice_sample: &Path, speaker: Option<&str>, speed: Option<f64>) -> Result<(), Box<dyn Error>> {
+pub fn audition(voice_sample: &Path, speaker: Option<&str>, take: &Take) -> Result<(), Box<dyn Error>> {
     // Finding the speaker first means a wrong name fails before the slow part.
     let speaker = speaker.map(cast::find).transpose()?;
-    let voice = Voice::load(voice_sample)?;
+    let voice = Voice::load(voice_sample, take.noise_limit_db)?;
     let pair = pair_for(voice_sample, Path::new(AUDITION_DIR))?;
     fs::create_dir_all(AUDITION_DIR)?;
 
@@ -47,7 +47,7 @@ pub fn audition(voice_sample: &Path, speaker: Option<&str>, speed: Option<f64>) 
     println!("Wrote {}: the sample as the model hears it", pair.original.display());
     println!("Saying: {}", voice.transcript());
     let narrator = Narrator::load()?;
-    narrator.say_to_file(&voice, voice.transcript(), &pair.cloned, speed.unwrap_or(1.0))?;
+    narrator.say_to_file(&voice, voice.transcript(), &pair.cloned, take)?;
 
     match speaker {
         Some(speaker) => cast::play(&speaker, vec![pair.original, pair.cloned]),

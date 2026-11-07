@@ -182,7 +182,7 @@ fn cut(samples: &[f32], start: f64, end: f64, sample_rate: u32) -> Vec<f32> {
 /// optionally with an `s`, `ms` or `us` unit, or `[HH:]MM:SS[.fraction]`.
 pub fn parse_time(text: &str) -> Result<f64, String> {
     seconds_in(text.trim()).ok_or_else(|| {
-        format!("{text} isn't a time; give seconds, such as 20.1, 20.1s or 1500ms, or minutes and seconds, such as 1:05.5")
+        "give seconds, such as 20.1, 20.1s or 1500ms, or minutes and seconds, such as 1:05.5".to_string()
     })
 }
 
@@ -223,7 +223,7 @@ fn plain_number(text: &str) -> Option<f64> {
 pub fn parse_reduction(text: &str) -> Result<f32, String> {
     let reduction = text.trim().parse::<f32>().ok().filter(|db| REDUCTION_RANGE.contains(db));
     reduction.ok_or_else(|| {
-        format!("--reduction must be from {} to {} dB, not {text}", REDUCTION_RANGE.start(), REDUCTION_RANGE.end())
+        format!("must be from {} to {} dB", REDUCTION_RANGE.start(), REDUCTION_RANGE.end())
     })
 }
 

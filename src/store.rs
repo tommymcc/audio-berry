@@ -1,6 +1,7 @@
 //! An output directory: one narration of one book, in one voice, with one set
 //! of render settings. Owns chunk numbering, the cache key and the files.
 
+use crate::narrator::PRECISION_VAR;
 use crate::quality::{DEFAULT_NOISE_LIMIT_DB, valid_noise_limit};
 use crate::accuracy::contains_phrase;
 use any_tts::{AudioSamples, DeviceSelection};
@@ -31,8 +32,9 @@ pub struct RenderSettings {
 }
 
 impl RenderSettings {
-    pub fn from_env(speed: Option<f64>) -> Self {
-        let dtype = std::env::var("OMNIVOICE_DTYPE").ok();
+    /// The settings for `speed` and the precision the model will load at.
+    pub fn new(speed: Option<f64>) -> Self {
+        let dtype = std::env::var(PRECISION_VAR).ok();
         Self { speed, ..Self::from_dtype(dtype.as_deref(), preferred_runtime_choice()) }
     }
 
@@ -217,9 +219,8 @@ fn settle_noise_limit(saved: Option<&Manifest>, given: Option<f32>, out: &Path) 
             save_now: false,
             note: Some(format!(
                 "Noise limit: {DEFAULT_NOISE_LIMIT_DB} dB. {} has no saved limit, so if this output directory \
-                 was rendered with {}, give it once more to save it.",
+                 was rendered with --noise-limit, give it once more to save it.",
                 path.display(),
-                crate::quality::NOISE_LIMIT_VAR,
             )),
         },
     }
