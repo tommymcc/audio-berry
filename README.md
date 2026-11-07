@@ -267,8 +267,8 @@ length the speaker reports plus a minute. Leave `play` running until playback en
 `audition` says a voice sample's own words, from its `.txt` file, in the cloned
 voice, then plays the sample and the clone in turn, so you hear the same words in
 both. They play on this computer with `ffplay`, which comes with ffmpeg, or on the
-Cast speaker matching `--speaker <name>`, as `play` matches it. If there's no `.txt` yet, it transcribes the sample first.
-It saves them in `output/audition`, so `voices/me.wav` gives `me-original.wav` and
+Cast speaker matching `--speaker <name>`, as `play` matches it. If there's no
+`.txt` yet, it transcribes the sample first. It saves them in `output/audition`, so `voices/me.wav` gives `me-original.wav` and
 `me-clone.wav`. The original is the part of the sample the model hears, at 24 kHz
 mono, and trimmed to at most 15 seconds if the sample is over 20. If you wrote the
 `.txt` for a longer recording than that, it warns that the clone will say more

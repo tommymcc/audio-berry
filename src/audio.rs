@@ -44,7 +44,7 @@ fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, doing: &st
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = ffmpeg.spawn().wrap_err(COULDNT_RUN)?;
+    let mut child = ffmpeg.spawn().wrap_err(COULDNT_RUN_FFMPEG)?;
     // Written from another thread, so ffmpeg's output can't fill up and stall it.
     let writer = match (stdin, child.stdin.take()) {
         (Some(bytes), Some(mut pipe)) => Some(std::thread::spawn(move || pipe.write_all(&bytes))),
@@ -68,19 +68,19 @@ fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, doing: &st
 }
 
 /// Why ffmpeg failed to start, which is usually that it isn't installed.
-pub const COULDNT_RUN: &str = "couldn't run ffmpeg; is it installed?";
+pub const COULDNT_RUN_FFMPEG: &str = "couldn't run ffmpeg; is it installed?";
 
-/// An error saying ffmpeg couldn't do what it was asked, such as "read
-/// voices/me.wav", with what it said about it below, without the internal
-/// addresses it starts its lines with.
+/// `tool_failed` for ffmpeg.
 pub fn ffmpeg_failed(doing: &str, stderr: &[u8]) -> Report {
     tool_failed("ffmpeg", doing, stderr)
 }
 
-/// As `ffmpeg_failed`, for `ffmpeg` or `ffplay`.
+/// An error saying `tool` (ffmpeg or ffplay) couldn't do what it was asked,
+/// such as "read voices/me.wav", with what it said about it below in a
+/// "<tool> said:" section, without the internal addresses it starts its lines with.
 fn tool_failed(tool: &str, doing: &str, stderr: &[u8]) -> Report {
     let failed = eyre!("{tool} couldn't {doing}");
-    match ffmpeg_said(stderr) {
+    match what_it_said(stderr) {
         Some(said) => failed.section(said.header(format!("{tool} said:"))),
         None => failed,
     }
@@ -98,15 +98,16 @@ pub fn play_here(path: &Path) -> Result<()> {
         .output()
         .wrap_err(COULDNT_RUN_FFPLAY)?;
     // ffplay exits successfully even when it can't read the file, but at this
-    // log level it only writes errors.
+    // log level it only writes errors. An error partway through a file also
+    // counts, though some of it will have played.
     if !output.status.success() || !output.stderr.trim_ascii().is_empty() {
         return Err(tool_failed("ffplay", &format!("play {}", path.display()), &output.stderr));
     }
     Ok(())
 }
 
-/// ffmpeg's error output without its addresses or blank lines, if it said anything.
-fn ffmpeg_said(stderr: &[u8]) -> Option<String> {
+/// ffmpeg's or ffplay's error output without its addresses or blank lines, if it said anything.
+fn what_it_said(stderr: &[u8]) -> Option<String> {
     let stderr = String::from_utf8_lossy(stderr);
     let said: Vec<&str> = stderr.lines().map(without_address).filter(|line| !line.is_empty()).collect();
     (!said.is_empty()).then(|| said.join("\n"))
@@ -133,10 +134,10 @@ mod tests {
         let report = ffmpeg_failed("read voices/me.wav", stderr);
         assert_eq!(report.to_string(), "ffmpeg couldn't read voices/me.wav");
         assert_eq!(
-            ffmpeg_said(stderr).unwrap(),
+            what_it_said(stderr).unwrap(),
             "Error opening input: No such file or directory\nError opening input file voices/me.wav."
         );
-        assert_eq!(ffmpeg_said(b"\n  \n"), None);
+        assert_eq!(what_it_said(b"\n  \n"), None);
     }
 
     #[test]
@@ -146,7 +147,7 @@ mod tests {
         let path = dir.join("not-audio.wav");
         std::fs::write(&path, "not audio").unwrap();
         let error = play_here(&path).unwrap_err().to_string();
-        assert!(error.contains("ffplay"), "{error}");
+        assert!(error.starts_with("ffplay couldn't play"), "{error}");
     }
 
     #[test]

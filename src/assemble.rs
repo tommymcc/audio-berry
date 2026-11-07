@@ -1,7 +1,7 @@
 //! Joins an output directory's complete chapters into a WAV each and a
 //! chaptered M4B, tagged with the book's title, author and cover.
 
-use crate::audio::{COULDNT_RUN, ffmpeg_failed};
+use crate::audio::{COULDNT_RUN_FFMPEG, ffmpeg_failed};
 use crate::epub::{Book, image_type};
 use crate::quality;
 use crate::store::NarrationStore;
@@ -58,7 +58,7 @@ fn tag_chapter(book: &Book, title: &str, untagged: &Path, tagged: &Path) -> Resu
     if let Some(author) = &book.author {
         ffmpeg.arg("-metadata").arg(format!("artist={author}"));
     }
-    let output = ffmpeg.arg(tagged).output().wrap_err(COULDNT_RUN)?;
+    let output = ffmpeg.arg(tagged).output().wrap_err(COULDNT_RUN_FFMPEG)?;
     if !output.status.success() {
         return Err(ffmpeg_failed(&format!("tag {}", tagged.display()), &output.stderr));
     }
@@ -125,7 +125,7 @@ pub fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathB
         ffmpeg.args(["-map", "2:v", "-c:v", "copy", "-disposition:v:0", "attached_pic"]);
     }
     ffmpeg.args(["-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", "-f", "mp4"]);
-    let output = ffmpeg.arg(&m4b).output().wrap_err(COULDNT_RUN)?;
+    let output = ffmpeg.arg(&m4b).output().wrap_err(COULDNT_RUN_FFMPEG)?;
     if !output.status.success() {
         return Err(ffmpeg_failed(&format!("make {}", m4b.display()), &output.stderr));
     }
