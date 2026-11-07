@@ -22,7 +22,9 @@
 
 **Take policy:** how many takes of a chunk `book` and `retake` render and which they keep: the first good enough unless `--takes` asks for the best of a set number. Good enough is a take that passes for `book`, and for `retake` a flawless one with its phrases heard. Like the noise limit, it's saved in `narration.txt` and isn't a render setting.
 
-**Pitch range:** how lively a take sounds: the span of its voiced pitch from the 5th to the 95th percentile, in semitones, tracked with pYIN at 16 kHz. Takes with too little voiced speech, under 20 frames of 10 ms, have none. Given a target with `--pitch-range`, the take that passes nearest it is kept, nearness being the smaller of the two ratios between range and target. Like the take policy, the target is saved in `narration.txt` and isn't a render setting.
+**Pitch range:** the span of a take's voiced pitch from the 5th to the 95th percentile, in semitones, tracked with pYIN at 16 kHz. A flat take has a narrow one. Takes with too little voiced speech, under 20 frames of 10 ms, have none. Given a target with `--pitch-range`, the take that passes nearest it is kept.
+
+**Nearness:** how near a take's pitch range is to the target: the smaller of the two ratios between range and target, 1 when exact. It ranks in steps of 0.05, so takes in the same step are ranked by how they're heard. It only ranks takes that pass. Like the take policy, the target is saved in `narration.txt` and isn't a render setting.
 
 **Voice sample:** the recording a narration's voice is cloned from, such as `voices/me.wav`, with what's said in it in a `.txt` file beside it. `clean` makes one from a noisy recording.
 

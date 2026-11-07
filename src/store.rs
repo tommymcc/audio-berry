@@ -217,121 +217,97 @@ pub struct NarrationStore {
     manifest: Manifest,
 }
 
-/// The noise limit a run uses, and what that means for `narration.txt`.
-struct SettledNoiseLimit {
-    limit_db: f32,
-    /// What `narration.txt` should hold. `None` leaves an older output
-    /// directory's file without a limit.
-    saved: Option<f32>,
+/// A setting that decides which take is kept, as a run settles it from the one
+/// given and the one saved in `narration.txt`.
+struct Settled<T> {
+    value: T,
     /// Whether to rewrite an existing `narration.txt` now. A new output
     /// directory saves its file with the first take instead.
     save_now: bool,
     note: Option<String>,
 }
 
-/// A given limit wins and is saved; otherwise the saved one is used. An output
-/// directory saved before limits were gets the default without it being written,
-/// because it may have been rendered with a limit that wasn't saved.
-fn settle_noise_limit(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> SettledNoiseLimit {
+/// How a setting given on the command line compares with the one saved.
+enum Change<T> {
+    /// A new output directory, with what was given, if anything.
+    New { given: Option<T> },
+    /// Given, and different from the saved setting, which it replaces.
+    Replacing { old: T, new: T },
+    /// The saved setting, whether or not it was given again.
+    Kept { old: T, given: bool },
+}
+
+impl<T: PartialEq> Settled<T> {
+    /// A given setting wins and is saved; otherwise the saved one is used, or
+    /// `default` in a new output directory. `note` says what the run will use.
+    fn settle(saved: Option<T>, given: Option<T>, default: T, note: impl FnOnce(&Change<T>) -> Option<String>) -> Self {
+        let change = match (saved, given) {
+            (None, given) => Change::New { given },
+            (Some(old), Some(new)) if old != new => Change::Replacing { old, new },
+            (Some(old), given) => Change::Kept { old, given: given.is_some() },
+        };
+        let note = note(&change);
+        let (value, save_now) = match change {
+            Change::New { given } => (given.unwrap_or(default), false),
+            Change::Replacing { new, .. } => (new, true),
+            Change::Kept { old, .. } => (old, false),
+        };
+        Settled { value, save_now, note }
+    }
+}
+
+/// What `narration.txt` should hold for the noise limit, from which the run's
+/// limit follows, with `None` for the default. A given limit wins and is saved;
+/// otherwise the saved one is used. An output directory saved before limits were
+/// gets the default without it being written, because it may have been rendered
+/// with a limit that wasn't saved.
+fn settle_noise_limit(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> Settled<Option<f32>> {
     let path = out.join(MANIFEST);
-    let Some(saved) = saved else {
-        let limit_db = given.unwrap_or(DEFAULT_NOISE_LIMIT_DB);
-        let note = given.map(|limit| format!("Noise limit: {limit} dB"));
-        return SettledNoiseLimit { limit_db, saved: Some(limit_db), save_now: false, note };
-    };
-    match (saved.noise_limit_db, given) {
-        (Some(old), Some(new)) if old != new => SettledNoiseLimit {
-            limit_db: new,
-            saved: Some(new),
-            save_now: true,
-            note: Some(format!("Noise limit: {new} dB, replacing {old} dB in {}", path.display())),
-        },
-        (None, Some(new)) => SettledNoiseLimit {
-            limit_db: new,
-            saved: Some(new),
-            save_now: true,
-            note: Some(format!("Noise limit: {new} dB, now saved in {}", path.display())),
-        },
-        (Some(old), _) => SettledNoiseLimit {
-            limit_db: old,
-            saved: Some(old),
-            save_now: false,
-            note: (given.is_some() || old != DEFAULT_NOISE_LIMIT_DB).then(|| format!("Noise limit: {old} dB")),
-        },
-        (None, None) => SettledNoiseLimit {
-            limit_db: DEFAULT_NOISE_LIMIT_DB,
-            saved: None,
-            save_now: false,
-            note: Some(format!(
-                "Noise limit: {DEFAULT_NOISE_LIMIT_DB} dB. {} has no saved limit, so if this output directory \
-                 was rendered with --noise-limit, give it once more to save it.",
-                path.display(),
-            )),
-        },
-    }
+    let saved = saved.map(|saved| saved.noise_limit_db);
+    Settled::settle(saved, given.map(Some), Some(DEFAULT_NOISE_LIMIT_DB), |change| match *change {
+        Change::New { given } => given.flatten().map(|limit| format!("Noise limit: {limit} dB")),
+        Change::Replacing { old, new } => new.map(|new| match old {
+            Some(old) => format!("Noise limit: {new} dB, replacing {old} dB in {}", path.display()),
+            None => format!("Noise limit: {new} dB, now saved in {}", path.display()),
+        }),
+        Change::Kept { old: Some(old), given } => {
+            (given || old != DEFAULT_NOISE_LIMIT_DB).then(|| format!("Noise limit: {old} dB"))
+        }
+        Change::Kept { old: None, .. } => Some(format!(
+            "Noise limit: {DEFAULT_NOISE_LIMIT_DB} dB. {} has no saved limit, so if this output directory \
+             was rendered with --noise-limit, give it once more to save it.",
+            path.display(),
+        )),
+    })
 }
 
-/// The take policy a run uses, and whether to save it in `narration.txt` now.
-struct SettledTakes {
-    policy: TakePolicy,
-    /// Whether to rewrite an existing `narration.txt` now. A new output
-    /// directory saves its file with the first take instead.
-    save_now: bool,
-    note: Option<String>,
+/// The take policy a run uses: the default in a new output directory or one
+/// saved before policies were.
+fn settle_takes(saved: Option<&Manifest>, given: Option<TakePolicy>, out: &Path) -> Settled<TakePolicy> {
+    let saved = saved.map(|saved| saved.takes);
+    Settled::settle(saved, given, TakePolicy::default(), |change| match *change {
+        Change::New { given } => given.map(|policy| format!("Takes: keeping {policy}")),
+        Change::Replacing { old, new } => {
+            Some(format!("Takes: keeping {new}, replacing {old} in {}", out.join(MANIFEST).display()))
+        }
+        Change::Kept { old, given } => (given || old != TakePolicy::default()).then(|| format!("Takes: keeping {old}")),
+    })
 }
 
-/// A given policy wins and is saved; otherwise the saved one is used, or the
-/// default in a new output directory or one saved before policies were.
-fn settle_takes(saved: Option<&Manifest>, given: Option<TakePolicy>, out: &Path) -> SettledTakes {
-    let Some(saved) = saved else {
-        let note = given.map(|policy| format!("Takes: keeping {policy}"));
-        return SettledTakes { policy: given.unwrap_or_default(), save_now: false, note };
-    };
-    match given {
-        Some(new) if new != saved.takes => SettledTakes {
-            policy: new,
-            save_now: true,
-            note: Some(format!("Takes: keeping {new}, replacing {} in {}", saved.takes, out.join(MANIFEST).display())),
-        },
-        _ => SettledTakes {
-            policy: saved.takes,
-            save_now: false,
-            note: (given.is_some() || saved.takes != TakePolicy::default())
-                .then(|| format!("Takes: keeping {}", saved.takes)),
-        },
-    }
-}
-
-/// The pitch range target a run uses, and whether to save it in `narration.txt` now.
-struct SettledPitchRange {
-    target: Option<f32>,
-    /// Whether to rewrite an existing `narration.txt` now. A new output
-    /// directory saves its file with the first take instead.
-    save_now: bool,
-    note: Option<String>,
-}
-
-/// A given target wins and is saved; otherwise the saved one is used, or none in
-/// a new output directory or one saved before targets were.
-fn settle_pitch_range(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> SettledPitchRange {
+/// The pitch range target a run uses: none in a new output directory or one
+/// saved before targets were.
+fn settle_pitch_range(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> Settled<Option<f32>> {
     let aiming = |range: f32| format!("Pitch range: aiming for {range} semitones");
-    let Some(saved) = saved else {
-        return SettledPitchRange { target: given, save_now: false, note: given.map(aiming) };
-    };
     let path = out.join(MANIFEST);
-    match (saved.pitch_range_st, given) {
-        (Some(old), Some(new)) if old != new => SettledPitchRange {
-            target: Some(new),
-            save_now: true,
-            note: Some(format!("{}, replacing {old} in {}", aiming(new), path.display())),
-        },
-        (None, Some(new)) => SettledPitchRange {
-            target: Some(new),
-            save_now: true,
-            note: Some(format!("{}, now saved in {}", aiming(new), path.display())),
-        },
-        (old, _) => SettledPitchRange { target: old, save_now: false, note: old.map(aiming) },
-    }
+    let saved = saved.map(|saved| saved.pitch_range_st);
+    Settled::settle(saved, given.map(Some), None, |change| match *change {
+        Change::New { given } => given.flatten().map(aiming),
+        Change::Replacing { old, new } => new.map(|new| match old {
+            Some(old) => format!("{}, replacing {old} in {}", aiming(new), path.display()),
+            None => format!("{}, now saved in {}", aiming(new), path.display()),
+        }),
+        Change::Kept { old, .. } => old.map(aiming),
+    })
 }
 
 /// Numbers the chunks and keys each by its text, voice and speed.
@@ -396,17 +372,17 @@ impl NarrationStore {
             voice: format!("{voice:x}"),
             precision: settings.precision.clone(),
             speed,
-            noise_limit_db: noise_limit.saved,
-            takes: takes.policy,
-            pitch_range_st: pitch_range.target,
+            noise_limit_db: noise_limit.value,
+            takes: takes.value,
+            pitch_range_st: pitch_range.value,
         };
         let store = Self {
             out: out.to_path_buf(),
             chunks,
             speed,
-            noise_limit_db: noise_limit.limit_db,
-            takes: takes.policy,
-            pitch_range_st: pitch_range.target,
+            noise_limit_db: noise_limit.value.unwrap_or(DEFAULT_NOISE_LIMIT_DB),
+            takes: takes.value,
+            pitch_range_st: pitch_range.value,
             manifest,
         };
         store.require_same(saved)?;

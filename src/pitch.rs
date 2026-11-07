@@ -1,16 +1,17 @@
-//! Measures how lively a take sounds, as the range of pitch its voice spans.
-//! Flat takes of a lively voice sound unlike it even when every word is right.
+//! Measures a take's pitch range: the span of pitch its voice covers. Flat takes
+//! of a lively voice sound unlike it even when every word is right.
 //!
 //! Pitch is tracked with pYIN, as librosa's `pyin` does it, so ranges agree with
 //! the listening tests that chose the target: YIN's troughs at many thresholds
 //! give each frame candidate pitches, and a hidden Markov model picks a smooth
 //! path through them, deciding which frames are voiced.
 
-use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::sync::Arc;
 
-/// The targets `--pitch-range` can ask for, in semitones. One voice's lines
-/// spanned 7 to 16.
+/// The targets `--pitch-range` can ask for, in semitones. A lively speaker's
+/// sentences typically span about 7 to 16.
 pub const PITCH_RANGE_LIMITS: std::ops::RangeInclusive<f32> = 2.0..=30.0;
 
 /// A target pitch range given on the command line.
@@ -26,7 +27,7 @@ pub fn valid_pitch_range(value: &str) -> Option<f32> {
 
 /// How near a take's pitch range is to the target, as the smaller of their
 /// ratios: 1 when exact, and towards 0 the further off, whether flatter or livelier.
-pub fn closeness(range: f32, target: f32) -> f32 {
+pub fn nearness(range: f32, target: f32) -> f32 {
     if range <= 0.0 || target <= 0.0 {
         return 0.0;
     }
@@ -42,19 +43,24 @@ pub fn range_semitones(samples: &[f32], sample_rate: u32) -> Option<f32> {
         return None;
     }
     let median = percentile(&sorted(voiced.clone()), 50.0);
-    let semitones = sorted(voiced.iter().map(|hz| 12.0 * (hz / median).log2()).collect());
+    let semitones = sorted(voiced.iter().map(|hz| SEMITONES_PER_OCTAVE * (hz / median).log2()).collect());
     Some((percentile(&semitones, 95.0) - percentile(&semitones, 5.0)) as f32)
 }
 
+const SEMITONES_PER_OCTAVE: f64 = 12.0;
 /// Fewer voiced frames than this is too little speech to measure.
 const MIN_VOICED_FRAMES: usize = 20;
 /// The pitch searched, which covers a man's speaking voice and most women's.
 const LOWEST_HZ: f64 = 60.0;
 const HIGHEST_HZ: f64 = 300.0;
-/// Each frame is analysed over this much audio, centred on it.
+/// Each frame is analysed over this much audio, centred on it: 1024 samples at
+/// 16 kHz, and 10 ms apart, as the listening tests measured.
 const FRAME_SECONDS: f64 = 0.064;
 const HOP_SECONDS: f64 = 0.01;
-/// The pitch path's resolution.
+
+// The rest are librosa's defaults for `pyin`.
+
+/// The pitch path's resolution, a tenth of a semitone.
 const BINS_PER_SEMITONE: usize = 10;
 /// How fast the pitch path can move, in semitones a second.
 const MAX_TRANSITION_RATE: f64 = 35.92;
@@ -74,10 +80,21 @@ const BOLTZMANN: f64 = 2.0;
 /// rate the listening tests measured at.
 const ANALYSIS_RATE: u32 = 16_000;
 
+/// Where `hz` falls among the pitch path's bins, counting from `LOWEST_HZ`.
+fn bin_of(hz: f64) -> f64 {
+    SEMITONES_PER_OCTAVE * BINS_PER_SEMITONE as f64 * (hz / LOWEST_HZ).log2()
+}
+
+/// The pitch at the centre of a bin.
+fn hz_of(bin: usize) -> f64 {
+    LOWEST_HZ * 2f64.powf(bin as f64 / (SEMITONES_PER_OCTAVE * BINS_PER_SEMITONE as f64))
+}
+
 /// Each frame's pitch in Hz every `HOP_SECONDS`, or `None` where unvoiced.
 fn track(samples: &[f32], sample_rate: u32) -> Vec<Option<f64>> {
     let samples = resample(samples, sample_rate, ANALYSIS_RATE);
     let rate = f64::from(ANALYSIS_RATE);
+    // Even, so half a frame either side centres it exactly.
     let frame = (FRAME_SECONDS * rate).round() as usize & !1;
     let hop = ((HOP_SECONDS * rate).round() as usize).max(1);
     let min_period = (rate / HIGHEST_HZ).floor() as usize;
@@ -85,9 +102,9 @@ fn track(samples: &[f32], sample_rate: u32) -> Vec<Option<f64>> {
     if samples.is_empty() || min_period < 1 || max_period <= min_period + 1 {
         return Vec::new();
     }
-    let bins = (12.0 * BINS_PER_SEMITONE as f64 * (HIGHEST_HZ / LOWEST_HZ).log2()).floor() as usize + 1;
-    let semitones_per_hop = (MAX_TRANSITION_RATE * 12.0 * HOP_SECONDS).round() as usize;
-    let mut path = Path::new(bins, semitones_per_hop * BINS_PER_SEMITONE / 2);
+    let bins = bin_of(HIGHEST_HZ).floor() as usize + 1;
+    let semitones_per_hop = (MAX_TRANSITION_RATE * SEMITONES_PER_OCTAVE * HOP_SECONDS).round() as usize;
+    let mut path = PitchPath::new(bins, semitones_per_hop * BINS_PER_SEMITONE / 2);
     let mut differences = Differences::new(frame, min_period, max_period);
     let observations = Observations::new(bins, min_period, rate);
 
@@ -103,7 +120,7 @@ fn track(samples: &[f32], sample_rate: u32) -> Vec<Option<f64>> {
     }
     path.best()
         .into_iter()
-        .map(|state| (state < bins).then(|| LOWEST_HZ * 2f64.powf(state as f64 / (12 * BINS_PER_SEMITONE) as f64)))
+        .map(|state| (state < bins).then(|| hz_of(state)))
         .collect()
 }
 
@@ -188,8 +205,8 @@ struct Differences {
     frame: usize,
     min_period: usize,
     max_period: usize,
-    forward: std::sync::Arc<dyn realfft::RealToComplex<f64>>,
-    inverse: std::sync::Arc<dyn realfft::ComplexToReal<f64>>,
+    forward: Arc<dyn RealToComplex<f64>>,
+    inverse: Arc<dyn ComplexToReal<f64>>,
     input: Vec<f64>,
     spectrum: Vec<Complex<f64>>,
     autocorrelation: Vec<f64>,
@@ -236,6 +253,7 @@ impl Differences {
             cumulative += difference;
             if period >= self.min_period {
                 let mean = cumulative / period as f64;
+                // librosa adds the smallest normal float, here f32's as its audio is.
                 self.cmnd[period - self.min_period] = difference / (mean + f64::from(f32::MIN_POSITIVE));
             }
         }
@@ -249,6 +267,8 @@ struct Observations {
     bins: usize,
     min_period: usize,
     rate: f64,
+    /// The thresholds, from 0.01 to 1.
+    thresholds: Vec<f64>,
     /// How likely each threshold is, from the Beta prior.
     threshold_weights: Vec<f64>,
 }
@@ -257,10 +277,10 @@ impl Observations {
     fn new(bins: usize, min_period: usize, rate: f64) -> Self {
         // Beta(2, b)'s CDF has a closed form: 1 − (1 − x)^b · (1 + b·x).
         let cdf = |x: f64| 1.0 - (1.0 - x).powi(BETA_B) * (1.0 + f64::from(BETA_B) * x);
-        let threshold = |index: usize| index as f64 / THRESHOLDS as f64;
-        let threshold_weights =
-            (0..THRESHOLDS).map(|index| cdf(threshold(index + 1)) - cdf(threshold(index))).collect();
-        Observations { bins, min_period, rate, threshold_weights }
+        let thresholds: Vec<f64> = (1..=THRESHOLDS).map(|index| index as f64 / THRESHOLDS as f64).collect();
+        let below = |index: usize| if index == 0 { 0.0 } else { thresholds[index - 1] };
+        let threshold_weights = (0..THRESHOLDS).map(|index| cdf(thresholds[index]) - cdf(below(index))).collect();
+        Observations { bins, min_period, rate, thresholds, threshold_weights }
     }
 
     fn of(&self, cmnd: &[f64]) -> Vec<f64> {
@@ -280,8 +300,7 @@ impl Observations {
             let decay: Vec<f64> = (0..=troughs.len()).map(|count| (-BOLTZMANN * count as f64).exp()).collect();
             // At each threshold, the troughs below it share its weight, the
             // earliest most, by a Boltzmann distribution over their order.
-            for (index, weight) in self.threshold_weights.iter().enumerate() {
-                let threshold = (index + 1) as f64 / THRESHOLDS as f64;
+            for (&threshold, weight) in self.thresholds.iter().zip(&self.threshold_weights) {
                 let below = troughs.iter().filter(|&&trough| cmnd[trough] < threshold).count();
                 let normaliser = (1.0 - decay[1]) / (1.0 - decay[below]);
                 let mut position = 0;
@@ -295,7 +314,7 @@ impl Observations {
             // The deepest trough also takes the thresholds no trough is below.
             let deepest = first_largest(troughs.iter().map(|&trough| -cmnd[trough]));
             let depth = cmnd[troughs[deepest]];
-            let unreached = (1..=THRESHOLDS).take_while(|&index| index as f64 / THRESHOLDS as f64 <= depth).count();
+            let unreached = self.thresholds.iter().take_while(|&&threshold| threshold <= depth).count();
             weights[deepest] += NO_TROUGH_PROBABILITY * self.threshold_weights[..unreached].iter().sum::<f64>();
 
             for (&trough, &weight) in troughs.iter().zip(&weights) {
@@ -305,8 +324,7 @@ impl Observations {
                 let period = (self.min_period + trough) as f64 + parabolic_shift(cmnd, trough);
                 let hz = self.rate / period;
                 // Rounded half to even, as numpy rounds.
-                let bin = (12.0 * BINS_PER_SEMITONE as f64 * (hz / LOWEST_HZ).log2()).round_ties_even();
-                let bin = bin.max(0.0) as usize;
+                let bin = bin_of(hz).round_ties_even().max(0.0) as usize;
                 // Above the highest pitch, as librosa clips it into a state it then overwrites.
                 if bin < self.bins {
                     probabilities[bin] = weight;
@@ -331,10 +349,30 @@ fn parabolic_shift(values: &[f64], index: usize) -> f64 {
     if slope.abs() >= curve.abs() { 0.0 } else { -slope / curve }
 }
 
+/// Whether a state is voiced. The voiced states come first, one per pitch bin,
+/// then the unvoiced ones, as in librosa.
+#[derive(Clone, Copy, PartialEq)]
+enum Voicing {
+    Voiced,
+    Unvoiced,
+}
+
+impl Voicing {
+    const BOTH: [Voicing; 2] = [Voicing::Voiced, Voicing::Unvoiced];
+
+    /// The state of this voicing at pitch bin 0.
+    fn first_state(self, bins: usize) -> usize {
+        match self {
+            Voicing::Voiced => 0,
+            Voicing::Unvoiced => bins,
+        }
+    }
+}
+
 /// The most likely sequence of states, by Viterbi decoding as frames arrive.
 /// The pitch moves at most `reach` bins a frame, more likely the less it moves,
 /// and voicing switches with `SWITCH_PROBABILITY`.
-struct Path {
+struct PitchPath {
     bins: usize,
     reach: usize,
     /// Log-likelihood of the best path ending in each state.
@@ -347,7 +385,7 @@ struct Path {
     started: bool,
 }
 
-impl Path {
+impl PitchPath {
     fn new(bins: usize, reach: usize) -> Self {
         let in_reach = |bin: usize| bin.saturating_sub(reach)..=(bin + reach).min(bins - 1);
         // Triangular around the current bin, normalised over the bins in its reach.
@@ -356,10 +394,12 @@ impl Path {
         let log_moves = (0..bins)
             .map(|to| in_reach(to).map(|from| (weight(from, to) / totals[from]).ln()).collect())
             .collect();
-        Path { bins, reach, value: Vec::new(), back: Vec::new(), log_moves, started: false }
+        PitchPath { bins, reach, value: Vec::new(), back: Vec::new(), log_moves, started: false }
     }
 
     fn step(&mut self, observations: &[f64]) {
+        // librosa adds the smallest normal float before taking logs, so a state
+        // that can't be observed is very unlikely rather than impossible.
         let log = |probability: f64| (probability + f64::MIN_POSITIVE).ln();
         if !self.started {
             self.started = true;
@@ -375,8 +415,8 @@ impl Path {
             let lowest = to.saturating_sub(self.reach);
             let moves = &self.log_moves[to];
             // The best bin to come from, voiced and unvoiced, the lowest on a tie.
-            let best = |voicing: usize| {
-                let start = voicing * self.bins + lowest;
+            let best = |voicing: Voicing| {
+                let start = voicing.first_state(self.bins) + lowest;
                 let values = &self.value[start..start + moves.len()];
                 let (mut best, mut best_from) = (f64::NEG_INFINITY, start);
                 for (offset, (value, chance)) in values.iter().zip(moves).enumerate() {
@@ -386,14 +426,17 @@ impl Path {
                 }
                 (best, best_from)
             };
-            let (voiced, unvoiced) = (best(0), best(1));
-            for to_voicing in 0..2 {
-                let (from_voiced, from_unvoiced) = if to_voicing == 0 { (stay, switch) } else { (switch, stay) };
+            let (voiced, unvoiced) = (best(Voicing::Voiced), best(Voicing::Unvoiced));
+            for to_voicing in Voicing::BOTH {
+                let (from_voiced, from_unvoiced) = match to_voicing {
+                    Voicing::Voiced => (stay, switch),
+                    Voicing::Unvoiced => (switch, stay),
+                };
                 let voiced = (voiced.0 + from_voiced, voiced.1);
                 let unvoiced = (unvoiced.0 + from_unvoiced, unvoiced.1);
                 // Ties go to the voiced state, as it comes first.
                 let (best, best_from) = if unvoiced.0 > voiced.0 { unvoiced } else { voiced };
-                let state = to_voicing * self.bins + to;
+                let state = to_voicing.first_state(self.bins) + to;
                 value[state] = best + log(observations[state]);
                 back[state] = best_from as u16;
             }
@@ -542,12 +585,12 @@ mod tests {
     }
 
     #[test]
-    fn closeness_is_1_at_the_target_and_falls_either_side() {
-        assert_eq!(closeness(12.4, 12.4), 1.0);
-        assert!((closeness(6.2, 12.4) - 0.5).abs() < 1e-6);
-        assert!((closeness(24.8, 12.4) - 0.5).abs() < 1e-6);
-        assert!(closeness(11.0, 12.4) > closeness(15.0, 12.4));
-        assert_eq!(closeness(0.0, 12.4), 0.0);
+    fn nearness_is_1_at_the_target_and_falls_either_side() {
+        assert_eq!(nearness(12.4, 12.4), 1.0);
+        assert!((nearness(6.2, 12.4) - 0.5).abs() < 1e-6);
+        assert!((nearness(24.8, 12.4) - 0.5).abs() < 1e-6);
+        assert!(nearness(11.0, 12.4) > nearness(15.0, 12.4));
+        assert_eq!(nearness(0.0, 12.4), 0.0);
     }
 
     #[test]

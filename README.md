@@ -231,9 +231,9 @@ audio-berry clean [OPTIONS] <recording> <start> <end> <output.wav>
 `audio-berry <command> --help` describes a command's arguments and options:
 `--speed <factor>` for `speak`, `book` and `audition`, `--seed <n>` for `speak`
 and `audition`, `--takes <n>` and `--pitch-range <semitones>` for `book` and
-`retake`, `--noise-limit <dB>` and
-`--precision <f32|f16|bf16>` for `speak`, `book`, `retake` and `audition`, and
-`--reduction <dB>` for `sections` and `clean`. An environment variable can give `--noise-limit`
+`retake`, `--noise-limit <dB>` and `--precision <f32|f16|bf16>` for `speak`,
+`book`, `retake` and `audition`, and `--reduction <dB>` for `sections` and
+`clean`. An environment variable can give `--noise-limit`
 (`AUDIO_BERRY_NOISE_LIMIT_DB`), `--seed` (`OMNIVOICE_SEED`) or `--precision`
 (`OMNIVOICE_DTYPE`) instead, and the option wins if both are given. An invalid
 value stops a command that takes the option. `book` and `retake` pick their own
@@ -328,18 +328,22 @@ A flat take of a lively voice sounds unlike it even when every word is right.
 `--pitch-range <semitones>`, from 2 to 30, keeps the take that passes whose pitch
 range, from its 5th to 95th percentile of pitch, is nearest that, ahead of the
 one heard most nearly as written, since every take that passes is heard well
-enough. A take that fails still never beats one that passes. One speaker's
-lively sentences span about 12.4 semitones, and his lines 7 to 16:
+enough. Nearness counts in steps of 5%, so takes about as near as each other
+are still ranked by how they're heard, and a take that fails never beats one
+that passes. A lively speaker's sentences typically span about 7 to 16
+semitones, so pick a target in that span and adjust it by ear, using the ranges
+the kept takes measured:
 
 ```sh
-./target/release/audio-berry book voices/dad.wav book.epub output/book --takes 5 --pitch-range 12.4 --noise-limit -50
+./target/release/audio-berry book voices/me.wav book.epub output/book --takes 5 --pitch-range 12.4 --noise-limit -50
 ```
 
 It only matters when there are takes to choose between, as with `--takes` above
 1, since by default `book` keeps the first take that passes. It's saved in
-`narration.txt` like `--takes`, and each chunk's line and the `pitch_range_st`
-column of `report.tsv` give the take's range. Without it, nothing is measured
-and that column is empty.
+`narration.txt` like `--takes`, so it also applies to `retake`: that keeps the
+current take if it passes and is nearer the target than the new ones. Each
+chunk's line and the `pitch_range_st` column of `report.tsv` give the take's
+range. Without a target, nothing is measured and that column is empty.
 
 In a terminal, `book` and `retake` show a progress bar with the time left and the
 latest chunk's take and recall. For `book` the bar covers the whole book, so a
@@ -514,9 +518,9 @@ An output directory holds one book in one voice, with one speed and model
 precision (`--precision`). It saves them in `narration.txt` with its first take, and
 later runs reuse the saved speed, so you don't have to repeat `--speed`. It also
 saves the [noise limit](#noise-limit), `--takes` and `--pitch-range`, which can
-change at any time. A run
-with a different book, voice, speed or precision stops with an error rather than
-rendering everything again, so use a new directory for those. Correcting a voice's
+change at any time. A run with a different book, voice, speed or precision stops
+with an error rather than rendering everything again, so use a new directory for
+those. Correcting a voice's
 `.txt` file counts as a different voice, but changing its [allowances](#allowances)
 doesn't.
 

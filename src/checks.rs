@@ -23,9 +23,9 @@ pub struct Verdict {
     /// The take's pitch range in semitones, measured only when there's a
     /// target, and `None` too when too little of it is voiced to measure.
     pub pitch_range: Option<f32>,
-    /// How near the pitch range is to the target, from `pitch::closeness`, or
+    /// How near the pitch range is to the target, from `pitch::nearness`, or
     /// 0 with no target or no range.
-    lively: f32,
+    nearness: f32,
     plausible: bool,
     clean: bool,
 }
@@ -52,13 +52,13 @@ impl Standard {
         let quality = quality::measure(&audio.samples, audio.sample_rate);
         let characters = text.chars().count();
         let pitch_range = self.pitch_target.and_then(|_| pitch::range_semitones(&audio.samples, audio.sample_rate));
-        let lively = match (pitch_range, self.pitch_target) {
-            (Some(range), Some(target)) => pitch::closeness(range, target),
+        let nearness = match (pitch_range, self.pitch_target) {
+            (Some(range), Some(target)) => pitch::nearness(range, target),
             _ => 0.0,
         };
         Verdict {
             pitch_range,
-            lively,
+            nearness,
             plausible: quality::plausible_length_at(characters, quality.seconds, self.speed),
             clean: quality.clean(self.noise_limit_db),
             accuracy: accuracy::compare(text, transcript, &self.allowances),
@@ -86,11 +86,12 @@ impl Verdict {
 
     /// How the take ranks against others of the same chunk. `heard` is whether
     /// the phrases a `retake` asks for were heard, and true when none were.
-    /// Liveliness counts only for a take that passes with its phrases heard, so
-    /// it never lifts one that fails, and failing takes rank as without a target.
+    /// Nearness to the pitch range target counts only for a take that passes with
+    /// its phrases heard, so it never lifts one that fails, and failing takes rank
+    /// as without a target.
     pub fn rank(&self, heard: bool) -> Rank {
-        let lively = if self.passes() && heard { self.lively } else { 0.0 };
-        Rank { plausible: self.plausible, clean: self.clean, heard, lively, score: self.accuracy.score() }
+        let nearness = if self.passes() && heard { in_steps(self.nearness) } else { 0.0 };
+        Rank { plausible: self.plausible, clean: self.clean, heard, nearness, score: self.accuracy.score() }
     }
 
     /// How `book` compares the take with others: it passes if it `passes`.
@@ -112,20 +113,35 @@ impl Verdict {
 /// `Judged` puts passing takes first. A later score belongs here as a field.
 ///
 /// The fields compare in order: plausible length matters most, then clean audio,
-/// then hearing a `retake`'s phrases, then liveliness, then accuracy, as recall
-/// minus extra words. So with a pitch range target, the take that passes nearest
-/// it wins, since every take that passes is heard well enough; otherwise, among
-/// takes that pass, the one heard most nearly as written wins. Ties keep the
-/// earlier take.
+/// then hearing a `retake`'s phrases, then nearness to the pitch range target,
+/// then accuracy, as recall minus extra words. So with a target, the take that
+/// passes nearest it wins, since every take that passes is heard well enough,
+/// unless another is about as near; otherwise, among takes that pass, the one
+/// heard most nearly as written wins. Ties keep the earlier take.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct Rank {
     plausible: bool,
     clean: bool,
     heard: bool,
-    /// How near the pitch range is to the target, from 0 to 1, for a take that
-    /// passes with its phrases heard; 0 for any other, or with no target.
-    lively: f32,
+    /// How near the pitch range is to the target, in `NEARNESS_STEP`s up to 1,
+    /// for a take that passes with its phrases heard; 0 for any other, or with
+    /// no target.
+    nearness: f32,
     score: f32,
+}
+
+/// Nearness counts in steps this big, so takes about as near the target rank by
+/// accuracy instead: against 12.4 semitones, 12.1 and 12.6 are both in the top
+/// step, but 11.0 is in the next. Ranges measure within about 0.01 semitones of
+/// librosa's, so a step is far wider than the measuring error; how small a
+/// difference can be heard hasn't been tested.
+const NEARNESS_STEP: f32 = 0.05;
+
+/// `nearness` rounded up to a whole number of `NEARNESS_STEP`s. Up, so that an
+/// exact match isn't a step of its own, and a measured range, however far off,
+/// still ranks above none.
+fn in_steps(nearness: f32) -> f32 {
+    (nearness / NEARNESS_STEP).ceil() * NEARNESS_STEP
 }
 
 #[cfg(test)]
@@ -147,8 +163,8 @@ mod tests {
         let standard = standard(1.0);
         let verdict = standard.judge(TEXT, &silence(4.0), TEXT);
         assert!(verdict.passes());
-        let Rank { plausible, clean, heard, lively, score } = verdict.rank(true);
-        assert_eq!((plausible, clean, heard, lively, score), (true, true, true, 0.0, 1.0));
+        let Rank { plausible, clean, heard, nearness, score } = verdict.rank(true);
+        assert_eq!((plausible, clean, heard, nearness, score), (true, true, true, 0.0, 1.0));
         assert_eq!(verdict.pitch_range, None, "measured only with a target");
     }
 
@@ -173,24 +189,24 @@ mod tests {
     fn verdict(clean: bool, recall: f32, extra: f32) -> Verdict {
         let quality = Quality { floor_db: -60.0, speech_db: -20.0, peak_db: -2.0, seconds: 8.0 };
         let accuracy = Accuracy { recall, extra, transcript: String::new() };
-        Verdict { quality, accuracy, pitch_range: None, lively: 0.0, plausible: true, clean }
+        Verdict { quality, accuracy, pitch_range: None, nearness: 0.0, plausible: true, clean }
     }
 
     /// As `verdict`, with this pitch range measured against a target of 12.4 semitones.
     fn ranged(clean: bool, recall: f32, extra: f32, range: Option<f32>) -> Verdict {
-        let lively = range.map_or(0.0, |range| pitch::closeness(range, 12.4));
-        Verdict { pitch_range: range, lively, ..verdict(clean, recall, extra) }
+        let nearness = range.map_or(0.0, |range| pitch::nearness(range, 12.4));
+        Verdict { pitch_range: range, nearness, ..verdict(clean, recall, extra) }
     }
 
     #[test]
     fn with_a_target_the_passing_take_nearest_it_beats_more_accurate_ones() {
         let flat = ranged(true, 1.0, 0.0, Some(7.0));
         let near = ranged(true, 0.95, 0.03, Some(12.0));
-        let too_lively = ranged(true, 1.0, 0.0, Some(18.0));
-        assert!(near.passes() && flat.passes() && too_lively.passes());
+        let too_wide = ranged(true, 1.0, 0.0, Some(18.0));
+        assert!(near.passes() && flat.passes() && too_wide.passes());
         assert!(near.judged() > flat.judged());
-        assert!(near.judged() > too_lively.judged());
-        assert!(too_lively.judged() > flat.judged(), "18 is nearer 12.4 than 7 is, by ratio");
+        assert!(near.judged() > too_wide.judged());
+        assert!(too_wide.judged() > flat.judged(), "18 is nearer 12.4 than 7 is, by ratio");
     }
 
     #[test]
@@ -201,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn liveliness_never_lifts_a_failing_take() {
+    fn nearness_never_lifts_a_failing_take() {
         let passing = ranged(true, 0.92, 0.06, Some(6.0));
         let noisy = ranged(false, 1.0, 0.0, Some(12.4));
         let misheard = ranged(true, 0.8, 0.0, Some(12.4));
@@ -216,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn a_retake_counts_liveliness_only_with_its_phrases_heard() {
+    fn a_retake_counts_nearness_only_with_its_phrases_heard() {
         let near = ranged(true, 0.95, 0.03, Some(12.4));
         let flat = ranged(true, 1.0, 0.0, Some(6.0));
         assert!(near.judged_for_retake(true) > flat.judged_for_retake(true));
@@ -233,7 +249,32 @@ mod tests {
         let verdict = targeted.judge(TEXT, &audio, TEXT);
         let range = verdict.pitch_range.unwrap();
         assert!(range < 0.5, "a steady hum is flat: {range}");
-        assert_eq!(verdict.rank(true).lively, pitch::closeness(range, 12.4));
+        assert_eq!(verdict.rank(true).nearness, in_steps(pitch::nearness(range, 12.4)));
+    }
+
+    #[test]
+    fn takes_about_as_near_the_target_rank_by_accuracy() {
+        // 12.1 and 12.6 are both within a step of 12.4.
+        let accurate = ranged(true, 1.0, 0.0, Some(12.1));
+        let nearer = ranged(true, 0.95, 0.03, Some(12.6));
+        assert!(pitch::nearness(12.6, 12.4) > pitch::nearness(12.1, 12.4));
+        assert!(accurate.judged() > nearer.judged());
+    }
+
+    #[test]
+    fn takes_clearly_nearer_the_target_win_over_accuracy() {
+        let accurate = ranged(true, 1.0, 0.0, Some(11.0));
+        let nearer = ranged(true, 0.95, 0.03, Some(12.2));
+        assert!(nearer.judged() > accurate.judged());
+    }
+
+    #[test]
+    fn nearness_counts_in_steps_rounded_up() {
+        assert_eq!(in_steps(1.0), 1.0);
+        assert_eq!(in_steps(0.97), 1.0);
+        assert!((in_steps(0.92) - 0.95).abs() < 1e-6);
+        assert!((in_steps(0.01) - NEARNESS_STEP).abs() < 1e-6, "far off still beats unmeasured");
+        assert_eq!(in_steps(0.0), 0.0);
     }
 
     #[test]

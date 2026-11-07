@@ -119,8 +119,10 @@ impl<'a> Recorder<'a> {
 
 /// Writes one row per chunk with audio, so weak spots can be found and listened to.
 fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &Path) -> Result<usize> {
+    // New columns go last, so anything reading columns by position still works.
     let mut report = String::from(
-        "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tpitch_range_st\tflag\ttext\ttranscript\n",
+        "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\t\
+         pitch_range_st\n",
     );
     let mut flagged = 0;
     for item in store.chunks().iter().filter(|item| store.has_audio(item)) {
@@ -145,10 +147,10 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
             characters as f32 / quality.seconds.max(0.01),
             accuracy.recall,
             accuracy.extra,
-            verdict.pitch_range.map(|range| format!("{range:.1}")).unwrap_or_default(),
             if pass { "" } else { "CHECK" },
             item.text,
             check.transcript,
+            verdict.pitch_range.map(|range| format!("{range:.1}")).unwrap_or_default(),
         )?;
     }
     fs::write(out.join("report.tsv"), report)?;
