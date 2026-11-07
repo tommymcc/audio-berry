@@ -31,9 +31,8 @@ pub enum Goal<'a> {
 
 impl Goal<'_> {
     /// The most takes the default policy renders, stopping sooner at one that's
-    /// good enough; if none is, it keeps the best of them. A retake, which asks
-    /// more of a take and covers only the chunks named, tries one more new take
-    /// than `book` does.
+    /// good enough; if none is, it keeps the best of them. A retake tries one
+    /// more new take than `book` does.
     pub fn most_takes(&self) -> u64 {
         match self {
             Goal::Book => 5,
