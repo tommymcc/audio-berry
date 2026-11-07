@@ -10,9 +10,9 @@ pub const TAKES_RANGE: std::ops::RangeInclusive<u64> = 1..=10;
 /// The output directory saves it in `narration.txt`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TakePolicy {
-    /// Renders takes until one is good enough, up to the command's own limit,
-    /// keeping the best rendered. For `book` that's a take that passes, of up to
-    /// 5; for `retake` it's a flawless take with its phrases heard, of up to 6.
+    /// Renders takes until one is good enough, up to a limit, keeping the best
+    /// rendered. The goal of the takes, `checks::Goal`, says what's good enough
+    /// and what the limit is.
     #[default]
     FirstPassing,
     /// Renders exactly this many takes and keeps the best, from `--takes`.
@@ -77,14 +77,14 @@ impl TakePolicy {
 
     /// Renders takes `first`, `first + 1` and so on with `render`, and keeps the
     /// one `judge` puts highest, the earlier on a tie. `FirstPassing` stops after
-    /// `limit` takes, or sooner at a take that's `done`.
+    /// `limit` takes, or sooner at a take that's `good_enough`.
     pub fn render_best<T, R: PartialOrd>(
         self,
         first: u64,
         limit: u64,
         mut render: impl FnMut(u64) -> Result<T>,
         judge: impl Fn(&T) -> Judged<R>,
-        done: impl Fn(&T) -> bool,
+        good_enough: impl Fn(&T) -> bool,
     ) -> Result<Kept<T>> {
         let count = match self {
             TakePolicy::FirstPassing => limit,
@@ -95,7 +95,7 @@ impl TakePolicy {
         for index in first..first + count {
             let current = render(index)?;
             rendered += 1;
-            let stop = self == TakePolicy::FirstPassing && done(&current);
+            let stop = self == TakePolicy::FirstPassing && good_enough(&current);
             let judged = judge(&current);
             if best.as_ref().is_none_or(|(_, _, existing)| judged > *existing) {
                 best = Some((current, index, judged));

@@ -20,7 +20,7 @@
 
 **Noise limit:** the highest floor a take can have and still pass, -55 dB unless `--noise-limit` sets it. The output directory saves it in `narration.txt`, so it's given once, and giving a new value replaces the saved one. It isn't a render setting: it decides which take is kept, not how a take sounds, so changing it keeps the audio already rendered.
 
-**Take policy:** how many takes of a chunk `book` and `retake` render and which they keep: the first good enough unless `--takes` asks for the best of a set number. Good enough is a take that passes for `book`, and for `retake` a flawless one with its phrases heard. Like the noise limit, it's saved in `narration.txt` and isn't a render setting.
+**Take policy:** how many takes of a chunk `book` and `retake` render and which they keep: the first good enough unless `--takes` asks for the best of a set number. What's good enough depends on the takes' goal: for `book` a take that passes, of up to 5, and for `retake` a flawless one with its phrases heard, of up to 6 new ones. Like the noise limit, it's saved in `narration.txt` and isn't a render setting.
 
 **Pitch range:** the span of a take's voiced pitch from the 5th to the 95th percentile, in semitones, tracked with pYIN at 16 kHz. A flat take has a narrow one. Takes with too little voiced speech, under 20 frames of 10 ms, have none. Given a target with `--pitch-range`, the take that passes nearest it is kept.
 

@@ -1,7 +1,7 @@
 //! Judges a voice sample's floor, the level of its pauses, which takes copy,
 //! and advises what to do about a noisy one.
 
-use crate::book::MAX_TAKES;
+use crate::checks::Goal;
 use crate::clean::{self, DEFAULT_REDUCTION_DB};
 use crate::quality::{self, DEFAULT_NOISE_LIMIT_DB};
 use crate::voice::SAMPLE_RATE;
@@ -87,11 +87,12 @@ impl SampleCheck {
                 // The next multiple of 5 dB above the floor takes are expected
                 // to have, as -50 was for a -45.3 dB sample.
                 let raised = ((floor - NOISY_ABOVE_LIMIT_DB) / 5.0).ceil() * 5.0;
+                let most_takes = Goal::Book.most_takes();
                 let path = path.display();
                 let clean = clean::command_line(Path::new("recording.mp3"), "<start>", "<end>", &cleaned, Some(20.0));
                 Some(format!(
                     "The voice sample's floor is {floor:.1} dB. Takes copy it, a few dB quieter, so many \
-                     will have floors above {limit} and be retried, up to {MAX_TAKES} takes per chunk. \
+                     will have floors above {limit} and be retried, up to {most_takes} takes per chunk. \
                      Either:\n\
                      - keep this sample, and raise the limit when you narrate with book or retake, if test \
                      takes sound clean:\n    \

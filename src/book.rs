@@ -3,7 +3,7 @@
 
 use crate::accuracy::Allowances;
 use crate::assemble::assemble;
-use crate::checks::{Standard, Verdict};
+use crate::checks::{Goal, Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
@@ -16,11 +16,6 @@ use color_eyre::eyre::{Result, bail};
 use std::fmt::Write as _;
 use fs_err as fs;
 use std::path::Path;
-
-/// Takes tried per chunk by `book` until one passes.
-pub const MAX_TAKES: u64 = 5;
-/// New takes tried per chunk by `retake` until one is flawless.
-const MAX_RETAKES: u64 = 6;
 
 /// Reads the voice's allowances, and says how many there are, since they change
 /// which takes pass.
@@ -85,35 +80,58 @@ impl<'a> Recorder<'a> {
         Ok(Recorder { narrator, transcriber, voice, speed: store.speed(), standard })
     }
 
-    /// Renders and checks one take. Seeds follow from the text, so `take` picks a
-    /// repeatable take that differs from the others.
-    fn take(&mut self, item: &Chunk, take: u64) -> Result<Take> {
+    /// Renders and checks one take for `goal`. Seeds follow from the text, so
+    /// `take` picks a repeatable take that differs from the others.
+    fn take(&mut self, item: &Chunk, goal: &Goal, take: u64) -> Result<Take> {
         let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
         let audio = self.narrator.say(self.voice, &item.text, self.speed, Some(base_seed + take))?;
         let transcript = self.transcriber.transcribe(&audio)?;
-        let verdict = self.standard.judge(&item.text, &audio, &transcript);
+        let verdict = self.standard.judge(goal, &item.text, &audio, &transcript);
         Ok(Take { audio, verdict })
     }
 
-    /// Renders takes as `policy` says and keeps the best. Each rejected take is
-    /// reported through `progress`.
-    fn best(&mut self, item: &Chunk, policy: TakePolicy, progress: &mut Progress) -> Result<Kept<Take>> {
+    /// Renders takes from `first` on as `policy` says, for `goal`, and keeps the
+    /// best. Takes are reported through `progress`: for `book` each one that isn't
+    /// good enough, and for `retake` every one, with what was heard.
+    fn best(
+        &mut self,
+        item: &Chunk,
+        goal: &Goal,
+        first: u64,
+        policy: TakePolicy,
+        progress: &mut Progress,
+    ) -> Result<Kept<Take>> {
+        let standard = self.standard;
         let render = |take| {
-            let current = self.take(item, take)?;
-            if !current.verdict.passes() {
-                let Verdict { quality, accuracy, .. } = &current.verdict;
-                progress.line(&format!(
+            let current = self.take(item, goal, take)?;
+            let Verdict { quality, accuracy, .. } = &current.verdict;
+            match goal {
+                Goal::Book if !current.verdict.good_enough() => progress.line(&format!(
                     "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}",
                     take + 1,
                     quality.floor_db,
                     quality.seconds,
                     accuracy.recall,
                     accuracy.extra,
-                ))?;
+                ))?,
+                Goal::Book => {}
+                Goal::Retake { .. } => {
+                    progress.line(&format!(
+                        "  take {}: recall {:.2}, extra {:.2}, phrase heard {}, floor {:.0} dB{}",
+                        take + 1,
+                        accuracy.recall,
+                        accuracy.extra,
+                        current.verdict.heard(),
+                        quality.floor_db,
+                        pitch_range_note(standard, &current.verdict),
+                    ))?;
+                    progress.line(&format!("    heard: {}", accuracy.transcript))?;
+                }
             }
             Ok(current)
         };
-        policy.render_best(0, MAX_TAKES, render, |take| take.verdict.judged(), |take| take.verdict.passes())
+        let judge = |take: &Take| take.verdict.judged();
+        policy.render_best(first, goal.most_takes(), render, judge, |take| take.verdict.good_enough())
     }
 }
 
@@ -129,8 +147,8 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
         let path = store.audio_path(item);
         let audio = AudioSamples::from_wav_file(&path)?;
         let check = store.check(item)?;
-        let verdict = standard.judge(&item.text, &audio, &check.transcript);
-        let pass = verdict.passes();
+        let verdict = standard.judge(&Goal::Book, &item.text, &audio, &check.transcript);
+        let pass = verdict.good_enough();
         let Verdict { quality, accuracy, .. } = &verdict;
         let characters = item.text.chars().count();
         flagged += usize::from(!pass);
@@ -205,7 +223,7 @@ pub fn narrate(
         let mut recorder = Recorder::load(&voice, &store, &standard)?;
         let mut progress = Progress::new(total, total - pending.len());
         for item in &pending {
-            let kept = recorder.best(item, store.takes(), &mut progress)?;
+            let kept = recorder.best(item, &Goal::Book, 0, store.takes(), &mut progress)?;
             let take = &kept.take;
             store.store(item, &take.audio, &take.verdict.accuracy.transcript, kept.rendered)?;
             progress.chunk_done(&format!(
@@ -279,17 +297,13 @@ pub fn retake(
     let mut progress = Progress::untimed(wanted.len());
     for (position, selected) in wanted.iter().enumerate() {
         let item = selected.chunk;
-        let phrases = &selected.phrases;
+        let goal = Goal::Retake { phrases: &selected.phrases };
         let path = store.audio_path(item);
-        let heard_all = |transcript: &str| {
-            phrases.iter().all(|phrase| standard.heard(phrase, transcript))
-        };
-        let judge = |verdict: &Verdict| verdict.judged_for_retake(heard_all(&verdict.accuracy.transcript));
         // The check file holds the take count, so seeds already tried are skipped.
         let (first_take, current) = if store.has_audio(item) {
             let check = store.check(item)?;
             let audio = AudioSamples::from_wav_file(&path)?;
-            (check.takes, Some(judge(&standard.judge(&item.text, &audio, &check.transcript))))
+            (check.takes, Some(standard.judge(&goal, &item.text, &audio, &check.transcript).judged()))
         } else {
             (0, None)
         };
@@ -301,26 +315,9 @@ pub fn retake(
             item.text.chars().take(60).collect::<String>()
         ))?;
 
-        let render = |take: u64| {
-            let current = recorder.take(item, take)?;
-            let Verdict { quality, accuracy, .. } = &current.verdict;
-            progress.line(&format!(
-                "  take {}: recall {:.2}, extra {:.2}, phrase heard {}, floor {:.0} dB{}",
-                take + 1,
-                accuracy.recall,
-                accuracy.extra,
-                heard_all(&accuracy.transcript),
-                quality.floor_db,
-                pitch_range_note(&standard, &current.verdict),
-            ))?;
-            progress.line(&format!("    heard: {}", accuracy.transcript))?;
-            Ok(current)
-        };
-        // Done once the phrases are heard and every word is, with nothing more.
-        let done = |take: &Take| take.verdict.flawless() && heard_all(&take.verdict.accuracy.transcript);
-        let kept = store.takes().render_best(first_take, MAX_RETAKES, render, |take| judge(&take.verdict), done)?;
+        let kept = recorder.best(item, &goal, first_take, store.takes(), &mut progress)?;
         let count = first_take + kept.rendered;
-        let better = current.is_none_or(|current| judge(&kept.take.verdict) > current);
+        let better = current.is_none_or(|current| kept.take.verdict.judged() > current);
         let outcome = if better {
             if store.has_audio(item) {
                 store.retire(item)?;
