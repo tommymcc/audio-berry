@@ -22,6 +22,8 @@
 
 **Take policy:** how many takes of a chunk `book` and `retake` render and which they keep: the first good enough unless `--takes` asks for the best of a set number. What's good enough depends on the takes' goal: for `book` a take that passes, of up to 5, and for `retake` a flawless one with its phrases heard, of up to 6 new ones. Like the noise limit, it's saved in `narration.txt` and isn't a render setting.
 
+**Goal:** what a chunk's takes are rendered for, which the take policy follows: narrating it for `book`, or a `retake` of it, which may ask for phrases from the book to be heard. It decides what's good enough, how takes compare, and how many the default policy tries.
+
 **Pitch range:** the span of a take's voiced pitch from the 5th to the 95th percentile, in semitones, tracked with pYIN at 16 kHz. A flat take has a narrow one. Takes with too little voiced speech, under 20 frames of 10 ms, have none. Given a target with `--pitch-range`, the take that passes nearest it is kept.
 
 **Nearness:** how near a take's pitch range is to the target: the smaller of the two ratios between range and target, 1 when exact. It ranks in steps of 0.05, so takes in the same step are ranked by how they're heard. It only ranks takes that pass. Like the take policy, the target is saved in `narration.txt` and isn't a render setting.

@@ -31,7 +31,9 @@ pub enum Goal<'a> {
 
 impl Goal<'_> {
     /// The most takes the default policy renders, stopping sooner at one that's
-    /// good enough: 5 for `book`, and 6 new ones for `retake`.
+    /// good enough; if none is, it keeps the best of them. A retake, which asks
+    /// more of a take and covers only the chunks named, tries one more new take
+    /// than `book` does.
     pub fn most_takes(&self) -> u64 {
         match self {
             Goal::Book => 5,
@@ -55,7 +57,9 @@ pub struct Verdict {
     aim: Aim,
 }
 
-/// The goal a verdict was judged for, with what was found for it.
+/// The goal a verdict was judged for, without its phrases, which it no longer
+/// needs once they're heard or not. It's more than whether they were heard: a
+/// retake asking for no phrases is still judged as a retake, not as `book`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Aim {
     Book,
@@ -129,8 +133,7 @@ impl Verdict {
 
     /// Whether the take is good enough to keep without trying another: for
     /// `book` one that passes, and for `retake` one that's flawless, every word
-    /// heard with nothing more, with its phrases heard. It's also what `report.tsv`
-    /// flags, for `book`.
+    /// heard with nothing more, with its phrases heard.
     pub fn good_enough(&self) -> bool {
         match self.aim {
             Aim::Book => self.passes(),
