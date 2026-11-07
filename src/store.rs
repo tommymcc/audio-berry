@@ -32,8 +32,9 @@ pub struct RenderSettings {
 }
 
 impl RenderSettings {
-    /// The settings for `speed` and the precision the model will load at.
-    pub fn new(speed: Option<f64>) -> Self {
+    /// The settings for `speed` and the precision the model will load at, which
+    /// it reads from `PRECISION_VAR`.
+    pub fn from_env(speed: Option<f64>) -> Self {
         let dtype = std::env::var(PRECISION_VAR).ok();
         Self { speed, ..Self::from_dtype(dtype.as_deref(), preferred_runtime_choice()) }
     }

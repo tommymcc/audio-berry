@@ -44,13 +44,13 @@ enum Command {
         #[arg(value_name = "voice-sample")]
         voice_sample: PathBuf,
         /// What to say
-        #[arg(value_name = "text")]
+        #[arg(value_name = "text", allow_hyphen_values = true)]
         text: String,
         /// Where to save the speech
         #[arg(value_name = "output.wav")]
         output: PathBuf,
         #[command(flatten)]
-        take: TakeArgs,
+        say: SayArgs,
     },
     /// Lists a book's chapters, numbered for `book`
     Chapters {
@@ -77,7 +77,7 @@ enum Command {
         #[command(flatten)]
         speed: Speed,
         #[command(flatten)]
-        render: RenderArgs,
+        model: ModelArgs,
     },
     /// Records new takes of chunks of a narrated book
     ///
@@ -92,11 +92,14 @@ enum Command {
         /// The folder holding this book's narration
         #[arg(value_name = "output-dir")]
         output_dir: PathBuf,
-        /// Words from the book, or a chunk number such as 3.12
+        /// Words from the book, or a chunk number such as 3.12; after `--` if they start with -
         #[arg(value_name = "target", required = true)]
         targets: Vec<String>,
+        /// Refused with the reason, rather than as an unknown option
+        #[arg(long = "speed", value_name = "factor", hide = true, value_parser = refuse_retake_speed)]
+        refused_speed: Option<String>,
         #[command(flatten)]
-        render: RenderArgs,
+        model: ModelArgs,
     },
     /// Lists the words most often heard as other words in an output directory
     Mishearings {
@@ -130,7 +133,7 @@ enum Command {
         #[arg(value_name = "speaker")]
         speaker: Option<String>,
         #[command(flatten)]
-        take: TakeArgs,
+        say: SayArgs,
     },
     /// Suggests the best stretches of a recording to use as a voice sample
     Sections {
@@ -171,7 +174,7 @@ struct Speed {
 
 /// Options for the commands that load the model and a voice sample.
 #[derive(clap::Args)]
-struct RenderArgs {
+struct ModelArgs {
     #[arg(
         long,
         value_name = "dB",
@@ -179,43 +182,59 @@ struct RenderArgs {
         allow_negative_numbers = true,
         value_parser = quality::parse_noise_limit,
         help = format!(
-            "The most background a take can have and still pass, from -100 to 0 dB [default: {}]; \
-             an output directory saves it",
+            "The most background a take can have, from -100 to 0 dB [default: {}]; book and retake \
+             retry takes above it and save it in the output directory",
             quality::DEFAULT_NOISE_LIMIT_DB
         ),
     )]
     noise_limit: Option<f32>,
     /// The model's precision; the default suits the device
-    #[arg(long, env = narrator::PRECISION_VAR, value_parser = ["f32", "f16", "bf16"], ignore_case = true)]
+    #[arg(
+        long,
+        value_name = "precision",
+        env = narrator::PRECISION_VAR,
+        value_parser = ["f32", "f16", "bf16"],
+        ignore_case = true,
+    )]
     precision: Option<String>,
 }
 
-/// Options for `speak` and `audition`, which say one take.
-#[derive(clap::Args)]
-struct TakeArgs {
-    #[command(flatten)]
-    speed: Speed,
-    /// Picks a repeatable take; without one, each run differs
-    #[arg(long, value_name = "n", env = narrator::SEED_VAR)]
-    seed: Option<u64>,
-    #[command(flatten)]
-    render: RenderArgs,
-}
-
-impl TakeArgs {
-    fn take(self) -> narrator::Take {
-        self.render.use_precision();
-        narrator::Take { speed: self.speed.factor, seed: self.seed, noise_limit_db: self.render.noise_limit }
-    }
-}
-
-impl RenderArgs {
+impl ModelArgs {
     /// Passes the precision to the model, which only reads it from the environment.
     fn use_precision(&self) {
         if let Some(precision) = &self.precision {
             // SAFETY: called from main before the model loads, while no other
             // threads exist that could read the environment.
             unsafe { std::env::set_var(narrator::PRECISION_VAR, precision.to_ascii_lowercase()) };
+        }
+    }
+}
+
+/// Options for `speak` and `audition`, which each say one take.
+#[derive(clap::Args)]
+struct SayArgs {
+    #[command(flatten)]
+    speed: Speed,
+    /// Picks a repeatable take; without one, each run differs
+    #[arg(long, value_name = "n", env = narrator::SEED_VAR)]
+    seed: Option<u64>,
+    #[command(flatten)]
+    model: ModelArgs,
+}
+
+impl SayArgs {
+    fn settings(&self) -> narrator::SpeakSettings {
+        narrator::SpeakSettings { speed: self.speed.factor, seed: self.seed }
+    }
+}
+
+impl Command {
+    /// The model options, for a command that loads the model.
+    fn model_args(&self) -> Option<&ModelArgs> {
+        match self {
+            Command::Speak { say, .. } | Command::Audition { say, .. } => Some(&say.model),
+            Command::Book { model, .. } | Command::Retake { model, .. } => Some(model),
+            _ => None,
         }
     }
 }
@@ -244,18 +263,22 @@ fn stop_quietly_when_output_closes() {}
 
 fn main() -> Result<(), Box<dyn Error>> {
     stop_quietly_when_output_closes();
-    match Cli::parse().command {
-        Command::Speak { voice_sample, text, output, take } => narrator::speak(&voice_sample, &text, &output, &take.take()),
-        Command::Chapters { book } => book::list_chapters(&book),
-        Command::Book { voice_sample, book, output_dir, chapters, speed, render } => {
-            render.use_precision();
-            let chapters = (!chapters.is_empty()).then_some(chapters);
-            book::narrate(&voice_sample, &book, &output_dir, chapters, speed.factor, render.noise_limit)
+    let command = Cli::parse().command;
+    if let Some(model) = command.model_args() {
+        model.use_precision();
+    }
+    match command {
+        Command::Speak { voice_sample, text, output, say } => {
+            narrator::speak(&voice_sample, &text, &output, &say.settings(), say.model.noise_limit)
         }
-        Command::Retake { voice_sample, book, output_dir, targets, render } => {
-            render.use_precision();
+        Command::Chapters { book } => book::list_chapters(&book),
+        Command::Book { voice_sample, book, output_dir, chapters, speed, model } => {
+            let chapters = (!chapters.is_empty()).then_some(chapters);
+            book::narrate(&voice_sample, &book, &output_dir, chapters, speed.factor, model.noise_limit)
+        }
+        Command::Retake { voice_sample, book, output_dir, targets, model, .. } => {
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
-            book::retake(&voice_sample, &book, &output_dir, &targets, render.noise_limit)
+            book::retake(&voice_sample, &book, &output_dir, &targets, model.noise_limit)
         }
         Command::Mishearings { book, output_dir, voice_sample } => mishearings::list(&book, &output_dir, voice_sample.as_deref()),
         Command::Speakers => {
@@ -270,7 +293,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             cast::play(&cast::find(&speaker)?, files)
         }
-        Command::Audition { voice_sample, speaker, take } => audition::audition(&voice_sample, speaker.as_deref(), &take.take()),
+        Command::Audition { voice_sample, speaker, say } => {
+            audition::audition(&voice_sample, speaker.as_deref(), &say.settings(), say.model.noise_limit)
+        }
         Command::Sections { recording, count, reduction } => sections::suggest(&recording, count, reduction.db),
         Command::Clean { recording, start, end, output, reduction } => {
             let reduction = reduction.db.unwrap_or(clean::DEFAULT_REDUCTION_DB);
@@ -282,6 +307,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn parse_speed(value: &str) -> Result<f64, String> {
     let speed = value.parse::<f64>().ok().filter(|speed| SPEED_RANGE.contains(speed));
     speed.ok_or_else(|| format!("must be from {:.1} to {:.1}", SPEED_RANGE.start(), SPEED_RANGE.end()))
+}
+
+fn refuse_retake_speed(_: &str) -> Result<String, String> {
+    Err("retake uses the speed saved in the output directory".to_string())
 }
 
 fn parse_count(value: &str) -> Result<usize, String> {
@@ -340,8 +369,8 @@ mod tests {
 
     #[test]
     fn no_flag_means_no_value() {
-        let Ok(Command::Speak { take, .. }) = parse(&["speak", "v", "t", "o"]) else { panic!() };
-        assert_eq!(take.speed.factor, None);
+        let Ok(Command::Speak { say, .. }) = parse(&["speak", "v", "t", "o"]) else { panic!() };
+        assert_eq!(say.speed.factor, None);
         let Ok(Command::Clean { reduction, .. }) = parse(&["clean", "r", "1", "2", "o"]) else { panic!() };
         assert_eq!(reduction.db, None);
     }
@@ -382,10 +411,10 @@ mod tests {
 
     #[test]
     fn a_noise_limit_is_negative_and_for_commands_that_load_a_voice() {
-        let Ok(Command::Book { render, .. }) = parse(&["book", "v", "b", "o", "--noise-limit", "-50"]) else { panic!() };
-        assert_eq!(render.noise_limit, Some(-50.0));
-        let Ok(Command::Retake { render, .. }) = parse(&["retake", "v", "b", "o", "3.12", "--noise-limit", "-48"]) else { panic!() };
-        assert_eq!(render.noise_limit, Some(-48.0));
+        let Ok(Command::Book { model, .. }) = parse(&["book", "v", "b", "o", "--noise-limit", "-50"]) else { panic!() };
+        assert_eq!(model.noise_limit, Some(-50.0));
+        let Ok(Command::Retake { model, .. }) = parse(&["retake", "v", "b", "o", "3.12", "--noise-limit", "-48"]) else { panic!() };
+        assert_eq!(model.noise_limit, Some(-48.0));
         for bad in ["5", "-101", "lots"] {
             assert!(parse(&["book", "v", "b", "o", "--noise-limit", bad]).is_err(), "{bad}");
         }
@@ -394,17 +423,34 @@ mod tests {
 
     #[test]
     fn precision_is_one_the_model_knows() {
-        let Ok(Command::Retake { render, .. }) = parse(&["retake", "v", "b", "o", "3", "--precision", "F16"]) else { panic!() };
-        assert_eq!(render.precision.map(|p| p.to_ascii_lowercase()).as_deref(), Some("f16"));
+        let Ok(Command::Retake { model, .. }) = parse(&["retake", "v", "b", "o", "3", "--precision", "F16"]) else { panic!() };
+        assert_eq!(model.precision.map(|p| p.to_ascii_lowercase()).as_deref(), Some("f16"));
         assert!(parse(&["book", "v", "b", "o", "--precision", "f8"]).is_err());
     }
 
     #[test]
     fn a_seed_is_for_commands_that_say_one_take() {
-        let Ok(Command::Audition { take, .. }) = parse(&["audition", "v", "--seed", "2"]) else { panic!() };
-        assert_eq!(take.seed, Some(2));
+        let Ok(Command::Audition { say, .. }) = parse(&["audition", "v", "--seed", "2"]) else { panic!() };
+        assert_eq!(say.seed, Some(2));
         assert!(parse(&["speak", "v", "t", "o", "--seed", "two"]).is_err());
         assert!(parse(&["book", "v", "b", "o", "--seed", "2"]).is_err());
+    }
+
+    #[test]
+    fn text_and_targets_can_start_with_a_hyphen() {
+        let Ok(Command::Speak { text, say, .. }) = parse(&["speak", "v", "-hello there", "o", "--speed", "0.9"]) else { panic!() };
+        assert_eq!((text.as_str(), say.speed.factor), ("-hello there", Some(0.9)));
+        let Ok(Command::Speak { text, say, .. }) = parse(&["speak", "v", "--speed", "0.9", "t", "o"]) else { panic!() };
+        assert_eq!((text.as_str(), say.speed.factor), ("t", Some(0.9)));
+        let words = ["retake", "v", "b", "o", "3.12", "--noise-limit", "-50", "--", "-said she"];
+        let Ok(Command::Retake { targets, model, .. }) = parse(&words) else { panic!() };
+        assert_eq!((targets, model.noise_limit), (vec!["3.12".to_string(), "-said she".to_string()], Some(-50.0)));
+    }
+
+    #[test]
+    fn retake_says_why_it_refuses_a_speed() {
+        let error = parse(&["retake", "v", "b", "o", "3.12", "--speed", "1"]).err().unwrap().to_string();
+        assert!(error.contains("retake uses the speed saved in the output directory"), "{error}");
     }
 
     #[test]

@@ -38,7 +38,7 @@ fn open_store(
     speed: Option<f64>,
     noise_limit_db: Option<f32>,
 ) -> Result<NarrationStore, Box<dyn Error>> {
-    NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &RenderSettings::new(speed), noise_limit_db)
+    NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &RenderSettings::from_env(speed), noise_limit_db)
 }
 
 /// Prints each chapter's number, title and size.

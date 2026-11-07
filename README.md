@@ -234,7 +234,8 @@ and `audition`, `--noise-limit <dB>` and `--precision <f32|f16|bf16>` for
 and `clean`. An environment variable can give `--noise-limit`
 (`AUDIO_BERRY_NOISE_LIMIT_DB`), `--seed` (`OMNIVOICE_SEED`) or `--precision`
 (`OMNIVOICE_DTYPE`) instead, and the option wins if both are given. An invalid
-value in either stops the command. A `retake` target is words from the book, or a
+value stops a command that takes the option. `book` and `retake` pick their own
+seeds, so they ignore `OMNIVOICE_SEED`. A `retake` target is words from the book, or a
 chunk number such as 3.12.
 
 `book` and `retake` are explained in [Narrating a book](#narrating-a-book) and

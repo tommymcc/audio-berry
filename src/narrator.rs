@@ -42,9 +42,9 @@ impl Narrator {
     }
 
     /// Says `text` in `voice`, saves it to `output` and reports how fast that was.
-    pub fn say_to_file(&self, voice: &Voice, text: &str, output: &Path, take: &Take) -> Result<(), Box<dyn Error>> {
+    pub fn say_to_file(&self, voice: &Voice, text: &str, output: &Path, settings: &SpeakSettings) -> Result<(), Box<dyn Error>> {
         let started = Instant::now();
-        let audio = self.say(voice, text, take.speed.unwrap_or(1.0), take.seed)?;
+        let audio = self.say(voice, text, settings.speed.unwrap_or(1.0), settings.seed)?;
         let elapsed = started.elapsed().as_secs_f32();
 
         audio.save_wav(output)?;
@@ -59,17 +59,22 @@ impl Narrator {
 }
 
 /// How `speak` and `audition` say their one take.
-pub struct Take {
+pub struct SpeakSettings {
     /// Normal speed if `None`.
     pub speed: Option<f64>,
     /// The clock picks one if `None`.
     pub seed: Option<u64>,
-    /// What the voice sample is judged against; the default noise limit if `None`.
-    pub noise_limit_db: Option<f32>,
 }
 
 /// The `speak` command: says `text` in the voice sample's voice and saves it.
-pub fn speak(voice: &Path, text: &str, output: &Path, take: &Take) -> Result<(), Box<dyn Error>> {
-    let voice = Voice::load(voice, take.noise_limit_db)?;
-    Narrator::load()?.say_to_file(&voice, text, output, take)
+/// The sample is judged against `noise_limit_db`, or the default if `None`.
+pub fn speak(
+    voice: &Path,
+    text: &str,
+    output: &Path,
+    settings: &SpeakSettings,
+    noise_limit_db: Option<f32>,
+) -> Result<(), Box<dyn Error>> {
+    let voice = Voice::load(voice, noise_limit_db)?;
+    Narrator::load()?.say_to_file(&voice, text, output, settings)
 }
