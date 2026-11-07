@@ -3,7 +3,7 @@
 use crate::voice::Voice;
 use any_tts::models::omnivoice::preferred_runtime_choice;
 use any_tts::{AudioSamples, ModelType, SynthesisRequest, TtsConfig, TtsModel, load_model};
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, WrapErr};
 use std::path::Path;
 use std::time::Instant;
 
@@ -47,7 +47,7 @@ impl Narrator {
         let audio = self.say(voice, text, settings.speed.unwrap_or(1.0), settings.seed)?;
         let elapsed = started.elapsed().as_secs_f32();
 
-        audio.save_wav(output)?;
+        audio.save_wav(output).wrap_err_with(|| format!("couldn't save {}", output.display()))?;
         println!(
             "Wrote {}: {:.1}s of audio in {elapsed:.0}s ({:.2}x realtime)",
             output.display(),

@@ -238,6 +238,10 @@ value stops a command that takes the option. `book` and `retake` pick their own
 seeds, so they ignore `OMNIVOICE_SEED`. A `retake` target is words from the book, or a
 chunk number such as 3.12.
 
+Errors say what was being done and why. They leave out the backtrace even when
+`RUST_BACKTRACE` is set, since they're nearly always about the files given;
+`RUST_LIB_BACKTRACE=1` adds it.
+
 `book` and `retake` are explained in [Narrating a book](#narrating-a-book) and
 [One output directory, one narration](#one-output-directory-one-narration).
 

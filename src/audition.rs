@@ -5,7 +5,7 @@ use crate::cast;
 use crate::narrator::{Narrator, SpeakSettings};
 use crate::voice::Voice;
 use color_eyre::eyre::{Result, eyre};
-use std::fs;
+use fs_err as fs;
 use std::path::{Path, PathBuf};
 
 /// Where auditions are saved, so they can be played again with `play`.

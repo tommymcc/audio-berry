@@ -8,8 +8,8 @@ use crate::voice::{SAMPLE_RATE, transcript_path};
 use any_tts::AudioSamples;
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::{Array2, ArrayView2, Axis};
-use color_eyre::eyre::{Result, bail, eyre};
-use std::fs;
+use color_eyre::eyre::{Result, WrapErr, bail, eyre};
+use fs_err as fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -54,7 +54,7 @@ pub fn clean(
     // Clamp as the WAV does, so the peak reported is the peak saved.
     let sample: Vec<f32> = sample.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect();
     let measured = quality::measure(&sample, SAMPLE_RATE);
-    AudioSamples::new(sample, SAMPLE_RATE).save_wav(output)?;
+    AudioSamples::new(sample, SAMPLE_RATE).save_wav(output).wrap_err_with(|| format!("couldn't save {}", output.display()))?;
     println!(
         "Wrote {}: {:.2}s, peak {:.1} dB, cleaned with up to {reduction_db} dB of reduction in {took:.1}s",
         output.display(),
@@ -90,7 +90,7 @@ fn retire_transcript(sample: &Path) -> Result<Option<PathBuf>> {
     match fs::rename(&transcript, &old) {
         Ok(()) => Ok(Some(old)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(eyre!("couldn't move aside {}: {error}", transcript.display())),
+        Err(error) => Err(error).wrap_err_with(|| format!("couldn't move aside {}", transcript.display())),
     }
 }
 

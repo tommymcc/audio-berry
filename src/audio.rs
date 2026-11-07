@@ -1,7 +1,7 @@
 //! Reads audio files of any format.
 
 use any_tts::AudioSamples;
-use color_eyre::eyre::{Report, Result, eyre};
+use color_eyre::eyre::{Report, Result, WrapErr, eyre};
 use color_eyre::{Section, SectionExt};
 use std::io::Write;
 use std::path::Path;
@@ -25,7 +25,7 @@ fn decode(path: &Path, sample_rate: u32, seconds: Option<f64>) -> Result<Vec<f32
         ffmpeg.args(["-t", &seconds.to_string()]);
     }
     ffmpeg.arg("-i").arg(path);
-    run(ffmpeg, None, sample_rate, &format!("ffmpeg couldn't read {}", path.display()))
+    run(ffmpeg, None, sample_rate, &format!("read {}", path.display()))
 }
 
 /// Converts audio to mono f32 PCM at `sample_rate`, exactly as `decode_audio`
@@ -33,18 +33,18 @@ fn decode(path: &Path, sample_rate: u32, seconds: Option<f64>) -> Result<Vec<f32
 pub fn resample_as_saved(audio: &AudioSamples, sample_rate: u32) -> Result<Vec<f32>> {
     let mut ffmpeg = Command::new("ffmpeg");
     ffmpeg.args(["-v", "error", "-f", "wav", "-i", "pipe:0"]);
-    run(ffmpeg, Some(audio.get_wav()), sample_rate, "ffmpeg couldn't resample audio")
+    run(ffmpeg, Some(audio.get_wav()), sample_rate, "resample audio")
 }
 
 /// Runs ffmpeg, given its input, feeding it `stdin` if any, and reads the mono
-/// f32 PCM it writes. A failure is reported as `failed`, with what ffmpeg said.
-fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, failed: &str) -> Result<Vec<f32>> {
+/// f32 PCM it writes. A failure says ffmpeg couldn't do `doing`.
+fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, doing: &str) -> Result<Vec<f32>> {
     ffmpeg
         .args(["-ac", "1", "-ar", &sample_rate.to_string(), "-f", "f32le", "-"])
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = ffmpeg.spawn()?;
+    let mut child = ffmpeg.spawn().wrap_err(COULDNT_RUN)?;
     // Written from another thread, so ffmpeg's output can't fill up and stall it.
     let writer = match (stdin, child.stdin.take()) {
         (Some(bytes), Some(mut pipe)) => Some(std::thread::spawn(move || pipe.write_all(&bytes))),
@@ -57,7 +57,7 @@ fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, failed: &s
     };
     // ffmpeg stopping early closes the pipe, and its own error says why.
     if !output.status.success() {
-        return Err(ffmpeg_failed(failed, &output.stderr));
+        return Err(ffmpeg_failed(doing, &output.stderr));
     }
     written?;
     Ok(output
@@ -67,12 +67,17 @@ fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, failed: &s
         .collect())
 }
 
-/// An error saying what ffmpeg was doing, with what it said about it below,
-/// without the internal addresses it starts its lines with.
+/// Why ffmpeg failed to start, which is usually that it isn't installed.
+pub const COULDNT_RUN: &str = "couldn't run ffmpeg; is it installed?";
+
+/// An error saying ffmpeg couldn't do what it was asked, such as "read
+/// voices/me.wav", with what it said about it below, without the internal
+/// addresses it starts its lines with.
 pub fn ffmpeg_failed(doing: &str, stderr: &[u8]) -> Report {
+    let failed = eyre!("ffmpeg couldn't {doing}");
     match ffmpeg_said(stderr) {
-        Some(said) => eyre!("{doing}").section(said.header("ffmpeg said:")),
-        None => eyre!("{doing}"),
+        Some(said) => failed.section(said.header("ffmpeg said:")),
+        None => failed,
     }
 }
 
@@ -101,7 +106,7 @@ mod tests {
     fn ffmpeg_errors_say_what_failed_then_what_ffmpeg_said_without_addresses() {
         let stderr = b"[in#0 @ 0x5bfd60e7dc40] Error opening input: No such file or directory\n\
                        Error opening input file voices/me.wav.\n\n";
-        let report = ffmpeg_failed("ffmpeg couldn't read voices/me.wav", stderr);
+        let report = ffmpeg_failed("read voices/me.wav", stderr);
         assert_eq!(report.to_string(), "ffmpeg couldn't read voices/me.wav");
         assert_eq!(
             ffmpeg_said(stderr).unwrap(),

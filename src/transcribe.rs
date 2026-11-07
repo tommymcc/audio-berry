@@ -13,7 +13,7 @@ use candle_transformers::models::whisper::{self, Config, audio, model::Whisper};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use color_eyre::eyre::{Result, eyre};
-use std::fs;
+use fs_err as fs;
 use std::io::Write;
 use tokenizers::Tokenizer;
 

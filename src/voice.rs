@@ -2,14 +2,14 @@
 
 use crate::accuracy::Allowances;
 use crate::audio::decode_audio;
+use crate::files::read_if_present;
 use crate::sample_check::SampleCheck;
 use crate::store::fnv;
 use crate::transcribe::{Transcriber, VOICE_TRANSCRIPTION_MODEL};
 use any_tts::models::omnivoice::trim_long_audio;
 use any_tts::{AudioSamples, ReferenceAudio};
-use color_eyre::eyre::{Result, bail, eyre};
-use std::fs;
-use std::io::ErrorKind;
+use color_eyre::eyre::{Result, WrapErr, bail, eyre};
+use fs_err as fs;
 use std::path::{Path, PathBuf};
 
 /// The rate voice samples are kept at, as OmniVoice hears them.
@@ -32,6 +32,11 @@ impl Voice {
     /// corrected by hand. The sample is judged against `noise_limit_db`, if given,
     /// or the default noise limit.
     pub fn load(path: &Path, noise_limit_db: Option<f32>) -> Result<Voice> {
+        Self::load_unexplained(path, noise_limit_db)
+            .wrap_err_with(|| format!("couldn't load the voice sample {}", path.display()))
+    }
+
+    fn load_unexplained(path: &Path, noise_limit_db: Option<f32>) -> Result<Voice> {
         let recording = decode_audio(path, SAMPLE_RATE)?;
         let samples = trim_long_audio(
             &recording,
@@ -44,11 +49,7 @@ impl Voice {
         println!("Voice sample: using {:.1}s{}", seconds(&samples), check.summary());
 
         let transcript_path = transcript_path(path);
-        let existing = match fs::read_to_string(&transcript_path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
-        };
+        let existing = read_if_present(&transcript_path)?.unwrap_or_default();
         let existing = existing.trim();
         if !existing.is_empty() {
             if samples.len() < recording.len() {
@@ -125,10 +126,8 @@ pub fn allowances_path(sample: &Path) -> PathBuf {
 /// Reads the allowances beside a voice sample. Most voices have none.
 pub fn read_allowances(sample: &Path) -> Result<Allowances> {
     let path = allowances_path(sample);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Allowances::default()),
-        Err(error) => return Err(eyre!("{}: {error}", path.display())),
+    let Some(text) = read_if_present(&path)? else {
+        return Ok(Allowances::default());
     };
     Allowances::parse(&text).map_err(|error| eyre!("{}: {error}", path.display()))
 }
@@ -138,7 +137,7 @@ fn seconds(samples: &[f32]) -> f32 {
 }
 
 fn save(samples: &[f32], path: &Path) -> Result<()> {
-    AudioSamples::new(samples.to_vec(), SAMPLE_RATE).save_wav(path)?;
+    AudioSamples::new(samples.to_vec(), SAMPLE_RATE).save_wav(path).wrap_err_with(|| format!("couldn't save {}", path.display()))?;
     Ok(())
 }
 

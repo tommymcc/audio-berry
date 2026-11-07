@@ -1,15 +1,15 @@
 //! Joins an output directory's complete chapters into a WAV each and a
 //! chaptered M4B, tagged with the book's title, author and cover.
 
-use crate::audio::ffmpeg_failed;
+use crate::audio::{COULDNT_RUN, ffmpeg_failed};
 use crate::epub::{Book, image_type};
 use crate::quality;
 use crate::store::NarrationStore;
 use crate::voice::SAMPLE_RATE;
 use any_tts::AudioSamples;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use std::fmt::Write as _;
-use std::fs;
+use fs_err as fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,9 +58,9 @@ fn tag_chapter(book: &Book, title: &str, untagged: &Path, tagged: &Path) -> Resu
     if let Some(author) = &book.author {
         ffmpeg.arg("-metadata").arg(format!("artist={author}"));
     }
-    let output = ffmpeg.arg(tagged).output()?;
+    let output = ffmpeg.arg(tagged).output().wrap_err(COULDNT_RUN)?;
     if !output.status.success() {
-        return Err(ffmpeg_failed(&format!("ffmpeg couldn't tag {}", tagged.display()), &output.stderr));
+        return Err(ffmpeg_failed(&format!("tag {}", tagged.display()), &output.stderr));
     }
     fs::remove_file(untagged)?;
     Ok(())
@@ -93,7 +93,7 @@ pub fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathB
         let title = &book.chapters[chapter].title;
         let name = format!("{:02}-{}.wav", chapter + 1, safe_name(title));
         let untagged = chapter_dir.join("untagged.wav");
-        AudioSamples::new(samples.clone(), sample_rate).save_wav(&untagged)?;
+        AudioSamples::new(samples.clone(), sample_rate).save_wav(&untagged).wrap_err_with(|| format!("couldn't save {}", untagged.display()))?;
         tag_chapter(book, title, &untagged, &chapter_dir.join(name))?;
 
         let start = all.len() as u64 * 1000 / u64::from(sample_rate);
@@ -110,7 +110,7 @@ pub fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathB
     }
 
     let joined = out.join("joined.wav");
-    AudioSamples::new(all, sample_rate).save_wav(&joined)?;
+    AudioSamples::new(all, sample_rate).save_wav(&joined).wrap_err_with(|| format!("couldn't save {}", joined.display()))?;
     let metadata_path = out.join("chapters.txt");
     fs::write(&metadata_path, metadata)?;
     let m4b = out.join(format!("{}.m4b", safe_name(&book.title)));
@@ -125,9 +125,9 @@ pub fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathB
         ffmpeg.args(["-map", "2:v", "-c:v", "copy", "-disposition:v:0", "attached_pic"]);
     }
     ffmpeg.args(["-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", "-f", "mp4"]);
-    let output = ffmpeg.arg(&m4b).output()?;
+    let output = ffmpeg.arg(&m4b).output().wrap_err(COULDNT_RUN)?;
     if !output.status.success() {
-        return Err(ffmpeg_failed(&format!("ffmpeg couldn't make {}", m4b.display()), &output.stderr));
+        return Err(ffmpeg_failed(&format!("make {}", m4b.display()), &output.stderr));
     }
     fs::remove_file(&joined)?;
     Ok(m4b)

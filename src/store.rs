@@ -4,12 +4,12 @@
 use crate::narrator::PRECISION_VAR;
 use crate::quality::{DEFAULT_NOISE_LIMIT_DB, valid_noise_limit};
 use crate::accuracy::contains_phrase;
+use crate::files::read_if_present;
 use any_tts::{AudioSamples, DeviceSelection};
 use any_tts::models::omnivoice::{OmniVoiceRuntimeChoice, preferred_runtime_choice};
 use std::collections::{HashMap, HashSet};
-use color_eyre::eyre::{Result, bail, eyre};
-use std::fs;
-use std::io::ErrorKind;
+use color_eyre::eyre::{Result, WrapErr, bail, eyre};
+use fs_err as fs;
 use std::path::{Path, PathBuf};
 
 const CACHE_VERSION: &str = "3";
@@ -77,11 +77,7 @@ pub struct Check {
 }
 
 fn read_manifest(out: &Path) -> Result<Option<Manifest>> {
-    match fs::read_to_string(out.join(MANIFEST)) {
-        Ok(text) => Ok(Some(Manifest::parse(&text)?)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+    read_if_present(&out.join(MANIFEST))?.map(|text| Manifest::parse(&text)).transpose()
 }
 
 /// The noise limit a run in `out` will judge takes against when `given` is the
@@ -485,7 +481,7 @@ impl NarrationStore {
         let transcript = transcript.replace(['\n', '\t'], " ");
         fs::write(path.with_extension("check"), format!("{takes}\n{transcript}"))?;
         let temporary = path.with_extension("tmp");
-        audio.save_wav(&temporary)?;
+        audio.save_wav(&temporary).wrap_err_with(|| format!("couldn't save {}", temporary.display()))?;
         fs::rename(&temporary, path)?;
         Ok(())
     }

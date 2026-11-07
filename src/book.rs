@@ -13,7 +13,7 @@ use crate::voice::{Voice, allowances_path, read_allowances};
 use any_tts::AudioSamples;
 use color_eyre::eyre::{Result, bail, eyre};
 use std::fmt::Write as _;
-use std::fs;
+use fs_err as fs;
 use std::path::Path;
 
 /// Takes tried per chunk by `book`.

@@ -3,7 +3,7 @@
 use crate::text::{MAX_CHUNK_CHARS, Paragraph, chunk};
 use epub::doc::{EpubDoc, NavPoint};
 use scraper::{ElementRef, Html, Node, Selector};
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Result, WrapErr, bail};
 use std::path::Path;
 
 const BLOCKS: [&str; 22] = [
@@ -198,7 +198,7 @@ fn dublin_core(package: &str, name: &str) -> Option<String> {
 
 /// Reads a book. Each spine document with readable text becomes one chapter.
 pub fn read_book(path: &Path) -> Result<Book> {
-    let mut doc = EpubDoc::new(path).map_err(|error| eyre!("{}: {error}", path.display()))?;
+    let mut doc = EpubDoc::new(path).wrap_err_with(|| format!("couldn't read the book {}", path.display()))?;
     let root_file = doc.root_file.clone();
     let package = doc.get_resource_str_by_path(root_file).unwrap_or_default();
     let title = doc

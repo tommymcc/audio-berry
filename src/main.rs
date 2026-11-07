@@ -7,6 +7,7 @@ mod cast;
 mod checks;
 mod clean;
 mod epub;
+mod files;
 mod mishearings;
 mod narrator;
 mod progress;
@@ -495,11 +496,14 @@ mod tests {
         };
         let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
         assert_eq!(inputs(&["speak", "v.wav", "hi", "o.wav"]), paths(&["v.wav"]));
+        assert_eq!(inputs(&["audition", "v.wav", "kitchen"]), paths(&["v.wav"]));
+        assert_eq!(inputs(&["chapters", "b.epub"]), paths(&["b.epub"]));
         assert_eq!(inputs(&["book", "v.wav", "b.epub", "out"]), paths(&["v.wav", "b.epub"]));
         assert_eq!(inputs(&["retake", "v.wav", "b.epub", "out", "3.1"]), paths(&["v.wav", "b.epub"]));
         assert_eq!(inputs(&["mishearings", "b.epub", "out"]), paths(&["b.epub"]));
         assert_eq!(inputs(&["mishearings", "b.epub", "out", "v.wav"]), paths(&["b.epub", "v.wav"]));
         assert_eq!(inputs(&["play", "kitchen", "a.wav", "b.wav"]), paths(&["a.wav", "b.wav"]));
+        assert_eq!(inputs(&["sections", "r.mp3"]), paths(&["r.mp3"]));
         assert_eq!(inputs(&["clean", "r.mp3", "1", "2", "o.wav"]), paths(&["r.mp3"]));
         assert!(inputs(&["speakers"]).is_empty());
     }
