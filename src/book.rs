@@ -8,7 +8,7 @@ use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
 use crate::store::{Chunk, NarrationStore, RenderSettings, fnv, noise_limit_for};
-use crate::takes::{Kept, TakePolicy, beats};
+use crate::takes::{Kept, TakePolicy};
 use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
 use any_tts::AudioSamples;
@@ -111,7 +111,7 @@ impl<'a> Recorder<'a> {
             }
             Ok(current)
         };
-        policy.record(0, MAX_TAKES, render, |take| (take.verdict.passes(), take.verdict.rank(true)))
+        policy.render_best(0, MAX_TAKES, render, |take| take.verdict.judged(), |take| take.verdict.passes())
     }
 }
 
@@ -207,7 +207,7 @@ pub fn narrate(
             progress.chunk_done(&format!(
                 "{:.0}s of audio, {}, recall {:.2}",
                 take.audio.duration_secs(),
-                store.takes().describe(kept.number),
+                store.takes().describe(&kept),
                 take.verdict.accuracy.recall,
             ))?;
         }
@@ -280,13 +280,12 @@ pub fn retake(
         let heard_all = |transcript: &str| {
             phrases.iter().all(|phrase| standard.heard(phrase, transcript))
         };
+        let judge = |verdict: &Verdict| verdict.judged_for_retake(heard_all(&verdict.accuracy.transcript));
         // The check file holds the take count, so seeds already tried are skipped.
         let (first_take, current) = if store.has_audio(item) {
             let check = store.check(item)?;
             let audio = AudioSamples::from_wav_file(&path)?;
-            let verdict = standard.judge(&item.text, &audio, &check.transcript);
-            let heard = heard_all(&check.transcript);
-            (check.takes, Some((verdict.flawless() && heard, verdict.rank(heard))))
+            (check.takes, Some(judge(&standard.judge(&item.text, &audio, &check.transcript))))
         } else {
             (0, None)
         };
@@ -313,20 +312,17 @@ pub fn retake(
             Ok(current)
         };
         // Done once the phrases are heard and every word is, with nothing more.
-        let judge = |take: &Take| {
-            let heard = heard_all(&take.verdict.accuracy.transcript);
-            (take.verdict.flawless() && heard, take.verdict.rank(heard))
-        };
-        let kept = store.takes().record(first_take, MAX_RETAKES, render, judge)?;
+        let done = |take: &Take| take.verdict.flawless() && heard_all(&take.verdict.accuracy.transcript);
+        let kept = store.takes().render_best(first_take, MAX_RETAKES, render, |take| judge(&take.verdict), done)?;
         let count = first_take + kept.rendered;
-        let better = current.as_ref().is_none_or(|current| beats(&judge(&kept.take), current));
+        let better = current.is_none_or(|current| judge(&kept.take.verdict) > current);
         let outcome = if better {
             if store.has_audio(item) {
                 store.retire(item)?;
             }
             let transcript = &kept.take.verdict.accuracy.transcript;
             store.store(item, &kept.take.audio, transcript, count)?;
-            progress.line(&format!("  replaced with {}: {transcript}", store.takes().describe(kept.number)))?;
+            progress.line(&format!("  replaced with {}: {transcript}", store.takes().describe(&kept)))?;
             "replaced"
         } else {
             // Still counts the tried seeds, so the next retake tries new ones.

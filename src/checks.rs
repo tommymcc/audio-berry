@@ -3,6 +3,7 @@
 use crate::quality::{self, Quality};
 use crate::store::NarrationStore;
 use crate::accuracy::{self, Accuracy, Allowances};
+use crate::takes::Judged;
 use any_tts::AudioSamples;
 
 /// What a take must meet in one output directory, in one voice.
@@ -60,34 +61,37 @@ impl Verdict {
     /// How the take ranks against others of the same chunk. `heard` is whether
     /// the phrases a `retake` asks for were heard, and true when none were.
     pub fn rank(&self, heard: bool) -> Rank {
-        Rank {
-            plausible: self.plausible,
-            clean: self.clean,
-            heard,
-            score: self.accuracy.score(),
-            quietness: if self.passes() { -self.quality.floor_db } else { 0.0 },
-        }
+        Rank { plausible: self.plausible, clean: self.clean, heard, score: self.accuracy.score() }
+    }
+
+    /// How `book` compares the take with others: it passes if it `passes`.
+    pub fn judged(&self) -> Judged<Rank> {
+        Judged { passes: self.passes(), rank: self.rank(true) }
+    }
+
+    /// How `retake` compares the take with others, given whether its phrases
+    /// were heard. It passes if it's a plausible length, clean and the phrases
+    /// were heard, which its rank already puts first, so between new takes and
+    /// the current one the rank alone decides, as it always has; accuracy only
+    /// ranks.
+    pub fn judged_for_retake(&self, heard: bool) -> Judged<Rank> {
+        Judged { passes: self.plausible && self.clean && heard, rank: self.rank(heard) }
     }
 }
 
-/// The one place that decides which of a chunk's takes is better, which
-/// compares greater. Passing takes beat failing ones before this is asked (see
-/// `takes::beats`), so the fields only order takes that both pass or both fail.
+/// Decides which of a chunk's takes is better, which compares greater, after
+/// `Judged` puts passing takes first. A later score belongs here as a field.
 ///
-/// They compare in order: plausible length matters most, then clean audio, then
-/// hearing a `retake`'s phrases, then accuracy, as recall minus extra words, so
-/// that among takes that pass, the one heard most nearly as written wins. A lower
-/// floor breaks a tie between passing takes, as the quieter is cleaner. It's left
-/// out between failing takes, which keep the earlier take on a tie as they always
-/// have.
+/// The fields compare in order: plausible length matters most, then clean audio,
+/// then hearing a `retake`'s phrases, then accuracy, as recall minus extra words,
+/// so that among takes that pass, the one heard most nearly as written wins.
+/// Ties keep the earlier take.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct Rank {
     plausible: bool,
     clean: bool,
     heard: bool,
     score: f32,
-    /// How far below 0 dB the floor is, for passing takes only.
-    quietness: f32,
 }
 
 #[cfg(test)]
@@ -130,39 +134,48 @@ mod tests {
         assert!(wrong.rank(true) < standard.judge(TEXT, &silence(4.0), TEXT).rank(true));
     }
 
-    fn verdict(passes: bool, recall: f32, extra: f32, floor_db: f32) -> Verdict {
-        let quality = Quality { floor_db, speech_db: -20.0, peak_db: -2.0, seconds: 8.0 };
+    /// A take of a plausible length, heard with this recall and extra words.
+    fn verdict(clean: bool, recall: f32, extra: f32) -> Verdict {
+        let quality = Quality { floor_db: -60.0, speech_db: -20.0, peak_db: -2.0, seconds: 8.0 };
         let accuracy = Accuracy { recall, extra, transcript: String::new() };
-        Verdict { quality, accuracy, plausible: true, clean: passes }
+        Verdict { quality, accuracy, plausible: true, clean }
     }
 
     #[test]
-    fn among_passing_takes_the_most_accurate_then_the_quietest_ranks_higher() {
-        let ranks = |verdicts: &[Verdict]| verdicts.iter().map(|verdict| verdict.rank(true)).collect::<Vec<_>>();
-        let ranked = ranks(&[
-            verdict(true, 0.95, 0.05, -60.0),
-            verdict(true, 1.0, 0.0, -56.0),
-            verdict(true, 1.0, 0.0, -62.0),
-            verdict(true, 0.97, 0.0, -70.0),
-        ]);
+    fn among_passing_takes_the_most_accurate_ranks_higher() {
+        let takes = [verdict(true, 0.95, 0.05), verdict(true, 1.0, 0.0), verdict(true, 0.97, 0.0)];
+        let ranked: Vec<Rank> = takes.iter().map(|verdict| verdict.rank(true)).collect();
         assert!(ranked[1] > ranked[0], "higher recall and fewer extra words");
-        assert!(ranked[3] > ranked[0], "fewer extra words");
-        assert!(ranked[1] > ranked[3], "accuracy before the floor");
-        assert!(ranked[2] > ranked[1], "the lower floor breaks a tie");
+        assert!(ranked[2] > ranked[0], "fewer extra words");
+        assert!(ranked[1] > ranked[2], "higher recall");
     }
 
     #[test]
-    fn the_floor_breaks_no_tie_between_failing_takes() {
-        let noisy = verdict(false, 1.0, 0.0, -40.0);
-        let quieter = verdict(false, 1.0, 0.0, -50.0);
-        assert!(!noisy.passes() && !quieter.passes());
-        assert_eq!(noisy.rank(true), quieter.rank(true));
+    fn a_book_take_that_passes_beats_a_more_accurate_one_that_fails() {
+        let passing = verdict(true, 0.92, 0.06);
+        let noisy = verdict(false, 1.0, 0.0);
+        let mut overlong = verdict(true, 1.0, 0.0);
+        overlong.plausible = false;
+        let wordy = verdict(true, 1.0, 0.13);
+        assert!(passing.passes() && !wordy.passes());
+        assert!(wordy.rank(true) > passing.rank(true), "by rank alone the wordy take would win");
+        for failing in [noisy, overlong, wordy] {
+            assert!(passing.judged() > failing.judged());
+        }
+    }
+
+    #[test]
+    fn a_retake_judges_by_rank_alone() {
+        let acceptable = verdict(true, 0.92, 0.06);
+        let unacceptable = verdict(true, 0.91, 0.0);
+        assert!(unacceptable.judged_for_retake(true) > acceptable.judged_for_retake(true));
+        assert!(acceptable.judged_for_retake(true) > unacceptable.judged_for_retake(false));
     }
 
     #[test]
     fn a_retake_phrase_heard_ranks_above_accuracy() {
-        let heard = verdict(true, 0.95, 0.05, -60.0);
-        let missed = verdict(true, 1.0, 0.0, -60.0);
+        let heard = verdict(true, 0.95, 0.05);
+        let missed = verdict(true, 1.0, 0.0);
         assert!(heard.rank(true) > missed.rank(false));
     }
 

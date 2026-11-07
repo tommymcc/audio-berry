@@ -183,7 +183,7 @@ struct Speed {
 #[derive(clap::Args)]
 struct Takes {
     /// Renders n takes of each chunk, from 1 to 10, and keeps the best, rather than
-    /// the first that passes; saved in the output directory
+    /// the first good enough; saved in the output directory
     #[arg(long = "takes", value_name = "n", value_parser = takes::parse_takes)]
     policy: Option<takes::TakePolicy>,
 }

@@ -230,9 +230,9 @@ audio-berry clean [OPTIONS] <recording> <start> <end> <output.wav>
 
 `audio-berry <command> --help` describes a command's arguments and options:
 `--speed <factor>` for `speak`, `book` and `audition`, `--seed <n>` for `speak`
-and `audition`, `--takes <n>` for `book` and `retake`, `--noise-limit <dB>` and `--precision <f32|f16|bf16>` for
-`speak`, `book`, `retake` and `audition`, and `--reduction <dB>` for `sections`
-and `clean`. An environment variable can give `--noise-limit`
+and `audition`, `--takes <n>` for `book` and `retake`, `--noise-limit <dB>` and
+`--precision <f32|f16|bf16>` for `speak`, `book`, `retake` and `audition`, and
+`--reduction <dB>` for `sections` and `clean`. An environment variable can give `--noise-limit`
 (`AUDIO_BERRY_NOISE_LIMIT_DB`), `--seed` (`OMNIVOICE_SEED`) or `--precision`
 (`OMNIVOICE_DTYPE`) instead, and the option wins if both are given. An invalid
 value stops a command that takes the option. `book` and `retake` pick their own
@@ -315,15 +315,13 @@ If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
 cached in `chunks/`, so rerunning the same command resumes an interrupted book.
 
-Takes of the same text vary by seed, and one that passes may still be flat or
-slightly garbled where another isn't. `--takes <n>`, from 1 to 10, renders exactly
-n takes of each chunk and keeps the best, rather than the first that passes. A
-take that passes always beats one that doesn't. Between takes that pass, the one
-heard most nearly as written wins (recall minus extra words), then the one with
-the lower floor. Each take costs a render and a transcription. Like the noise limit, it's saved in
-`narration.txt` with the first take, so later `book` and `retake` runs reuse it,
-and giving a new value replaces it. It doesn't render anything again, and each
-chunk's line names the take kept, such as `take 2, the best of 3`.
+Takes vary by seed, and one that passes may still sound flat or garbled.
+`--takes <n>`, from 1 to 10, renders exactly n takes of each chunk and keeps the
+best rather than the first that passes: a take that passes beats one that
+doesn't, and otherwise the one heard most nearly as written wins. Like the noise
+limit, it's saved in `narration.txt`, so later runs reuse it, and giving it again
+replaces it without rendering anything again. Each chunk's line names the take
+kept, such as `take 2, the best of 3`.
 
 In a terminal, `book` and `retake` show a progress bar with the time left and the
 latest chunk's take and recall. For `book` the bar covers the whole book, so a
@@ -516,9 +514,9 @@ by printing the `book` command that rebuilds them:
 ./target/release/audio-berry retake voices/me.wav book.epub output/book "took a watch out"
 ```
 
-`retake` tries up to 6 new seeds per chunk, or exactly the saved or given
-`--takes`. It keeps a new take only if it beats the current one and, given words,
-if those words are heard. Replaced audio moves
+`retake` tries up to 6 new seeds per chunk, stopping at one heard exactly as
+written, or exactly as many as `--takes` gives or saved. It keeps a new take only if it beats
+the current one and, given words, if those words are heard. Replaced audio moves
 to `replaced/`. A short phrase can match several chunks,
 and each one gets new takes. `retake` only records what you name: words only match
 chunks that already have audio, and a chunk with no audio has to be named by number.
