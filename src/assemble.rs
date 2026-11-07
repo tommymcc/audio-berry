@@ -1,12 +1,13 @@
 //! Joins an output directory's complete chapters into a WAV each and a
 //! chaptered M4B, tagged with the book's title, author and cover.
 
+use crate::audio::ffmpeg_failed;
 use crate::epub::{Book, image_type};
 use crate::quality;
 use crate::store::NarrationStore;
 use crate::voice::SAMPLE_RATE;
 use any_tts::AudioSamples;
-use std::error::Error;
+use color_eyre::eyre::{Result, eyre};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,11 +38,11 @@ fn metadata_escape(value: &str) -> String {
 
 /// Writes the book's cover beside the M4B, where `play` finds it for the chapter
 /// WAVs, which can't hold a picture.
-fn save_cover(book: &Book, out: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
+fn save_cover(book: &Book, out: &Path) -> Result<Option<PathBuf>> {
     let Some(cover) = &book.cover else {
         return Ok(None);
     };
-    let (_, extension) = image_type(cover).ok_or("the cover is not a JPEG or PNG")?;
+    let (_, extension) = image_type(cover).ok_or_else(|| eyre!("the cover is not a JPEG or PNG"))?;
     let path = out.join(format!("cover.{extension}"));
     fs::write(&path, cover)?;
     Ok(Some(path))
@@ -49,7 +50,7 @@ fn save_cover(book: &Book, out: &Path) -> Result<Option<PathBuf>, Box<dyn Error>
 
 /// Copies a chapter's WAV to `tagged` with its title, the book and the author,
 /// which `play` sends to the speaker's display.
-fn tag_chapter(book: &Book, title: &str, untagged: &Path, tagged: &Path) -> Result<(), Box<dyn Error>> {
+fn tag_chapter(book: &Book, title: &str, untagged: &Path, tagged: &Path) -> Result<()> {
     let mut ffmpeg = Command::new("ffmpeg");
     ffmpeg.args(["-v", "error", "-y", "-i"]).arg(untagged).args(["-c", "copy"]);
     ffmpeg.arg("-metadata").arg(format!("title={title}"));
@@ -59,14 +60,14 @@ fn tag_chapter(book: &Book, title: &str, untagged: &Path, tagged: &Path) -> Resu
     }
     let output = ffmpeg.arg(tagged).output()?;
     if !output.status.success() {
-        return Err(format!("ffmpeg failed tagging {}: {}", tagged.display(), String::from_utf8_lossy(&output.stderr)).into());
+        return Err(ffmpeg_failed(&format!("ffmpeg couldn't tag {}", tagged.display()), &output.stderr));
     }
     fs::remove_file(untagged)?;
     Ok(())
 }
 
 /// Joins every complete chapter into one WAV each and a chaptered M4B.
-pub fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathBuf, Box<dyn Error>> {
+pub fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathBuf> {
     let chapter_dir = out.join("chapters");
     fs::create_dir_all(&chapter_dir)?;
     let mut sample_rate = SAMPLE_RATE;
@@ -126,7 +127,7 @@ pub fn assemble(book: &Book, store: &NarrationStore, out: &Path) -> Result<PathB
     ffmpeg.args(["-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", "-f", "mp4"]);
     let output = ffmpeg.arg(&m4b).output()?;
     if !output.status.success() {
-        return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+        return Err(ffmpeg_failed(&format!("ffmpeg couldn't make {}", m4b.display()), &output.stderr));
     }
     fs::remove_file(&joined)?;
     Ok(m4b)

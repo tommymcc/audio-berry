@@ -8,7 +8,7 @@ use crate::voice::{SAMPLE_RATE, transcript_path};
 use any_tts::AudioSamples;
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::{Array2, ArrayView2, Axis};
-use std::error::Error;
+use color_eyre::eyre::{Result, bail, eyre};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -37,14 +37,14 @@ pub fn clean(
     end: f64,
     output: &Path,
     reduction_db: f32,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     if end <= start {
-        return Err(format!("the end ({end}s) must come after the start ({start}s)").into());
+        bail!("the end ({end}s) must come after the start ({start}s)");
     }
     let noisy = decode_audio(recording, CLEANING_RATE)?;
     let length = noisy.len() as f64 / CLEANING_RATE as f64;
     if end > length {
-        return Err(format!("{} is only {length:.1}s long, so can't cut to {end}s", recording.display()).into());
+        bail!("{} is only {length:.1}s long, so can't cut to {end}s", recording.display());
     }
 
     let started = std::time::Instant::now();
@@ -77,20 +77,20 @@ pub fn clean(
 
 /// Cleans a whole recording decoded at `CLEANING_RATE`, removing at most
 /// `reduction_db` of noise, and gives it at the voice sample rate.
-pub fn clean_samples(noisy: &[f32], reduction_db: f32) -> Result<Vec<f32>, Box<dyn Error>> {
+pub fn clean_samples(noisy: &[f32], reduction_db: f32) -> Result<Vec<f32>> {
     to_voice_rate(&denoise(noisy, reduction_db)?)
 }
 
 /// Moves aside the transcript beside a voice sample just written at `sample`,
 /// if there is one, as `<name>.txt.old`, since it describes the audio that was
 /// there before. Otherwise the sample's first use would take it as its words.
-fn retire_transcript(sample: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
+fn retire_transcript(sample: &Path) -> Result<Option<PathBuf>> {
     let transcript = transcript_path(sample);
     let old = transcript.with_extension("txt.old");
     match fs::rename(&transcript, &old) {
         Ok(()) => Ok(Some(old)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("couldn't move aside {}: {error}", transcript.display()).into()),
+        Err(error) => Err(eyre!("couldn't move aside {}: {error}", transcript.display())),
     }
 }
 
@@ -103,15 +103,15 @@ pub fn command_line(recording: &Path, start: &str, end: &str, output: &Path, red
 
 /// Runs DeepFilterNet 3 over 48 kHz mono audio, removing at most `reduction_db`
 /// of noise. The output lines up with the input sample for sample.
-fn denoise(noisy: &[f32], reduction_db: f32) -> Result<Vec<f32>, Box<dyn Error>> {
+fn denoise(noisy: &[f32], reduction_db: f32) -> Result<Vec<f32>> {
     // Run every stage on every frame, as the Python version does, rather than
     // skipping frames the model judges to be pure speech or pure noise.
     let params = RuntimeParams::default_with_ch(1)
         .with_atten_lim(reduction_db)
         .with_thresholds(f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
-    let mut model = DfTract::new(DfParams::default(), &params)?;
+    let mut model = DfTract::new(DfParams::default(), &params).map_err(|error| eyre!("couldn't start DeepFilterNet: {error:#}"))?;
     if model.sr != CLEANING_RATE as usize {
-        return Err(format!("the built-in DeepFilterNet model works at {} Hz, not {CLEANING_RATE}", model.sr).into());
+        bail!("the built-in DeepFilterNet model works at {} Hz, not {CLEANING_RATE}", model.sr);
     }
     let hop = model.hop_size;
     // The STFT and the model's lookahead delay the output by this much.
@@ -130,7 +130,7 @@ fn denoise(noisy: &[f32], reduction_db: f32) -> Result<Vec<f32>, Box<dyn Error>>
         .axis_chunks_iter(Axis(1), hop)
         .zip(enhanced.axis_chunks_iter_mut(Axis(1), hop))
     {
-        model.process(frame, out)?;
+        model.process(frame, out).map_err(|error| eyre!("DeepFilterNet failed: {error:#}"))?;
     }
     Ok(enhanced.row(0).iter().skip(delay).take(noisy.len()).copied().collect())
 }
@@ -165,7 +165,7 @@ fn lift_quiet_hops(samples: &mut [f32], hop: usize) {
 }
 
 /// Converts audio at the cleaning rate to the voice sample rate.
-fn to_voice_rate(samples: &[f32]) -> Result<Vec<f32>, Box<dyn Error>> {
+fn to_voice_rate(samples: &[f32]) -> Result<Vec<f32>> {
     let view = ArrayView2::from_shape((1, samples.len()), samples)?;
     let resampled = df::transforms::resample(view, CLEANING_RATE as usize, SAMPLE_RATE as usize, None)?;
     let length = samples.len() * SAMPLE_RATE as usize / CLEANING_RATE as usize;

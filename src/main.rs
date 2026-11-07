@@ -22,8 +22,10 @@ mod transcribe;
 mod voice;
 
 use clap::{Parser, Subcommand};
-use std::error::Error;
-use std::path::PathBuf;
+use color_eyre::config::{HookBuilder, Theme};
+use color_eyre::eyre::{Result, bail};
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 
 /// Beyond this, the length checks and Whisper haven't been tried.
 const SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=2.0;
@@ -237,6 +239,21 @@ impl Command {
             _ => None,
         }
     }
+
+    /// The files the command reads, which must all exist.
+    fn input_files(&self) -> Vec<&Path> {
+        match self {
+            Command::Speak { voice_sample, .. } | Command::Audition { voice_sample, .. } => vec![voice_sample],
+            Command::Chapters { book } => vec![book],
+            Command::Book { voice_sample, book, .. } | Command::Retake { voice_sample, book, .. } => vec![voice_sample, book],
+            Command::Mishearings { book, voice_sample, .. } => {
+                std::iter::once(book).chain(voice_sample).map(PathBuf::as_path).collect()
+            }
+            Command::Play { files, .. } => files.iter().map(PathBuf::as_path).collect(),
+            Command::Sections { recording, .. } | Command::Clean { recording, .. } => vec![recording],
+            Command::Speakers => vec![],
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -261,9 +278,26 @@ fn stop_quietly_when_output_closes() {
 #[cfg(not(unix))]
 fn stop_quietly_when_output_closes() {}
 
-fn main() -> Result<(), Box<dyn Error>> {
+/// Shows errors readably: in colour only on a terminal, and without a backtrace
+/// unless RUST_LIB_BACKTRACE asks for one, since most errors are about the files
+/// given rather than the code. Panics still follow RUST_BACKTRACE.
+fn install_error_reports() -> Result<()> {
+    if std::env::var_os("RUST_LIB_BACKTRACE").is_none() {
+        // SAFETY: called from main before any other threads exist.
+        unsafe { std::env::set_var("RUST_LIB_BACKTRACE", "0") };
+    }
+    let theme = if std::io::stderr().is_terminal() { Theme::dark() } else { Theme::new() };
+    HookBuilder::default().theme(theme).display_env_section(false).install()
+}
+
+fn main() -> Result<()> {
     stop_quietly_when_output_closes();
+    install_error_reports()?;
     let command = Cli::parse().command;
+    // Before loading anything, which can take a while.
+    if let Some(missing) = command.input_files().into_iter().find(|file| !file.is_file()) {
+        bail!("no such file: {}", missing.display());
+    }
     if let Some(model) = command.model_args() {
         model.use_precision();
     }
@@ -287,12 +321,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             Ok(())
         }
-        Command::Play { speaker, files } => {
-            if let Some(missing) = files.iter().find(|file| !file.is_file()) {
-                return Err(format!("no such file: {}", missing.display()).into());
-            }
-            cast::play(&cast::find(&speaker)?, files)
-        }
+        Command::Play { speaker, files } => cast::play(&cast::find(&speaker)?, files),
         Command::Audition { voice_sample, speaker, say } => {
             audition::audition(&voice_sample, speaker.as_deref(), &say.settings(), say.model.noise_limit)
         }
@@ -457,5 +486,21 @@ mod tests {
     fn commands_that_need_a_list_refuse_an_empty_one() {
         assert!(parse(&["retake", "v", "b", "o"]).is_err());
         assert!(parse(&["play", "kitchen"]).is_err());
+    }
+
+    #[test]
+    fn the_files_each_command_reads_are_checked() {
+        let inputs = |words: &[&str]| -> Vec<PathBuf> {
+            parse(words).unwrap().input_files().into_iter().map(Path::to_path_buf).collect()
+        };
+        let paths = |names: &[&str]| -> Vec<PathBuf> { names.iter().map(PathBuf::from).collect() };
+        assert_eq!(inputs(&["speak", "v.wav", "hi", "o.wav"]), paths(&["v.wav"]));
+        assert_eq!(inputs(&["book", "v.wav", "b.epub", "out"]), paths(&["v.wav", "b.epub"]));
+        assert_eq!(inputs(&["retake", "v.wav", "b.epub", "out", "3.1"]), paths(&["v.wav", "b.epub"]));
+        assert_eq!(inputs(&["mishearings", "b.epub", "out"]), paths(&["b.epub"]));
+        assert_eq!(inputs(&["mishearings", "b.epub", "out", "v.wav"]), paths(&["b.epub", "v.wav"]));
+        assert_eq!(inputs(&["play", "kitchen", "a.wav", "b.wav"]), paths(&["a.wav", "b.wav"]));
+        assert_eq!(inputs(&["clean", "r.mp3", "1", "2", "o.wav"]), paths(&["r.mp3"]));
+        assert!(inputs(&["speakers"]).is_empty());
     }
 }

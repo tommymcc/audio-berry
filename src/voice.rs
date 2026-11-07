@@ -7,7 +7,7 @@ use crate::store::fnv;
 use crate::transcribe::{Transcriber, VOICE_TRANSCRIPTION_MODEL};
 use any_tts::models::omnivoice::trim_long_audio;
 use any_tts::{AudioSamples, ReferenceAudio};
-use std::error::Error;
+use color_eyre::eyre::{Result, bail, eyre};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ impl Voice {
     /// beside the sample, written by transcribing it the first time, and can be
     /// corrected by hand. The sample is judged against `noise_limit_db`, if given,
     /// or the default noise limit.
-    pub fn load(path: &Path, noise_limit_db: Option<f32>) -> Result<Voice, Box<dyn Error>> {
+    pub fn load(path: &Path, noise_limit_db: Option<f32>) -> Result<Voice> {
         let recording = decode_audio(path, SAMPLE_RATE)?;
         let samples = trim_long_audio(
             &recording,
@@ -69,7 +69,7 @@ impl Voice {
         let transcript = Transcriber::start(VOICE_TRANSCRIPTION_MODEL)?.transcribe(&heard)?;
         let samples = heard.samples;
         if transcript.is_empty() {
-            return Err(format!("heard no speech in {}", path.display()).into());
+            bail!("heard no speech in {}", path.display());
         }
         fs::write(&transcript_path, format!("{transcript}\n"))?;
         println!("Heard in the voice sample: {transcript}");
@@ -105,7 +105,7 @@ impl Voice {
 
     /// Saves the sample as the model hears it. A long sample is trimmed, and its
     /// transcript only covers what's kept.
-    pub fn save_heard(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+    pub fn save_heard(&self, path: &Path) -> Result<()> {
         save(&self.reference.samples, path)
     }
 }
@@ -123,21 +123,21 @@ pub fn allowances_path(sample: &Path) -> PathBuf {
 }
 
 /// Reads the allowances beside a voice sample. Most voices have none.
-pub fn read_allowances(sample: &Path) -> Result<Allowances, Box<dyn Error>> {
+pub fn read_allowances(sample: &Path) -> Result<Allowances> {
     let path = allowances_path(sample);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Allowances::default()),
-        Err(error) => return Err(format!("{}: {error}", path.display()).into()),
+        Err(error) => return Err(eyre!("{}: {error}", path.display())),
     };
-    Ok(Allowances::parse(&text).map_err(|error| format!("{}: {error}", path.display()))?)
+    Ok(Allowances::parse(&text).map_err(|error| eyre!("{}: {error}", path.display()))?)
 }
 
 fn seconds(samples: &[f32]) -> f32 {
     samples.len() as f32 / SAMPLE_RATE as f32
 }
 
-fn save(samples: &[f32], path: &Path) -> Result<(), Box<dyn Error>> {
+fn save(samples: &[f32], path: &Path) -> Result<()> {
     AudioSamples::new(samples.to_vec(), SAMPLE_RATE).save_wav(path)?;
     Ok(())
 }

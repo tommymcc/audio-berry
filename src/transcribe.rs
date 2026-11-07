@@ -12,7 +12,7 @@ use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::whisper::{self, Config, audio, model::Whisper};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use std::error::Error;
+use color_eyre::eyre::{Result, eyre};
 use std::fs;
 use std::io::Write;
 use tokenizers::Tokenizer;
@@ -111,7 +111,7 @@ impl Attempt {
     }
 }
 
-fn compression_ratio(text: &str) -> Result<f64, Box<dyn Error>> {
+fn compression_ratio(text: &str) -> Result<f64> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(text.as_bytes())?;
     Ok(text.len() as f64 / encoder.finish()?.len() as f64)
@@ -139,11 +139,11 @@ pub struct Transcriber {
 }
 
 impl Transcriber {
-    pub fn start(model: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn start(model: &str) -> Result<Self> {
         let repo = format!("openai/whisper-{model}");
         let config: Config = serde_json::from_slice(&fs::read(download_file(&repo, "config.json")?)?)?;
         let tokenizer = Tokenizer::from_file(download_file(&repo, "tokenizer.json")?)
-            .map_err(|error| format!("couldn't read the {model} tokenizer: {error}"))?;
+            .map_err(|error| eyre!("couldn't read the {model} tokenizer: {error}"))?;
         let weights = download_file(&repo, "model.safetensors")?;
         let device = DeviceSelection::Auto.resolve()?;
         // Safety: the cached weights aren't changed while the app is running.
@@ -152,7 +152,7 @@ impl Transcriber {
         let token = |name: &str| {
             tokenizer
                 .token_to_id(name)
-                .ok_or_else(|| format!("the {model} tokenizer has no {name}"))
+                .ok_or_else(|| eyre!("the {model} tokenizer has no {name}"))
         };
         let (start, no_timestamps) = (token(whisper::SOT_TOKEN)?, token(whisper::NO_TIMESTAMPS_TOKEN)?);
         let (end, blank) = (token(whisper::EOT_TOKEN)?, token("Ġ")?);
@@ -160,7 +160,7 @@ impl Transcriber {
         let no_speech = whisper::NO_SPEECH_TOKENS
             .iter()
             .find_map(|name| tokenizer.token_to_id(name))
-            .ok_or_else(|| format!("the {model} tokenizer has no no-speech token"))?;
+            .ok_or_else(|| eyre!("the {model} tokenizer has no no-speech token"))?;
 
         let mut mask = vec![0f32; config.vocab_size];
         for &id in &config.suppress_tokens {
@@ -192,7 +192,7 @@ impl Transcriber {
     }
 
     /// Decodes a window, with timestamps between its phrases if `timed`.
-    fn decode(&mut self, features: &Tensor, temperature: f64, timed: bool) -> Result<Attempt, Box<dyn Error>> {
+    fn decode(&mut self, features: &Tensor, temperature: f64, timed: bool) -> Result<Attempt> {
         let temperature = (temperature > 0.0).then_some(temperature);
         let mut sampler = LogitsProcessor::new(SAMPLING_SEED, temperature, None);
         let mut tokens = if timed { vec![self.start] } else { vec![self.start, self.no_timestamps] };
@@ -241,17 +241,17 @@ impl Transcriber {
 
     /// The words in `tokens`, leaving out timestamps, which the tokenizer
     /// doesn't count as special.
-    fn words(&self, tokens: &[u32]) -> Result<String, Box<dyn Error>> {
+    fn words(&self, tokens: &[u32]) -> Result<String> {
         let words: Vec<u32> = tokens.iter().copied().filter(|&token| token < self.timestamp_begin).collect();
         let text = self
             .tokenizer
             .decode(&words, true)
-            .map_err(|error| format!("couldn't decode a transcript: {error}"))?;
+            .map_err(|error| eyre!("couldn't decode a transcript: {error}"))?;
         Ok(text)
     }
 
     /// The best decoding of a window, or `None` if it seems silent.
-    fn transcribe_window(&mut self, mel: &Tensor, timed: bool) -> Result<Option<Attempt>, Box<dyn Error>> {
+    fn transcribe_window(&mut self, mel: &Tensor, timed: bool) -> Result<Option<Attempt>> {
         let features = self.model.encoder.forward(mel, true)?;
         let mut attempts = Vec::new();
         for temperature in whisper::TEMPERATURES {
@@ -273,7 +273,7 @@ impl Transcriber {
 
     /// Decodes `audio`, heard as it would be once saved as a WAV file, window by
     /// window, giving each window that isn't silent.
-    fn transcribe_windows(&mut self, audio: &AudioSamples, timed: bool) -> Result<Vec<Heard>, Box<dyn Error>> {
+    fn transcribe_windows(&mut self, audio: &AudioSamples, timed: bool) -> Result<Vec<Heard>> {
         let samples = resample_as_saved(audio, whisper::SAMPLE_RATE as u32)?;
         let bands = self.model.config.num_mel_bins;
         let seconds = |samples: usize| samples as f64 / whisper::SAMPLE_RATE as f64;
@@ -294,7 +294,7 @@ impl Transcriber {
     }
 
     /// What's said in `audio`, heard as it would be once saved as a WAV file.
-    pub fn transcribe(&mut self, audio: &AudioSamples) -> Result<String, Box<dyn Error>> {
+    pub fn transcribe(&mut self, audio: &AudioSamples) -> Result<String> {
         let text: Vec<String> = self.transcribe_windows(audio, false)?.into_iter().map(|heard| heard.attempt.text).collect();
         Ok(tidy(&text.join(" ")))
     }
@@ -302,7 +302,7 @@ impl Transcriber {
     /// What's said in `audio`, phrase by phrase, with when each phrase was said.
     /// Whisper places its timestamps roughly, sometimes a few tenths of a second
     /// out, so look for the pauses near them before cutting there.
-    pub fn transcribe_phrases(&mut self, audio: &AudioSamples) -> Result<Vec<Phrase>, Box<dyn Error>> {
+    pub fn transcribe_phrases(&mut self, audio: &AudioSamples) -> Result<Vec<Phrase>> {
         let mut phrases = Vec::new();
         for Heard { start: offset, seconds, attempt } in self.transcribe_windows(audio, true)? {
             for span in spans(&attempt.tokens, &attempt.logprobs, self.timestamp_begin, seconds) {

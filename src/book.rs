@@ -11,7 +11,7 @@ use crate::store::{Chunk, NarrationStore, RenderSettings, fnv, noise_limit_for};
 use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
 use any_tts::AudioSamples;
-use std::error::Error;
+use color_eyre::eyre::{Result, bail, eyre};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -23,7 +23,7 @@ const MAX_RETAKES: u64 = 6;
 
 /// Reads the voice's allowances, and says how many there are, since they change
 /// which takes pass.
-fn read_allowances_saying_so(voice_sample: &Path) -> Result<Allowances, Box<dyn Error>> {
+fn read_allowances_saying_so(voice_sample: &Path) -> Result<Allowances> {
     let allowances = read_allowances(voice_sample)?;
     if !allowances.is_empty() {
         println!("Allowances: {} from {}", allowances.len(), allowances_path(voice_sample).display());
@@ -37,12 +37,12 @@ fn open_store(
     out: &Path,
     speed: Option<f64>,
     noise_limit_db: Option<f32>,
-) -> Result<NarrationStore, Box<dyn Error>> {
+) -> Result<NarrationStore> {
     NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &RenderSettings::from_env(speed), noise_limit_db)
 }
 
 /// Prints each chapter's number, title and size.
-pub fn list_chapters(path: &Path) -> Result<(), Box<dyn Error>> {
+pub fn list_chapters(path: &Path) -> Result<()> {
     let book = read_book(path)?;
     println!("{} by {}", book.title, book.author.as_deref().unwrap_or("unknown"));
     for (index, chapter) in book.chapters.iter().enumerate() {
@@ -74,7 +74,7 @@ struct Recorder<'a> {
 
 impl<'a> Recorder<'a> {
     /// Loads the narrator and the transcriber that checks it.
-    fn load(voice: &'a Voice, store: &NarrationStore, standard: &'a Standard) -> Result<Self, Box<dyn Error>> {
+    fn load(voice: &'a Voice, store: &NarrationStore, standard: &'a Standard) -> Result<Self> {
         let narrator = Narrator::load()?;
         let transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
         Ok(Recorder { narrator, transcriber, voice, speed: store.speed(), standard })
@@ -82,7 +82,7 @@ impl<'a> Recorder<'a> {
 
     /// Renders and checks one take. Seeds follow from the text, so `take` picks a
     /// repeatable take that differs from the others.
-    fn take(&mut self, item: &Chunk, take: u64) -> Result<Take, Box<dyn Error>> {
+    fn take(&mut self, item: &Chunk, take: u64) -> Result<Take> {
         let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
         let audio = self.narrator.say(self.voice, &item.text, self.speed, Some(base_seed + take))?;
         let transcript = self.transcriber.transcribe(&audio)?;
@@ -92,7 +92,7 @@ impl<'a> Recorder<'a> {
 
     /// Renders takes until one passes, or returns the best of them with its take count.
     /// Each rejected take is reported through `progress`.
-    fn best(&mut self, item: &Chunk, progress: &mut Progress) -> Result<(Take, u64), Box<dyn Error>> {
+    fn best(&mut self, item: &Chunk, progress: &mut Progress) -> Result<(Take, u64)> {
         let mut best: Option<Take> = None;
         for take in 0..MAX_TAKES {
             let current = self.take(item, take)?;
@@ -115,13 +115,13 @@ impl<'a> Recorder<'a> {
                 best = Some(current);
             }
         }
-        let best = best.ok_or("no takes were rendered")?;
+        let best = best.ok_or_else(|| eyre!("no takes were rendered"))?;
         Ok((best, MAX_TAKES))
     }
 }
 
 /// Writes one row per chunk with audio, so weak spots can be found and listened to.
-fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &Path) -> Result<usize, Box<dyn Error>> {
+fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &Path) -> Result<usize> {
     let mut report = String::from(
         "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\n",
     );
@@ -167,12 +167,12 @@ pub fn narrate(
     chapters: Option<Vec<usize>>,
     speed: Option<f64>,
     noise_limit_db: Option<f32>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     let book = read_book(epub)?;
     let selected: Vec<usize> = match chapters {
         Some(numbers) => {
             if let Some(bad) = numbers.iter().find(|&&n| n == 0 || n > book.chapters.len()) {
-                return Err(format!("no chapter {bad}; this book has {}", book.chapters.len()).into());
+                bail!("no chapter {bad}; this book has {}", book.chapters.len());
             }
             numbers.iter().map(|number| number - 1).collect()
         }
@@ -263,7 +263,7 @@ pub fn retake(
     out: &Path,
     targets: &[&str],
     noise_limit_db: Option<f32>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     let book = read_book(epub)?;
     let allowances = read_allowances_saying_so(voice_sample)?;
     // Judge the sample against the limit its takes will be, which may be saved.

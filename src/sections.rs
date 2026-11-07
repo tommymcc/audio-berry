@@ -9,7 +9,7 @@ use crate::shell;
 use crate::transcribe::{CHECK_MODEL, Phrase, Transcriber};
 use crate::voice::SAMPLE_RATE;
 use any_tts::AudioSamples;
-use std::error::Error;
+use color_eyre::eyre::{Result, bail};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -111,12 +111,12 @@ const LENGTH_POINTS_PER_SECOND: f64 = 0.3;
 /// Suggests the best `count` sections of `recording` to use as a voice sample,
 /// with what's said in each and the `clean` command that makes it, cleaning
 /// with `reduction_db` if given, as `clean` would.
-pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Result<(), Box<dyn Error>> {
+pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Result<()> {
     let started = Instant::now();
     let noisy = decode_audio_up_to(recording, CLEANING_RATE, MAX_RECORDING_SECONDS + 1.0)?;
     let length = noisy.len() as f64 / f64::from(CLEANING_RATE);
     if length > MAX_RECORDING_SECONDS {
-        return Err(too_long(recording).into());
+        bail!(too_long(recording));
     }
     println!("Cleaning {length:.1}s of {}, then finding its phrases with Whisper {MODEL}", recording.display());
     let cleaned = clean::clean_samples(&noisy, reduction_db.unwrap_or(DEFAULT_REDUCTION_DB))?;
@@ -140,12 +140,11 @@ pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Res
     let length = cleaned.len() as f64 / f64::from(SAMPLE_RATE);
     let sections = best_sections(&phrases, &frames, length, count, floor_of);
     if sections.is_empty() {
-        return Err(format!(
+        bail!(
             "found no stretch of {MIN_SECONDS:.0} to {MAX_SECONDS:.0} seconds of speech in {} that starts and \
              ends in a pause",
             recording.display()
-        )
-        .into());
+        );
     }
 
     // Heard again, section by section, because Whisper's phrases cross the

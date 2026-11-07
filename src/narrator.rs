@@ -3,7 +3,7 @@
 use crate::voice::Voice;
 use any_tts::models::omnivoice::preferred_runtime_choice;
 use any_tts::{AudioSamples, ModelType, SynthesisRequest, TtsConfig, TtsModel, load_model};
-use std::error::Error;
+use color_eyre::eyre::Result;
 use std::path::Path;
 use std::time::Instant;
 
@@ -18,7 +18,7 @@ pub struct Narrator {
 }
 
 impl Narrator {
-    pub fn load() -> Result<Narrator, Box<dyn Error>> {
+    pub fn load() -> Result<Narrator> {
         let started = Instant::now();
         let model = load_model(TtsConfig::new(ModelType::OmniVoice).with_preferred_runtime())?;
         println!("Model loaded in {:.0}s on {}", started.elapsed().as_secs_f32(), preferred_runtime_choice().device.label());
@@ -27,7 +27,7 @@ impl Narrator {
 
     /// Says `text` in `voice` at `speed`. A seed picks a repeatable take; without
     /// one, the model picks it from `SEED_VAR`, as it does by default.
-    pub fn say(&self, voice: &Voice, text: &str, speed: f64, seed: Option<u64>) -> Result<AudioSamples, Box<dyn Error>> {
+    pub fn say(&self, voice: &Voice, text: &str, speed: f64, seed: Option<u64>) -> Result<AudioSamples> {
         if let Some(seed) = seed {
             // SAFETY: nothing else reads or writes the environment during this
             // call, as the model is only used from this thread between requests.
@@ -42,7 +42,7 @@ impl Narrator {
     }
 
     /// Says `text` in `voice`, saves it to `output` and reports how fast that was.
-    pub fn say_to_file(&self, voice: &Voice, text: &str, output: &Path, settings: &SpeakSettings) -> Result<(), Box<dyn Error>> {
+    pub fn say_to_file(&self, voice: &Voice, text: &str, output: &Path, settings: &SpeakSettings) -> Result<()> {
         let started = Instant::now();
         let audio = self.say(voice, text, settings.speed.unwrap_or(1.0), settings.seed)?;
         let elapsed = started.elapsed().as_secs_f32();
@@ -74,7 +74,7 @@ pub fn speak(
     output: &Path,
     settings: &SpeakSettings,
     noise_limit_db: Option<f32>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     let voice = Voice::load(voice, noise_limit_db)?;
     Narrator::load()?.say_to_file(&voice, text, output, settings)
 }

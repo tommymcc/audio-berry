@@ -6,7 +6,7 @@ use crate::epub::read_book;
 use crate::store::NarrationStore;
 use crate::voice::{allowances_path, read_allowances};
 use std::collections::{HashMap, HashSet};
-use std::error::Error;
+use color_eyre::eyre::Result;
 use std::io::ErrorKind;
 use std::path::Path;
 
@@ -77,7 +77,7 @@ fn lines(found: &[Mishearing], allowances: &Allowances) -> Vec<String> {
 /// Prints the words most often heard as others in the takes kept in `out`, as
 /// lines ready for a voice's allowances file. Given the voice sample, it marks
 /// those its allowances already allow.
-pub fn list(epub: &Path, out: &Path, voice_sample: Option<&Path>) -> Result<(), Box<dyn Error>> {
+pub fn list(epub: &Path, out: &Path, voice_sample: Option<&Path>) -> Result<()> {
     let book = read_book(epub)?;
     let allowances = voice_sample.map(read_allowances).transpose()?.unwrap_or_default();
     let store = NarrationStore::read(out, &book.title, &book.chunks())?;

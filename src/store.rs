@@ -7,7 +7,7 @@ use crate::accuracy::contains_phrase;
 use any_tts::{AudioSamples, DeviceSelection};
 use any_tts::models::omnivoice::{OmniVoiceRuntimeChoice, preferred_runtime_choice};
 use std::collections::{HashMap, HashSet};
-use std::error::Error;
+use color_eyre::eyre::{Result, bail, eyre};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -76,7 +76,7 @@ pub struct Check {
     pub transcript: String,
 }
 
-fn read_manifest(out: &Path) -> Result<Option<Manifest>, Box<dyn Error>> {
+fn read_manifest(out: &Path) -> Result<Option<Manifest>> {
     match fs::read_to_string(out.join(MANIFEST)) {
         Ok(text) => Ok(Some(Manifest::parse(&text)?)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -87,7 +87,7 @@ fn read_manifest(out: &Path) -> Result<Option<Manifest>, Box<dyn Error>> {
 /// The noise limit a run in `out` will judge takes against when `given` is the
 /// one given on the command line, if any: the given one, or the one saved there,
 /// or `None` for the default. `open` settles it the same way.
-pub fn noise_limit_for(out: &Path, given: Option<f32>) -> Result<Option<f32>, Box<dyn Error>> {
+pub fn noise_limit_for(out: &Path, given: Option<f32>) -> Result<Option<f32>> {
     match given {
         Some(limit) => Ok(Some(limit)),
         None => Ok(read_manifest(out)?.and_then(|saved| saved.noise_limit_db)),
@@ -134,12 +134,12 @@ impl Manifest {
         text
     }
 
-    fn parse(text: &str) -> Result<Self, Box<dyn Error>> {
+    fn parse(text: &str) -> Result<Self> {
         let field = |name: &str| {
             text.lines()
                 .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
                 .map(str::to_string)
-                .ok_or_else(|| format!("{MANIFEST} has no {name}"))
+                .ok_or_else(|| eyre!("{MANIFEST} has no {name}"))
         };
         Ok(Self {
             book: field("book")?,
@@ -148,14 +148,14 @@ impl Manifest {
             speed: field("speed").map_or(Ok(NORMAL_SPEED), |speed| speed.parse())?,
             noise_limit_db: match field("noise_limit_db") {
                 Ok(value) => Some(valid_noise_limit(&value).ok_or_else(|| {
-                    format!("{MANIFEST} has noise_limit_db={value}, which isn't a level from -100 to 0 dB. Correct or delete that line")
+                    eyre!("{MANIFEST} has noise_limit_db={value}, which isn't a level from -100 to 0 dB. Correct or delete that line")
                 })?),
                 Err(_) => None,
             },
         })
     }
 
-    fn require(&self, wanted: &Self, out: &Path) -> Result<(), Box<dyn Error>> {
+    fn require(&self, wanted: &Self, out: &Path) -> Result<()> {
         let fields = [
             ("book", &self.book, &wanted.book),
             ("voice", &self.voice, &wanted.voice),
@@ -164,11 +164,10 @@ impl Manifest {
         ];
         for (name, saved, asked) in fields {
             if saved != asked {
-                return Err(format!(
+                bail!(
                     "{} was rendered with {name} {saved}, not {asked}. Use a new output directory.",
                     out.display()
-                )
-                .into());
+                );
             }
         }
         Ok(())
@@ -259,12 +258,12 @@ fn chunks_of(chapters: &[Vec<String>], voice: &str, speed: f64) -> Vec<Chunk> {
 impl NarrationStore {
     /// Opens an output directory only to read what has been rendered there, in
     /// the voice and settings it saved, changing nothing.
-    pub fn read(out: &Path, book_title: &str, chapters: &[Vec<String>]) -> Result<Self, Box<dyn Error>> {
+    pub fn read(out: &Path, book_title: &str, chapters: &[Vec<String>]) -> Result<Self> {
         let manifest = read_manifest(out)?
-            .ok_or_else(|| format!("{} has no {MANIFEST}, so nothing has been rendered there", out.display()))?;
+            .ok_or_else(|| eyre!("{} has no {MANIFEST}, so nothing has been rendered there", out.display()))?;
         let book = book_title.replace('\n', " ");
         if manifest.book != book {
-            return Err(format!("{} narrates {}, not {book}", out.display(), manifest.book).into());
+            bail!("{} narrates {}, not {book}", out.display(), manifest.book);
         }
         Ok(Self {
             out: out.to_path_buf(),
@@ -282,7 +281,7 @@ impl NarrationStore {
         voice: u64,
         settings: &RenderSettings,
         given_noise_limit: Option<f32>,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self> {
         let saved = read_manifest(out)?;
         let speed = settings.speed.or(saved.as_ref().map(|saved| saved.speed)).unwrap_or(NORMAL_SPEED);
         let noise_limit = settle_noise_limit(saved.as_ref(), given_noise_limit, out);
@@ -307,7 +306,7 @@ impl NarrationStore {
     }
 
     /// Refuses anything other than what this folder has already rendered.
-    fn require_same(&self, saved: Option<Manifest>) -> Result<(), Box<dyn Error>> {
+    fn require_same(&self, saved: Option<Manifest>) -> Result<()> {
         if let Some(saved) = saved {
             return saved.require(&self.manifest, &self.out);
         }
@@ -319,14 +318,14 @@ impl NarrationStore {
     }
 
     /// Saves what this folder narrates, once it has audio to go with it.
-    fn save_manifest(&self) -> Result<(), Box<dyn Error>> {
+    fn save_manifest(&self) -> Result<()> {
         if !self.out.join(MANIFEST).exists() {
             self.write_manifest()?;
         }
         Ok(())
     }
 
-    fn write_manifest(&self) -> Result<(), Box<dyn Error>> {
+    fn write_manifest(&self) -> Result<()> {
         let path = self.out.join(MANIFEST);
         let temporary = path.with_extension("tmp");
         fs::write(&temporary, self.manifest.render())?;
@@ -337,7 +336,7 @@ impl NarrationStore {
     /// Older versions saved nothing, so a folder with chunks can only be trusted
     /// if some of them belong to this narration. They always used the default
     /// precision unless overridden for testing, and normal speed.
-    fn older_manifest(&self, wanted: &Manifest) -> Result<Option<Manifest>, Box<dyn Error>> {
+    fn older_manifest(&self, wanted: &Manifest) -> Result<Option<Manifest>> {
         let has_audio = fs::read_dir(self.out.join("chunks"))?
             .filter_map(Result::ok)
             .any(|entry| entry.path().extension().is_some_and(|extension| extension == "wav"));
@@ -345,19 +344,17 @@ impl NarrationStore {
             return Ok(None);
         }
         if wanted.speed != NORMAL_SPEED {
-            return Err(format!(
+            bail!(
                 "{} was rendered at normal speed, not {}. Use a new output directory.",
                 self.out.display(),
                 wanted.speed
-            )
-            .into());
+            );
         }
         if !self.chunks.iter().any(|chunk| self.has_audio(chunk)) {
-            return Err(format!(
+            bail!(
                 "{} has audio from a different voice or text. Use a new output directory.",
                 self.out.display()
-            )
-            .into());
+            );
         }
         Ok(Some(Manifest { precision: DEFAULT_PRECISION.into(), speed: NORMAL_SPEED, ..wanted.clone() }))
     }
@@ -365,12 +362,12 @@ impl NarrationStore {
     /// Finds what `targets` name: chunk numbers, or words from the book. Each audio
     /// file appears once, in book order, with every chunk number that shares it.
     /// Words only match chunks with audio, as they're for fixing what's been heard.
-    pub fn select(&self, targets: &[&str]) -> Result<Vec<Selected<'_>>, Box<dyn Error>> {
+    pub fn select(&self, targets: &[&str]) -> Result<Vec<Selected<'_>>> {
         let mut wanted: HashMap<&str, Vec<String>> = HashMap::new();
         for target in targets {
             if let Some(number) = parse_number(target) {
                 let chunk = self.chunks.iter().find(|chunk| (chunk.chapter + 1, chunk.position + 1) == number);
-                let chunk = chunk.ok_or_else(|| format!("no chunk {target} in this book"))?;
+                let chunk = chunk.ok_or_else(|| eyre!("no chunk {target} in this book"))?;
                 wanted.entry(&chunk.hash).or_default();
             } else {
                 for chunk in self.chunks_with_words(target)? {
@@ -392,7 +389,7 @@ impl NarrationStore {
         Ok(selected)
     }
 
-    fn chunks_with_words(&self, words: &str) -> Result<Vec<&Chunk>, Box<dyn Error>> {
+    fn chunks_with_words(&self, words: &str) -> Result<Vec<&Chunk>> {
         let (with_audio, without): (Vec<&Chunk>, Vec<&Chunk>) = self
             .chunks
             .iter()
@@ -403,14 +400,13 @@ impl NarrationStore {
         }
         if without.is_empty() {
             let hint = if words.parse::<usize>().is_ok() { "; chunk numbers look like 3.12, see report.tsv" } else { "" };
-            return Err(format!("nothing in the book matches \"{words}\"{hint}").into());
+            bail!("nothing in the book matches \"{words}\"{hint}");
         }
         let numbers: Vec<String> = without.iter().map(|chunk| chunk.number()).collect();
-        Err(format!(
+        Err(eyre!(
             "\"{words}\" is only in chunks with no audio: {}. Name them by number to record them.",
             numbers.join(", ")
-        )
-        .into())
+        ))
     }
 
     /// The speaking speed this folder narrates at.
@@ -483,7 +479,7 @@ impl NarrationStore {
     }
 
     /// Saves a chunk's audio and check file, replacing the audio in one step.
-    pub fn store(&self, chunk: &Chunk, audio: &AudioSamples, transcript: &str, takes: u64) -> Result<(), Box<dyn Error>> {
+    pub fn store(&self, chunk: &Chunk, audio: &AudioSamples, transcript: &str, takes: u64) -> Result<()> {
         self.save_manifest()?;
         let path = self.audio_path(chunk);
         let transcript = transcript.replace(['\n', '\t'], " ");
@@ -495,14 +491,14 @@ impl NarrationStore {
     }
 
     /// Reads the stored check for a chunk that has audio.
-    pub fn check(&self, chunk: &Chunk) -> Result<Check, Box<dyn Error>> {
+    pub fn check(&self, chunk: &Chunk) -> Result<Check> {
         let sidecar = fs::read_to_string(self.audio_path(chunk).with_extension("check"))?;
-        let (takes, transcript) = sidecar.split_once('\n').ok_or("malformed chunk check file")?;
+        let (takes, transcript) = sidecar.split_once('\n').ok_or_else(|| eyre!("malformed chunk check file"))?;
         Ok(Check { takes: takes.parse()?, transcript: transcript.to_string() })
     }
 
     /// Records more tried seeds without changing the audio.
-    pub fn record_tried(&self, chunk: &Chunk, takes: u64) -> Result<(), Box<dyn Error>> {
+    pub fn record_tried(&self, chunk: &Chunk, takes: u64) -> Result<()> {
         let transcript = self.check(chunk)?.transcript;
         let path = self.audio_path(chunk).with_extension("check");
         let temporary = path.with_extension("check.tmp");
@@ -512,7 +508,7 @@ impl NarrationStore {
     }
 
     /// Moves a chunk's audio and check file to `replaced/`, ready for a new take.
-    pub fn retire(&self, chunk: &Chunk) -> Result<(), Box<dyn Error>> {
+    pub fn retire(&self, chunk: &Chunk) -> Result<()> {
         let takes = self.check(chunk)?.takes;
         let replaced = self.out.join("replaced");
         fs::create_dir_all(&replaced)?;
@@ -591,7 +587,7 @@ mod tests {
         assert_eq!(store.incomplete_chapter_count(), 3);
     }
 
-    fn open_as(dir: &TempDir, title: &str, voice: u64, precision: &str) -> Result<NarrationStore, Box<dyn Error>> {
+    fn open_as(dir: &TempDir, title: &str, voice: u64, precision: &str) -> Result<NarrationStore> {
         let settings = RenderSettings { precision: precision.into(), speed: None };
         NarrationStore::open(dir.path(), title, &chapters(&[&["a"]]), voice, &settings, None)
     }
@@ -671,7 +667,7 @@ mod tests {
         assert_eq!(numbers(&store.select(&["2.1", "1.1"]).unwrap()), ["1.1", "2.1"]);
     }
 
-    fn open_at(dir: &TempDir, speed: Option<f64>) -> Result<NarrationStore, Box<dyn Error>> {
+    fn open_at(dir: &TempDir, speed: Option<f64>) -> Result<NarrationStore> {
         let settings = RenderSettings { speed, ..settings() };
         NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings, None)
     }
@@ -808,7 +804,7 @@ mod tests {
         }
     }
 
-    fn open_store(dir: &TempDir, noise_limit: Option<f32>) -> Result<NarrationStore, Box<dyn Error>> {
+    fn open_store(dir: &TempDir, noise_limit: Option<f32>) -> Result<NarrationStore> {
         NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), noise_limit)
     }
 

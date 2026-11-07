@@ -3,7 +3,7 @@
 use crate::text::{MAX_CHUNK_CHARS, Paragraph, chunk};
 use epub::doc::{EpubDoc, NavPoint};
 use scraper::{ElementRef, Html, Node, Selector};
-use std::error::Error;
+use color_eyre::eyre::{Result, bail, eyre};
 use std::path::Path;
 
 const BLOCKS: [&str; 22] = [
@@ -197,8 +197,8 @@ fn dublin_core(package: &str, name: &str) -> Option<String> {
 }
 
 /// Reads a book. Each spine document with readable text becomes one chapter.
-pub fn read_book(path: &Path) -> Result<Book, Box<dyn Error>> {
-    let mut doc = EpubDoc::new(path).map_err(|error| format!("{}: {error}", path.display()))?;
+pub fn read_book(path: &Path) -> Result<Book> {
+    let mut doc = EpubDoc::new(path).map_err(|error| eyre!("{}: {error}", path.display()))?;
     let root_file = doc.root_file.clone();
     let package = doc.get_resource_str_by_path(root_file).unwrap_or_default();
     let title = doc
@@ -248,11 +248,10 @@ pub fn read_book(path: &Path) -> Result<Book, Box<dyn Error>> {
         chapters.push(Chapter { title, paragraphs });
     }
     if chapters.is_empty() {
-        return Err(format!(
+        bail!(
             "no readable text in {}; DRM-protected books can't be read",
             path.display()
-        )
-        .into());
+        );
     }
     Ok(Book {
         title,

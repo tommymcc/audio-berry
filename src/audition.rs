@@ -4,7 +4,7 @@
 use crate::cast;
 use crate::narrator::{Narrator, SpeakSettings};
 use crate::voice::Voice;
-use std::error::Error;
+use color_eyre::eyre::{Result, eyre};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,10 +22,10 @@ struct Pair {
 
 /// Names the pair after the sample, so `voices/me.wav` gives `me-original.wav`
 /// and `me-clone.wav`. Speakers with a screen show these names.
-fn pair_for(voice: &Path, dir: &Path) -> Result<Pair, Box<dyn Error>> {
+fn pair_for(voice: &Path, dir: &Path) -> Result<Pair> {
     let stem = voice
         .file_stem()
-        .ok_or_else(|| format!("no file name in {}", voice.display()))?
+        .ok_or_else(|| eyre!("no file name in {}", voice.display()))?
         .to_string_lossy();
     Ok(Pair {
         original: dir.join(format!("{stem}-original.wav")),
@@ -40,7 +40,7 @@ pub fn audition(
     speaker: Option<&str>,
     settings: &SpeakSettings,
     noise_limit_db: Option<f32>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     // Finding the speaker first means a wrong name fails before the slow part.
     let speaker = speaker.map(cast::find).transpose()?;
     let voice = Voice::load(voice_sample, noise_limit_db)?;

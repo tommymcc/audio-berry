@@ -1,43 +1,44 @@
 //! Reads audio files of any format.
 
 use any_tts::AudioSamples;
-use std::error::Error;
+use color_eyre::eyre::{Report, Result, eyre};
+use color_eyre::{Section, SectionExt};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Decodes any audio file ffmpeg understands into mono f32 PCM.
-pub fn decode_audio(path: &Path, sample_rate: u32) -> Result<Vec<f32>, Box<dyn Error>> {
+pub fn decode_audio(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
     decode(path, sample_rate, None)
 }
 
 /// Decodes at most the first `seconds` of an audio file, so a long one can be
 /// refused without holding all of it.
-pub fn decode_audio_up_to(path: &Path, sample_rate: u32, seconds: f64) -> Result<Vec<f32>, Box<dyn Error>> {
+pub fn decode_audio_up_to(path: &Path, sample_rate: u32, seconds: f64) -> Result<Vec<f32>> {
     decode(path, sample_rate, Some(seconds))
 }
 
-fn decode(path: &Path, sample_rate: u32, seconds: Option<f64>) -> Result<Vec<f32>, Box<dyn Error>> {
+fn decode(path: &Path, sample_rate: u32, seconds: Option<f64>) -> Result<Vec<f32>> {
     let mut ffmpeg = Command::new("ffmpeg");
     ffmpeg.args(["-v", "error"]);
     if let Some(seconds) = seconds {
         ffmpeg.args(["-t", &seconds.to_string()]);
     }
     ffmpeg.arg("-i").arg(path);
-    run(ffmpeg, None, sample_rate, &format!("ffmpeg failed on {}", path.display()))
+    run(ffmpeg, None, sample_rate, &format!("ffmpeg couldn't read {}", path.display()))
 }
 
 /// Converts audio to mono f32 PCM at `sample_rate`, exactly as `decode_audio`
 /// would read it back from a saved WAV file, without saving one.
-pub fn resample_as_saved(audio: &AudioSamples, sample_rate: u32) -> Result<Vec<f32>, Box<dyn Error>> {
+pub fn resample_as_saved(audio: &AudioSamples, sample_rate: u32) -> Result<Vec<f32>> {
     let mut ffmpeg = Command::new("ffmpeg");
     ffmpeg.args(["-v", "error", "-f", "wav", "-i", "pipe:0"]);
-    run(ffmpeg, Some(audio.get_wav()), sample_rate, "ffmpeg failed")
+    run(ffmpeg, Some(audio.get_wav()), sample_rate, "ffmpeg couldn't resample audio")
 }
 
 /// Runs ffmpeg, given its input, feeding it `stdin` if any, and reads the mono
-/// f32 PCM it writes. A failure is reported after `failed`.
-fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, failed: &str) -> Result<Vec<f32>, Box<dyn Error>> {
+/// f32 PCM it writes. A failure is reported as `failed`, with what ffmpeg said.
+fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, failed: &str) -> Result<Vec<f32>> {
     ffmpeg
         .args(["-ac", "1", "-ar", &sample_rate.to_string(), "-f", "f32le", "-"])
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -51,12 +52,12 @@ fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, failed: &s
     };
     let output = child.wait_with_output()?;
     let written = match writer {
-        Some(writer) => writer.join().map_err(|_| "couldn't feed ffmpeg")?,
+        Some(writer) => writer.join().map_err(|_| eyre!("couldn't feed ffmpeg"))?,
         None => Ok(()),
     };
     // ffmpeg stopping early closes the pipe, and its own error says why.
     if !output.status.success() {
-        return Err(format!("{failed}: {}", String::from_utf8_lossy(&output.stderr)).into());
+        return Err(ffmpeg_failed(failed, &output.stderr));
     }
     written?;
     Ok(output
@@ -66,10 +67,55 @@ fn run(mut ffmpeg: Command, stdin: Option<Vec<u8>>, sample_rate: u32, failed: &s
         .collect())
 }
 
+/// An error saying what ffmpeg was doing, with what it said about it below,
+/// without the internal addresses it starts its lines with.
+pub fn ffmpeg_failed(doing: &str, stderr: &[u8]) -> Report {
+    match ffmpeg_said(stderr) {
+        Some(said) => eyre!("{doing}").section(said.header("ffmpeg said:")),
+        None => eyre!("{doing}"),
+    }
+}
+
+/// ffmpeg's error output without its addresses or blank lines, if it said anything.
+fn ffmpeg_said(stderr: &[u8]) -> Option<String> {
+    let stderr = String::from_utf8_lossy(stderr);
+    let said: Vec<&str> = stderr.lines().map(without_address).filter(|line| !line.is_empty()).collect();
+    (!said.is_empty()).then(|| said.join("\n"))
+}
+
+/// A line of ffmpeg's output without a leading `[in#0 @ 0x5bfd60e7dc40] `.
+fn without_address(line: &str) -> &str {
+    let line = line.trim();
+    match line.strip_prefix('[').and_then(|rest| rest.split_once("] ")) {
+        Some((inside, rest)) if inside.contains(" @ 0x") => rest.trim(),
+        _ => line,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_dir::TempDir;
+
+    #[test]
+    fn ffmpeg_errors_say_what_failed_then_what_ffmpeg_said_without_addresses() {
+        let stderr = b"[in#0 @ 0x5bfd60e7dc40] Error opening input: No such file or directory\n\
+                       Error opening input file voices/me.wav.\n\n";
+        let report = ffmpeg_failed("ffmpeg couldn't read voices/me.wav", stderr);
+        assert_eq!(report.to_string(), "ffmpeg couldn't read voices/me.wav");
+        assert_eq!(
+            ffmpeg_said(stderr).unwrap(),
+            "Error opening input: No such file or directory\nError opening input file voices/me.wav."
+        );
+        assert_eq!(ffmpeg_said(b"\n  \n"), None);
+    }
+
+    #[test]
+    fn brackets_without_an_address_are_kept() {
+        assert_eq!(without_address("[mp3 @ 0x1f] bad frame"), "bad frame");
+        assert_eq!(without_address("[sic] as written"), "[sic] as written");
+        assert_eq!(without_address("  plain  "), "plain");
+    }
 
     #[test]
     fn audio_resampled_in_memory_matches_the_saved_file_read_back() {

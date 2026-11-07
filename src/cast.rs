@@ -7,7 +7,7 @@ use rust_cast::channels::connection::ConnectionResponse;
 use rust_cast::channels::heartbeat::HeartbeatResponse;
 use rust_cast::channels::receiver::{CastDeviceApp, ReceiverResponse};
 use rust_cast::{CastDevice, ChannelMessage};
-use std::error::Error;
+use color_eyre::eyre::{Result, bail, eyre};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
 use std::borrow::Cow;
@@ -28,7 +28,7 @@ pub struct Speaker {
 }
 
 /// Finds Cast devices on the local network.
-pub fn discover() -> Result<Vec<Speaker>, Box<dyn Error>> {
+pub fn discover() -> Result<Vec<Speaker>> {
     let mdns = ServiceDaemon::new()?;
     let events = mdns.browse("_googlecast._tcp.local.")?;
     let deadline = Instant::now() + DISCOVERY_TIME;
@@ -67,7 +67,7 @@ pub fn discover() -> Result<Vec<Speaker>, Box<dyn Error>> {
 }
 
 /// Picks the one speaker whose name contains `query`, ignoring case.
-pub fn find(query: &str) -> Result<Speaker, Box<dyn Error>> {
+pub fn find(query: &str) -> Result<Speaker> {
     let speakers = discover()?;
     let names = || {
         speakers
@@ -82,16 +82,15 @@ pub fn find(query: &str) -> Result<Speaker, Box<dyn Error>> {
         .filter(|speaker| speaker.name.to_lowercase().contains(&query_lower))
         .count();
     if matches != 1 {
-        return Err(format!(
+        bail!(
             "{matches} speakers match \"{query}\" (found: {})",
             names()
-        )
-        .into());
+        );
     }
     speakers
         .into_iter()
         .find(|speaker| speaker.name.to_lowercase().contains(&query_lower))
-        .ok_or_else(|| "speaker disappeared".into())
+        .ok_or_else(|| eyre!("speaker disappeared"))
 }
 
 fn content_type(path: &Path) -> &'static str {
@@ -275,7 +274,7 @@ fn handle_request(mut stream: TcpStream, files: &[Resource]) -> std::io::Result<
 }
 
 /// Serves `files` on a temporary port for as long as the process runs.
-fn serve(speaker: &Speaker, files: Vec<Resource>) -> Result<String, Box<dyn Error>> {
+fn serve(speaker: &Speaker, files: Vec<Resource>) -> Result<String> {
     // The address the speaker can reach us on is whichever routes towards it.
     let probe = UdpSocket::bind("0.0.0.0:0")?;
     probe.connect((speaker.ip, speaker.port))?;
@@ -297,7 +296,7 @@ fn serve(speaker: &Speaker, files: Vec<Resource>) -> Result<String, Box<dyn Erro
 }
 
 /// Plays `files` in order on `speaker`, returning once the last one finishes.
-pub fn play(speaker: &Speaker, files: Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+pub fn play(speaker: &Speaker, files: Vec<PathBuf>) -> Result<()> {
     // Dependencies enable two TLS backends, so rustls needs telling which to use.
     let _ = rustls::crypto::ring::default_provider().install_default();
     // Covers are served after the audio, each picture once.
@@ -398,7 +397,7 @@ impl PlaybackClock {
 fn wait_until_finished(
     device: &CastDevice<'_>,
     session_id: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     let mut clock = PlaybackClock::new(Instant::now());
     let mut session_seen = false;
     while !clock.timed_out(Instant::now()) {
@@ -416,9 +415,9 @@ fn wait_until_finished(
                     }
                     match entry.idle_reason {
                         Some(IdleReason::Finished) => return Ok(()),
-                        Some(IdleReason::Error) => return Err("the speaker couldn't play the file".into()),
+                        Some(IdleReason::Error) => return Err(eyre!("the speaker couldn't play the file")),
                         Some(IdleReason::Cancelled | IdleReason::Interrupted) => {
-                            return Err("playback was stopped on the speaker".into());
+                            bail!("playback was stopped on the speaker");
                         }
                         None => {}
                     }
@@ -427,24 +426,24 @@ fn wait_until_finished(
             // Stopping from the speaker or an app closes the session, often
             // without a final media status.
             ChannelMessage::Connection(ConnectionResponse::Close) => {
-                return Err("playback was stopped on the speaker".into());
+                bail!("playback was stopped on the speaker");
             }
             // A display can report no apps just after a launch, so a session
             // can only have stopped once it has been seen running.
             ChannelMessage::Receiver(ReceiverResponse::Status(status)) => {
                 let running = status.applications.iter().any(|app| app.session_id == session_id);
                 if session_seen && !running {
-                    return Err("playback was stopped on the speaker".into());
+                    bail!("playback was stopped on the speaker");
                 }
                 session_seen |= running;
             }
             ChannelMessage::Media(MediaResponse::LoadFailed(_)) => {
-                return Err("the speaker failed to load the file".into());
+                bail!("the speaker failed to load the file");
             }
             _ => {}
         }
     }
-    Err("timed out waiting for playback to finish".into())
+    Err(eyre!("timed out waiting for playback to finish"))
 }
 
 #[cfg(test)]
