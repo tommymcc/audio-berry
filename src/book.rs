@@ -7,7 +7,7 @@ use crate::checks::{Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
-use crate::store::{Chunk, NarrationStore, RenderSettings, fnv, noise_limit_for};
+use crate::store::{Chunk, KeepSettings, NarrationStore, RenderSettings, fnv, noise_limit_for};
 use crate::takes::{Kept, TakePolicy};
 use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
@@ -32,16 +32,18 @@ fn read_allowances_saying_so(voice_sample: &Path) -> Result<Allowances> {
     Ok(allowances)
 }
 
-fn open_store(
-    book: &Book,
-    voice: &Voice,
-    out: &Path,
-    speed: Option<f64>,
-    noise_limit_db: Option<f32>,
-    takes: Option<TakePolicy>,
-) -> Result<NarrationStore> {
+fn open_store(book: &Book, voice: &Voice, out: &Path, speed: Option<f64>, keep: KeepSettings) -> Result<NarrationStore> {
     let settings = RenderSettings::from_env(speed);
-    NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &settings, noise_limit_db, takes)
+    NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &settings, keep)
+}
+
+/// The take's pitch range for the progress output, when ranked by it.
+fn pitch_range_note(standard: &Standard, verdict: &Verdict) -> String {
+    match (standard.pitch_target(), verdict.pitch_range) {
+        (None, _) => String::new(),
+        (Some(_), Some(range)) => format!(", pitch range {range:.1} st"),
+        (Some(_), None) => ", pitch range unmeasured".into(),
+    }
 }
 
 /// Prints each chapter's number, title and size.
@@ -118,7 +120,7 @@ impl<'a> Recorder<'a> {
 /// Writes one row per chunk with audio, so weak spots can be found and listened to.
 fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &Path) -> Result<usize> {
     let mut report = String::from(
-        "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\n",
+        "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tpitch_range_st\tflag\ttext\ttranscript\n",
     );
     let mut flagged = 0;
     for item in store.chunks().iter().filter(|item| store.has_audio(item)) {
@@ -132,7 +134,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
         flagged += usize::from(!pass);
         writeln!(
             report,
-            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}",
             book.chapters[item.chapter].title,
             item.number(),
             path.file_name().unwrap_or_default().to_string_lossy(),
@@ -143,6 +145,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
             characters as f32 / quality.seconds.max(0.01),
             accuracy.recall,
             accuracy.extra,
+            verdict.pitch_range.map(|range| format!("{range:.1}")).unwrap_or_default(),
             if pass { "" } else { "CHECK" },
             item.text,
             check.transcript,
@@ -161,8 +164,7 @@ pub fn narrate(
     out: &Path,
     chapters: Option<Vec<usize>>,
     speed: Option<f64>,
-    noise_limit_db: Option<f32>,
-    takes: Option<TakePolicy>,
+    keep: KeepSettings,
 ) -> Result<()> {
     let book = read_book(epub)?;
     let selected: Vec<usize> = match chapters {
@@ -177,8 +179,8 @@ pub fn narrate(
 
     let allowances = read_allowances_saying_so(voice_sample)?;
     // Judge the sample against the limit its takes will be, which may be saved.
-    let voice = Voice::load(voice_sample, noise_limit_for(out, noise_limit_db)?)?;
-    let store = open_store(&book, &voice, out, speed, noise_limit_db, takes)?;
+    let voice = Voice::load(voice_sample, noise_limit_for(out, keep.noise_limit_db)?)?;
+    let store = open_store(&book, &voice, out, speed, keep)?;
     let standard = Standard::of(&store, allowances);
 
     let text_dir = out.join("text");
@@ -205,10 +207,11 @@ pub fn narrate(
             let take = &kept.take;
             store.store(item, &take.audio, &take.verdict.accuracy.transcript, kept.rendered)?;
             progress.chunk_done(&format!(
-                "{:.0}s of audio, {}, recall {:.2}",
+                "{:.0}s of audio, {}, recall {:.2}{}",
                 take.audio.duration_secs(),
                 store.takes().describe(&kept),
                 take.verdict.accuracy.recall,
+                pitch_range_note(&standard, &take.verdict),
             ))?;
         }
         progress.finish();
@@ -260,14 +263,13 @@ pub fn retake(
     epub: &Path,
     out: &Path,
     targets: &[&str],
-    noise_limit_db: Option<f32>,
-    takes: Option<TakePolicy>,
+    keep: KeepSettings,
 ) -> Result<()> {
     let book = read_book(epub)?;
     let allowances = read_allowances_saying_so(voice_sample)?;
     // Judge the sample against the limit its takes will be, which may be saved.
-    let voice = Voice::load(voice_sample, noise_limit_for(out, noise_limit_db)?)?;
-    let store = open_store(&book, &voice, out, None, noise_limit_db, takes)?;
+    let voice = Voice::load(voice_sample, noise_limit_for(out, keep.noise_limit_db)?)?;
+    let store = open_store(&book, &voice, out, None, keep)?;
     let standard = Standard::of(&store, allowances);
     let wanted = store.select(targets)?;
 
@@ -301,12 +303,13 @@ pub fn retake(
             let current = recorder.take(item, take)?;
             let Verdict { quality, accuracy, .. } = &current.verdict;
             progress.line(&format!(
-                "  take {}: recall {:.2}, extra {:.2}, phrase heard {}, floor {:.0} dB",
+                "  take {}: recall {:.2}, extra {:.2}, phrase heard {}, floor {:.0} dB{}",
                 take + 1,
                 accuracy.recall,
                 accuracy.extra,
                 heard_all(&accuracy.transcript),
                 quality.floor_db,
+                pitch_range_note(&standard, &current.verdict),
             ))?;
             progress.line(&format!("    heard: {}", accuracy.transcript))?;
             Ok(current)
@@ -322,7 +325,8 @@ pub fn retake(
             }
             let transcript = &kept.take.verdict.accuracy.transcript;
             store.store(item, &kept.take.audio, transcript, count)?;
-            progress.line(&format!("  replaced with {}: {transcript}", store.takes().describe(&kept)))?;
+            let pitch_range = pitch_range_note(&standard, &kept.take.verdict);
+            progress.line(&format!("  replaced with {}{pitch_range}: {transcript}", store.takes().describe(&kept)))?;
             "replaced"
         } else {
             // Still counts the tried seeds, so the next retake tries new ones.

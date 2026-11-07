@@ -5,6 +5,7 @@ use crate::narrator::PRECISION_VAR;
 use crate::quality::{DEFAULT_NOISE_LIMIT_DB, valid_noise_limit};
 use crate::accuracy::contains_phrase;
 use crate::files::read_if_present;
+use crate::pitch::{PITCH_RANGE_LIMITS, valid_pitch_range};
 use crate::takes::{TAKES_RANGE, TakePolicy};
 use any_tts::{AudioSamples, DeviceSelection};
 use any_tts::models::omnivoice::{OmniVoiceRuntimeChoice, preferred_runtime_choice};
@@ -81,6 +82,17 @@ fn read_manifest(out: &Path) -> Result<Option<Manifest>> {
     read_if_present(&out.join(MANIFEST))?.map(|text| Manifest::parse(&text)).transpose()
 }
 
+/// What decides which take of a chunk is kept, as given on the command line.
+/// None of it is a render setting, so it can change without touching the audio,
+/// and each `None` uses what the output directory saved.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KeepSettings {
+    pub noise_limit_db: Option<f32>,
+    pub takes: Option<TakePolicy>,
+    /// The pitch range, in semitones, that takes which pass are ranked by nearness to.
+    pub pitch_range_st: Option<f32>,
+}
+
 /// The noise limit a run in `out` will judge takes against when `given` is the
 /// one given on the command line, if any: the given one, or the one saved there,
 /// or `None` for the default. `open` settles it the same way.
@@ -120,6 +132,9 @@ struct Manifest {
     /// Not a render setting either: it decides which take is kept. Output
     /// directories saved before it was keep the first take that passes, as they did.
     takes: TakePolicy,
+    /// Not a render setting either. `None` ranks takes without one, as output
+    /// directories saved before it was did.
+    pitch_range_st: Option<f32>,
 }
 
 impl Manifest {
@@ -132,6 +147,9 @@ impl Manifest {
             text.push_str(&format!("noise_limit_db={limit}\n"));
         }
         text.push_str(&format!("takes={}\n", self.takes.saved()));
+        if let Some(range) = self.pitch_range_st {
+            text.push_str(&format!("pitch_range_st={range}\n"));
+        }
         text
     }
 
@@ -159,6 +177,13 @@ impl Manifest {
                     eyre!("{MANIFEST} has takes={value}, which isn't first-passing or best-of-{fewest} to best-of-{most}. Correct or delete that line")
                 })?,
                 Err(_) => TakePolicy::default(),
+            },
+            pitch_range_st: match field("pitch_range_st") {
+                Ok(value) => Some(valid_pitch_range(&value).ok_or_else(|| {
+                    let (lowest, highest) = (PITCH_RANGE_LIMITS.start(), PITCH_RANGE_LIMITS.end());
+                    eyre!("{MANIFEST} has pitch_range_st={value}, which isn't a range from {lowest} to {highest} semitones. Correct or delete that line")
+                })?),
+                Err(_) => None,
             },
         })
     }
@@ -188,6 +213,7 @@ pub struct NarrationStore {
     speed: f64,
     noise_limit_db: f32,
     takes: TakePolicy,
+    pitch_range_st: Option<f32>,
     manifest: Manifest,
 }
 
@@ -276,6 +302,38 @@ fn settle_takes(saved: Option<&Manifest>, given: Option<TakePolicy>, out: &Path)
     }
 }
 
+/// The pitch range target a run uses, and whether to save it in `narration.txt` now.
+struct SettledPitchRange {
+    target: Option<f32>,
+    /// Whether to rewrite an existing `narration.txt` now. A new output
+    /// directory saves its file with the first take instead.
+    save_now: bool,
+    note: Option<String>,
+}
+
+/// A given target wins and is saved; otherwise the saved one is used, or none in
+/// a new output directory or one saved before targets were.
+fn settle_pitch_range(saved: Option<&Manifest>, given: Option<f32>, out: &Path) -> SettledPitchRange {
+    let aiming = |range: f32| format!("Pitch range: aiming for {range} semitones");
+    let Some(saved) = saved else {
+        return SettledPitchRange { target: given, save_now: false, note: given.map(aiming) };
+    };
+    let path = out.join(MANIFEST);
+    match (saved.pitch_range_st, given) {
+        (Some(old), Some(new)) if old != new => SettledPitchRange {
+            target: Some(new),
+            save_now: true,
+            note: Some(format!("{}, replacing {old} in {}", aiming(new), path.display())),
+        },
+        (None, Some(new)) => SettledPitchRange {
+            target: Some(new),
+            save_now: true,
+            note: Some(format!("{}, now saved in {}", aiming(new), path.display())),
+        },
+        (old, _) => SettledPitchRange { target: old, save_now: false, note: old.map(aiming) },
+    }
+}
+
 /// Numbers the chunks and keys each by its text, voice and speed.
 fn chunks_of(chapters: &[Vec<String>], voice: &str, speed: f64) -> Vec<Chunk> {
     // Normal speed keeps the original key, so older chunks stay valid.
@@ -311,23 +369,26 @@ impl NarrationStore {
             speed: manifest.speed,
             noise_limit_db: manifest.noise_limit_db.unwrap_or(DEFAULT_NOISE_LIMIT_DB),
             takes: manifest.takes,
+            pitch_range_st: manifest.pitch_range_st,
             manifest,
         })
     }
 
+    /// Opens an output directory to render in, with what decides which take is
+    /// kept as `given`, saving it when it changes.
     pub fn open(
         out: &Path,
         book_title: &str,
         chapters: &[Vec<String>],
         voice: u64,
         settings: &RenderSettings,
-        given_noise_limit: Option<f32>,
-        given_takes: Option<TakePolicy>,
+        given: KeepSettings,
     ) -> Result<Self> {
         let saved = read_manifest(out)?;
         let speed = settings.speed.or(saved.as_ref().map(|saved| saved.speed)).unwrap_or(NORMAL_SPEED);
-        let noise_limit = settle_noise_limit(saved.as_ref(), given_noise_limit, out);
-        let takes = settle_takes(saved.as_ref(), given_takes, out);
+        let noise_limit = settle_noise_limit(saved.as_ref(), given.noise_limit_db, out);
+        let takes = settle_takes(saved.as_ref(), given.takes, out);
+        let pitch_range = settle_pitch_range(saved.as_ref(), given.pitch_range_st, out);
         let chunks = chunks_of(chapters, &format!("{voice:x}"), speed);
         fs::create_dir_all(out.join("chunks"))?;
         let manifest = Manifest {
@@ -337,6 +398,7 @@ impl NarrationStore {
             speed,
             noise_limit_db: noise_limit.saved,
             takes: takes.policy,
+            pitch_range_st: pitch_range.target,
         };
         let store = Self {
             out: out.to_path_buf(),
@@ -344,13 +406,14 @@ impl NarrationStore {
             speed,
             noise_limit_db: noise_limit.limit_db,
             takes: takes.policy,
+            pitch_range_st: pitch_range.target,
             manifest,
         };
         store.require_same(saved)?;
-        if noise_limit.save_now || takes.save_now {
+        if noise_limit.save_now || takes.save_now || pitch_range.save_now {
             store.write_manifest()?;
         }
-        for note in [noise_limit.note, takes.note].into_iter().flatten() {
+        for note in [noise_limit.note, takes.note, pitch_range.note].into_iter().flatten() {
             eprintln!("{note}");
         }
         Ok(store)
@@ -475,6 +538,12 @@ impl NarrationStore {
         self.takes
     }
 
+    /// The pitch range, in semitones, that this output directory prefers among
+    /// takes that pass, if any.
+    pub fn pitch_range_st(&self) -> Option<f32> {
+        self.pitch_range_st
+    }
+
     /// Every chunk in the book, whichever chapters have been rendered.
     pub fn chunks(&self) -> &[Chunk] {
         &self.chunks
@@ -596,7 +665,7 @@ mod tests {
     }
 
     fn open(dir: &TempDir, texts: &[&[&str]]) -> NarrationStore {
-        NarrationStore::open(dir.path(), "A Book", &chapters(texts), 0xabc, &settings(), None, None).unwrap()
+        NarrationStore::open(dir.path(), "A Book", &chapters(texts), 0xabc, &settings(), KeepSettings::default()).unwrap()
     }
 
     fn tone() -> AudioSamples {
@@ -645,7 +714,7 @@ mod tests {
 
     fn open_as(dir: &TempDir, title: &str, voice: u64, precision: &str) -> Result<NarrationStore> {
         let settings = RenderSettings { precision: precision.into(), speed: None };
-        NarrationStore::open(dir.path(), title, &chapters(&[&["a"]]), voice, &settings, None, None)
+        NarrationStore::open(dir.path(), title, &chapters(&[&["a"]]), voice, &settings, KeepSettings::default())
     }
 
     fn numbers(selected: &[Selected]) -> Vec<String> {
@@ -725,7 +794,7 @@ mod tests {
 
     fn open_at(dir: &TempDir, speed: Option<f64>) -> Result<NarrationStore> {
         let settings = RenderSettings { speed, ..settings() };
-        NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings, None, None)
+        NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings, KeepSettings::default())
     }
 
     #[test]
@@ -860,8 +929,12 @@ mod tests {
         }
     }
 
+    fn open_keeping(dir: &TempDir, given: KeepSettings) -> Result<NarrationStore> {
+        NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), given)
+    }
+
     fn open_store(dir: &TempDir, noise_limit: Option<f32>) -> Result<NarrationStore> {
-        NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), noise_limit, None)
+        open_keeping(dir, KeepSettings { noise_limit_db: noise_limit, ..KeepSettings::default() })
     }
 
     fn open_with_limit(dir: &TempDir, noise_limit: Option<f32>) -> NarrationStore {
@@ -978,8 +1051,7 @@ mod tests {
     }
 
     fn open_with_takes(dir: &TempDir, takes: Option<TakePolicy>) -> NarrationStore {
-        NarrationStore::open(dir.path(), "A Book", &chapters(&[&["Hello there."]]), 0xabc, &settings(), None, takes)
-            .unwrap()
+        open_keeping(dir, KeepSettings { takes, ..KeepSettings::default() }).unwrap()
     }
 
     fn render_with_takes(dir: &TempDir, takes: Option<TakePolicy>) {
@@ -1048,6 +1120,84 @@ mod tests {
         fs::write(dir.join(MANIFEST), format!("{OLDER_MANIFEST}takes=best-of-50\n")).unwrap();
         let error = open_store(&dir, None).err().unwrap().to_string();
         assert!(error.contains("takes=best-of-50") && error.contains("delete that line"), "{error}");
+    }
+
+    fn open_with_pitch_range(dir: &TempDir, range: Option<f32>) -> NarrationStore {
+        open_keeping(dir, KeepSettings { pitch_range_st: range, ..KeepSettings::default() }).unwrap()
+    }
+
+    fn render_with_pitch_range(dir: &TempDir, range: Option<f32>) {
+        let store = open_with_pitch_range(dir, range);
+        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+    }
+
+    fn saved_pitch_range(dir: &TempDir) -> Option<String> {
+        let text = fs::read_to_string(dir.join(MANIFEST)).unwrap();
+        text.lines().find_map(|line| line.strip_prefix("pitch_range_st=")).map(str::to_string)
+    }
+
+    #[test]
+    fn the_pitch_range_is_saved_with_the_first_take() {
+        let dir = TempDir::new("store-pitch-first");
+        let store = open_with_pitch_range(&dir, Some(12.4));
+        assert_eq!(store.pitch_range_st(), Some(12.4));
+        assert!(!dir.join(MANIFEST).exists());
+        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+        assert_eq!(saved_pitch_range(&dir).as_deref(), Some("12.4"));
+        assert_eq!(open_with_pitch_range(&dir, None).pitch_range_st(), Some(12.4));
+    }
+
+    #[test]
+    fn no_pitch_range_is_saved_when_none_is_given() {
+        let dir = TempDir::new("store-pitch-none");
+        render_with_pitch_range(&dir, None);
+        assert_eq!(saved_pitch_range(&dir), None);
+        assert_eq!(open_with_pitch_range(&dir, None).pitch_range_st(), None);
+    }
+
+    #[test]
+    fn a_new_pitch_range_replaces_the_saved_one_and_keeps_the_audio() {
+        let dir = TempDir::new("store-pitch-changed");
+        render_with_pitch_range(&dir, Some(12.4));
+        let before = fs::read_to_string(dir.join(MANIFEST)).unwrap();
+        let store = open_with_pitch_range(&dir, Some(10.0));
+        assert_eq!(store.pitch_range_st(), Some(10.0));
+        assert!(store.has_audio(&store.chunks()[0]), "the cached take should still be found");
+        let after = fs::read_to_string(dir.join(MANIFEST)).unwrap();
+        assert_eq!(before.replace("pitch_range_st=12.4", "pitch_range_st=10"), after);
+        let settled = settle_pitch_range(Some(&Manifest::parse(&before).unwrap()), Some(10.0), dir.path());
+        assert!(settled.note.unwrap().contains("replacing 12.4"));
+        let unchanged = settle_pitch_range(Some(&Manifest::parse(&after).unwrap()), Some(10.0), dir.path());
+        assert!(!unchanged.save_now);
+    }
+
+    #[test]
+    fn an_older_folder_has_no_pitch_range_until_one_is_given() {
+        let dir = folder_without_a_saved_limit("pitch-older");
+        assert_eq!(open_with_pitch_range(&dir, None).pitch_range_st(), None);
+        assert_eq!(fs::read_to_string(dir.join(MANIFEST)).unwrap(), OLDER_MANIFEST);
+        assert_eq!(open_with_pitch_range(&dir, Some(12.4)).pitch_range_st(), Some(12.4));
+        assert_eq!(saved_pitch_range(&dir).as_deref(), Some("12.4"));
+        assert_eq!(open_with_pitch_range(&dir, None).pitch_range_st(), Some(12.4));
+        let settled = settle_pitch_range(Some(&Manifest::parse(OLDER_MANIFEST).unwrap()), Some(12.4), dir.path());
+        assert!(settled.note.unwrap().contains("now saved in"));
+    }
+
+    #[test]
+    fn a_manifest_saved_before_pitch_ranges_still_loads() {
+        // As saved with a noise limit and take policy, before pitch ranges were.
+        let text = format!("{OLDER_MANIFEST}noise_limit_db=-50\ntakes=best-of-3\n");
+        let manifest = Manifest::parse(&text).unwrap();
+        assert_eq!((manifest.pitch_range_st, manifest.takes), (None, TakePolicy::BestOf(3)));
+        assert_eq!(manifest.render(), text, "rewritten unchanged");
+    }
+
+    #[test]
+    fn a_bad_saved_pitch_range_is_an_error_that_says_how_to_fix_it() {
+        let dir = folder_without_a_saved_limit("pitch-bad");
+        fs::write(dir.join(MANIFEST), format!("{OLDER_MANIFEST}pitch_range_st=40\n")).unwrap();
+        let error = open_store(&dir, None).err().unwrap().to_string();
+        assert!(error.contains("pitch_range_st=40") && error.contains("delete that line"), "{error}");
     }
 
     #[test]

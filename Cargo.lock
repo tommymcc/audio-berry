@@ -176,6 +176,7 @@ dependencies = [
  "libc",
  "mdns-sd",
  "ndarray",
+ "realfft",
  "rust_cast",
  "rustls",
  "scraper",

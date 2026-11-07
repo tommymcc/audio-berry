@@ -10,6 +10,7 @@ mod epub;
 mod files;
 mod mishearings;
 mod narrator;
+mod pitch;
 mod progress;
 mod quality;
 mod sample_check;
@@ -186,6 +187,17 @@ struct Takes {
     /// the first good enough; saved in the output directory
     #[arg(long = "takes", value_name = "n", value_parser = takes::parse_takes)]
     policy: Option<takes::TakePolicy>,
+    /// Of the takes that pass, keeps the one whose pitch range is nearest this, from
+    /// 2 to 30 semitones, such as 12.4 for a lively voice; saved in the output directory
+    #[arg(long = "pitch-range", value_name = "semitones", value_parser = pitch::parse_pitch_range)]
+    pitch_range: Option<f32>,
+}
+
+impl Takes {
+    /// What decides which take is kept, with the noise limit given.
+    fn keep(&self, noise_limit_db: Option<f32>) -> store::KeepSettings {
+        store::KeepSettings { noise_limit_db, takes: self.policy, pitch_range_st: self.pitch_range }
+    }
 }
 
 /// Options for the commands that load the model and a voice sample.
@@ -322,11 +334,11 @@ fn main() -> Result<()> {
         Command::Chapters { book } => book::list_chapters(&book),
         Command::Book { voice_sample, book, output_dir, chapters, speed, takes, model } => {
             let chapters = (!chapters.is_empty()).then_some(chapters);
-            book::narrate(&voice_sample, &book, &output_dir, chapters, speed.factor, model.noise_limit, takes.policy)
+            book::narrate(&voice_sample, &book, &output_dir, chapters, speed.factor, takes.keep(model.noise_limit))
         }
         Command::Retake { voice_sample, book, output_dir, targets, takes, model, .. } => {
             let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
-            book::retake(&voice_sample, &book, &output_dir, &targets, model.noise_limit, takes.policy)
+            book::retake(&voice_sample, &book, &output_dir, &targets, takes.keep(model.noise_limit))
         }
         Command::Mishearings { book, output_dir, voice_sample } => mishearings::list(&book, &output_dir, voice_sample.as_deref()),
         Command::Speakers => {
@@ -503,6 +515,26 @@ mod tests {
             assert!(error.contains("must be a whole number from 1 to 10"), "{error}");
         }
         assert!(parse(&["speak", "v", "t", "o", "--takes", "3"]).is_err());
+    }
+
+    #[test]
+    fn a_pitch_range_is_for_book_and_retake_and_from_2_to_30() {
+        let words = ["book", "v", "b", "o", "--takes", "5", "--pitch-range", "12.4", "--noise-limit", "-50"];
+        let Ok(Command::Book { takes, model, .. }) = parse(&words) else { panic!() };
+        let keep = takes.keep(model.noise_limit);
+        assert_eq!(
+            (keep.pitch_range_st, keep.takes, keep.noise_limit_db),
+            (Some(12.4), Some(takes::TakePolicy::BestOf(5)), Some(-50.0))
+        );
+        let Ok(Command::Retake { takes, .. }) = parse(&["retake", "v", "b", "o", "3.12", "--pitch-range", "9"]) else { panic!() };
+        assert_eq!(takes.pitch_range, Some(9.0));
+        let Ok(Command::Book { takes, .. }) = parse(&["book", "v", "b", "o"]) else { panic!() };
+        assert_eq!(takes.pitch_range, None);
+        for bad in ["1", "31", "lively"] {
+            let error = parse(&["book", "v", "b", "o", "--pitch-range", bad]).err().unwrap().to_string();
+            assert!(error.contains("must be a range from 2 to 30 semitones"), "{error}");
+        }
+        assert!(parse(&["speak", "v", "t", "o", "--pitch-range", "12"]).is_err());
     }
 
     #[test]

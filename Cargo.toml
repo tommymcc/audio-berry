@@ -26,6 +26,8 @@ indicatif = "0.18"
 mdns-sd = "0.21"
 # The version deep_filter uses, for passing audio to it.
 ndarray = "0.15"
+# Already built for deep_filter; the autocorrelation in pitch tracking.
+realfft = "3.5"
 rust_cast = "0.21"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 scraper = "0.29.0"
