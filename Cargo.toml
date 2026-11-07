@@ -11,7 +11,7 @@ metal = ["any-tts/metal"]
 
 [dependencies]
 # The integration branch of the fork, which has native OmniVoice voice cloning.
-any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "d92eef45315791ef67f0e896ecb776488fdc93bd", default-features = false, features = ["omnivoice", "download"] }
+any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "f485382b79b4b10632c685bdacf038388dbfe83a", default-features = false, features = ["omnivoice", "download"] }
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"

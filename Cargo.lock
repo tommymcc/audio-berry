@@ -110,7 +110,7 @@ dependencies = [
 [[package]]
 name = "any-tts"
 version = "0.2.0"
-source = "git+https://github.com/tommymcc/any-tts?rev=d92eef45315791ef67f0e896ecb776488fdc93bd#d92eef45315791ef67f0e896ecb776488fdc93bd"
+source = "git+https://github.com/tommymcc/any-tts?rev=f485382b79b4b10632c685bdacf038388dbfe83a#f485382b79b4b10632c685bdacf038388dbfe83a"
 dependencies = [
  "base64 0.22.1",
  "candle-core",
