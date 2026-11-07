@@ -7,6 +7,7 @@ use crate::accuracy::contains_phrase;
 use crate::files::read_if_present;
 use crate::pitch::{PITCH_RANGE_LIMITS, valid_pitch_range};
 use crate::takes::{TAKES_RANGE, TakePolicy};
+use crate::text::ChunkLimit;
 use any_tts::{AudioSamples, DeviceSelection};
 use any_tts::models::omnivoice::{OmniVoiceRuntimeChoice, preferred_runtime_choice};
 use std::collections::{HashMap, HashSet};
@@ -18,6 +19,8 @@ const CACHE_VERSION: &str = "3";
 const DEFAULT_PRECISION: &str = "f16";
 const NORMAL_SPEED: f64 = 1.0;
 const MANIFEST: &str = "narration.txt";
+/// The key `narration.txt` saves the chunk limit's weight under.
+const CHUNK_WEIGHT: &str = "chunk_weight";
 
 pub fn fnv(bytes: &[u8], seed: u64) -> u64 {
     bytes.iter().fold(seed ^ 0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -335,17 +338,25 @@ impl SettledDir {
         self.sample_noise_limit
     }
 
-    /// Opens the output directory to render the book's `chapters` in `voice` with
-    /// `render` settings, saving the keep settings if they changed and saying what
-    /// the run will use. Refuses a directory rendered any other way.
+    /// The speed a run with `render` settings uses: the one given, else the one
+    /// saved, else normal speed.
+    pub fn speed(&self, render: &RenderSettings) -> f64 {
+        render.speed.or(self.saved.as_ref().map(|saved| saved.speed)).unwrap_or(NORMAL_SPEED)
+    }
+
+    /// Opens the output directory to render the book's `chapters`, split within
+    /// `limit`, in `voice` with `render` settings, saving the keep settings and
+    /// the limit if they changed and saying what the run will use. Refuses a
+    /// directory rendered any other way.
     pub fn open(
         self,
         book_title: &str,
         chapters: &[Vec<String>],
+        limit: &ChunkLimit,
         voice: u64,
         render: &RenderSettings,
     ) -> Result<NarrationStore> {
-        let speed = render.speed.or(self.saved.as_ref().map(|saved| saved.speed)).unwrap_or(NORMAL_SPEED);
+        let speed = self.speed(render);
         let chunks = chunks_of(chapters, &format!("{voice:x}"), speed);
         fs::create_dir_all(self.out.join("chunks"))?;
         let manifest = Manifest {
@@ -353,11 +364,13 @@ impl SettledDir {
             voice: format!("{voice:x}"),
             precision: render.precision.clone(),
             speed,
+            chunk_weight: Some(limit.weight()),
             keep: self.rules,
         };
+        let new_limit = self.saved.as_ref().is_some_and(|saved| saved.chunk_weight != manifest.chunk_weight);
         let store = NarrationStore { out: self.out, chunks, speed, manifest };
         store.require_same(self.saved)?;
-        if self.settled.save_now {
+        if self.settled.save_now || new_limit {
             store.write_manifest()?;
         }
         for note in &self.settled.notes {
@@ -389,6 +402,9 @@ struct Manifest {
     voice: String,
     precision: String,
     speed: f64,
+    /// The `ChunkLimit` weight the chapters were split within, saved so the
+    /// chunks can be found again without the voice sample.
+    chunk_weight: Option<f64>,
     keep: KeepRules,
 }
 
@@ -398,6 +414,9 @@ impl Manifest {
             "book={}\nvoice={}\nprecision={}\nspeed={}\n",
             self.book, self.voice, self.precision, self.speed
         );
+        if let Some(weight) = self.chunk_weight {
+            text.push_str(&format!("{CHUNK_WEIGHT}={weight}\n"));
+        }
         self.keep.render(&mut text);
         text
     }
@@ -412,6 +431,7 @@ impl Manifest {
             voice: field("voice")?,
             precision: field("precision")?,
             speed: line("speed").map_or(Ok(NORMAL_SPEED), |speed| speed.parse())?,
+            chunk_weight: line(CHUNK_WEIGHT).map(|weight| weight.parse()).transpose()?,
             keep: KeepRules::parse(line)?,
         })
     }
@@ -463,17 +483,29 @@ fn chunks_of(chapters: &[Vec<String>], voice: &str, speed: f64) -> Vec<Chunk> {
 
 impl NarrationStore {
     /// Opens an output directory only to read what has been rendered there, in
-    /// the voice and settings it saved, changing nothing.
-    pub fn read(out: &Path, book_title: &str, chapters: &[Vec<String>]) -> Result<Self> {
+    /// the voice and settings it saved, changing nothing. `chapters` splits the
+    /// book's chapters within the limit saved there.
+    pub fn read(
+        out: &Path,
+        book_title: &str,
+        chapters: impl FnOnce(&ChunkLimit) -> Vec<Vec<String>>,
+    ) -> Result<Self> {
         let manifest = read_manifest(out)?
             .ok_or_else(|| eyre!("{} has no {MANIFEST}, so nothing has been rendered there", out.display()))?;
         let book = book_title.replace('\n', " ");
         if manifest.book != book {
             bail!("{} narrates {}, not {book}", out.display(), manifest.book);
         }
+        let Some(weight) = manifest.chunk_weight else {
+            bail!(
+                "{} has no {CHUNK_WEIGHT} in its {MANIFEST}, so its chunks can't be found. \
+                 Run book there again to save it.",
+                out.display()
+            );
+        };
         Ok(Self {
             out: out.to_path_buf(),
-            chunks: chunks_of(chapters, &manifest.voice, manifest.speed),
+            chunks: chunks_of(&chapters(&ChunkLimit::with_weight(weight)), &manifest.voice, manifest.speed),
             speed: manifest.speed,
             manifest,
         })
@@ -718,6 +750,9 @@ mod tests {
         texts.iter().map(|chapter| chapter.iter().map(|text| text.to_string()).collect()).collect()
     }
 
+    /// The chunk limit's weight tests open folders with.
+    const LIMIT_WEIGHT: f64 = 412.5;
+
     /// Opens `dir` as a run does: settling `given`, then opening it.
     fn open_with(
         dir: &TempDir,
@@ -727,7 +762,50 @@ mod tests {
         render: &RenderSettings,
         given: KeepSettings,
     ) -> Result<NarrationStore> {
-        settle(dir.path(), given)?.open(title, &chapters(texts), voice, render)
+        open_within(dir, title, texts, LIMIT_WEIGHT, voice, render, given)
+    }
+
+    /// Opens `dir` as `open_with` does, splitting within `weight`.
+    fn open_within(
+        dir: &TempDir,
+        title: &str,
+        texts: &[&[&str]],
+        weight: f64,
+        voice: u64,
+        render: &RenderSettings,
+        given: KeepSettings,
+    ) -> Result<NarrationStore> {
+        settle(dir.path(), given)?.open(title, &chapters(texts), &ChunkLimit::with_weight(weight), voice, render)
+    }
+
+    #[test]
+    fn reading_a_folder_splits_the_book_within_its_saved_limit() {
+        let dir = TempDir::new("store-read-limit");
+        render_at(&dir, None);
+        assert!(fs::read_to_string(dir.join(MANIFEST)).unwrap().contains("\nchunk_weight=412.5\n"));
+        let mut limit = None;
+        NarrationStore::read(dir.path(), "A Book", |given| {
+            limit = Some(*given);
+            chapters(&[&["Hello there."]])
+        })
+        .unwrap();
+        assert_eq!(limit, Some(ChunkLimit::with_weight(LIMIT_WEIGHT)));
+    }
+
+    #[test]
+    fn a_new_limit_is_saved_on_opening() {
+        let dir = TempDir::new("store-new-limit");
+        render_at(&dir, None);
+        open_within(&dir, "A Book", &[&["Hello there."]], 300.0, 0xabc, &settings(), KeepSettings::default()).unwrap();
+        assert!(fs::read_to_string(dir.join(MANIFEST)).unwrap().contains("\nchunk_weight=300\n"));
+    }
+
+    #[test]
+    fn reading_a_folder_without_a_saved_limit_says_to_render_there_again() {
+        let dir = TempDir::new("store-read-no-limit");
+        fs::write(dir.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n").unwrap();
+        let error = NarrationStore::read(dir.path(), "A Book", |_| chapters(&[&["a"]])).err().unwrap().to_string();
+        assert!(error.ends_with("has no chunk_weight in its narration.txt, so its chunks can't be found. Run book there again to save it."), "{error}");
     }
 
     fn open(dir: &TempDir, texts: &[&[&str]]) -> NarrationStore {
@@ -1026,9 +1104,10 @@ mod tests {
         settle(dir.path(), KeepSettings::default()).err().unwrap().to_string()
     }
 
-    /// The lines of `dir`'s `narration.txt` after book, voice, precision and speed.
+    /// The lines of `dir`'s `narration.txt` after book, voice, precision, speed and
+    /// chunk weight.
     fn saved_lines(dir: &TempDir) -> Vec<String> {
-        fs::read_to_string(dir.join(MANIFEST)).unwrap().lines().skip(4).map(str::to_string).collect()
+        fs::read_to_string(dir.join(MANIFEST)).unwrap().lines().skip(5).map(str::to_string).collect()
     }
 
     const DEFAULT_RULES: KeepRules =
@@ -1091,7 +1170,7 @@ mod tests {
     }
 
     /// A `narration.txt` with none of the keep settings.
-    const OLDER_MANIFEST: &str = "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n";
+    const OLDER_MANIFEST: &str = "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\nchunk_weight=412.5\n";
 
     fn folder_without_saved_settings(name: &str) -> TempDir {
         let dir = TempDir::new(name);
@@ -1223,16 +1302,16 @@ mod tests {
     fn reading_a_folder_finds_its_takes_at_its_saved_speed() {
         let dir = TempDir::new("store-read");
         render_at(&dir, Some(0.9));
-        let store = NarrationStore::read(dir.path(), "A Book", &chapters(&[&["Hello there."]])).unwrap();
+        let store = NarrationStore::read(dir.path(), "A Book", |_| chapters(&[&["Hello there."]])).unwrap();
         assert_eq!(store.speed(), 0.9);
         assert_eq!(store.check(&store.chunks()[0]).unwrap(), Check { takes: 1, transcript: "a".into() });
-        assert!(NarrationStore::read(dir.path(), "Another Book", &chapters(&[&["Hello there."]])).is_err());
+        assert!(NarrationStore::read(dir.path(), "Another Book", |_| chapters(&[&["Hello there."]])).is_err());
     }
 
     #[test]
     fn reading_a_folder_with_nothing_rendered_is_an_error_that_changes_nothing() {
         let dir = TempDir::new("store-read-empty");
-        let error = NarrationStore::read(dir.path(), "A Book", &chapters(&[&["a"]])).err().unwrap().to_string();
+        let error = NarrationStore::read(dir.path(), "A Book", |_| chapters(&[&["a"]])).err().unwrap().to_string();
         assert!(error.ends_with("has no narration.txt, so nothing has been rendered there"), "{error}");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }

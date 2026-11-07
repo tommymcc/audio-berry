@@ -4,11 +4,13 @@
 use crate::accuracy::Allowances;
 use crate::assemble::assemble;
 use crate::checks::{Goal, Standard, Verdict};
+use crate::estimate::{Pace, SPLIT_ABOVE_SECONDS};
 use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
 use crate::store::{self, Chunk, KeepSettings, NarrationStore, RenderSettings, fnv};
 use crate::takes::{Kept, TakePolicy};
+use crate::text::ChunkLimit;
 use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
 use any_tts::AudioSamples;
@@ -46,9 +48,27 @@ impl Session {
         let settled = store::settle(out, given)?;
         let rules = *settled.rules();
         let voice = Voice::load(voice_sample, settled.sample_noise_limit())?;
-        let store = settled.open(&book.title, &book.chunks(), voice.hash(), &RenderSettings::from_env(speed))?;
+        let render = RenderSettings::from_env(speed);
+        let pace = voice.pace(settled.speed(&render));
+        let limit = ChunkLimit::for_pace(&pace);
+        let store = settled.open(&book.title, &book.chunks(&limit), &limit, voice.hash(), &render)?;
+        warn_of_splits(&store, &pace);
         let standard = Standard::of(&rules, store.speed(), allowances);
         Ok(Session { book, voice, store, standard, takes: rules.takes })
+    }
+}
+
+/// Warns of each chunk long enough at `pace` that any-tts will split it.
+fn warn_of_splits(store: &NarrationStore, pace: &Pace) {
+    for item in store.chunks() {
+        let seconds = pace.seconds(&item.text);
+        if seconds > SPLIT_ABOVE_SECONDS {
+            eprintln!(
+                "Warning: chunk {} is estimated at {seconds:.1}s, over the {SPLIT_ABOVE_SECONDS:.0}s above which \
+                 any-tts splits it into pieces joined by short silences.",
+                item.number()
+            );
+        }
     }
 }
 
@@ -66,14 +86,7 @@ pub fn list_chapters(path: &Path) -> Result<()> {
     let book = read_book(path)?;
     println!("{} by {}", book.title, book.author.as_deref().unwrap_or("unknown"));
     for (index, chapter) in book.chapters.iter().enumerate() {
-        let chunks = chapter.chunks();
-        let characters: usize = chunks.iter().map(|chunk| chunk.chars().count()).sum();
-        println!(
-            "{:>3}  {}  ({characters} characters, {} chunks)",
-            index + 1,
-            chapter.title,
-            chunks.len()
-        );
+        println!("{:>3}  {}  ({} characters)", index + 1, chapter.title, chapter.spoken_chars());
     }
     Ok(())
 }

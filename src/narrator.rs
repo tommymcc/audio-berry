@@ -1,5 +1,6 @@
 //! The text-to-speech model, which says text in a cloned voice.
 
+use crate::estimate::SPLIT_ABOVE_SECONDS;
 use crate::voice::Voice;
 use any_tts::models::omnivoice::preferred_runtime_choice;
 use any_tts::{AudioSamples, ModelType, SynthesisRequest, TtsConfig, TtsModel, load_model};
@@ -43,8 +44,17 @@ impl Narrator {
 
     /// Says `text` in `voice`, saves it to `output` and reports how fast that was.
     pub fn say_to_file(&self, voice: &Voice, text: &str, output: &Path, settings: &SpeakSettings) -> Result<()> {
+        let speed = settings.speed.unwrap_or(1.0);
+        let seconds = voice.pace(speed).seconds(text);
+        if seconds > SPLIT_ABOVE_SECONDS {
+            eprintln!(
+                "Warning: the text for {} is estimated at {seconds:.1}s, over the {SPLIT_ABOVE_SECONDS:.0}s above \
+                 which any-tts splits it into pieces joined by short silences.",
+                output.display()
+            );
+        }
         let started = Instant::now();
-        let audio = self.say(voice, text, settings.speed.unwrap_or(1.0), settings.seed)?;
+        let audio = self.say(voice, text, speed, settings.seed)?;
         let elapsed = started.elapsed().as_secs_f32();
 
         audio.save_wav(output).wrap_err_with(|| format!("couldn't save {}", output.display()))?;

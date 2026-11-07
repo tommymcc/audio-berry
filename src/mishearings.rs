@@ -80,7 +80,7 @@ fn lines(found: &[Mishearing], allowances: &Allowances) -> Vec<String> {
 pub fn list(epub: &Path, out: &Path, voice_sample: Option<&Path>) -> Result<()> {
     let book = read_book(epub)?;
     let allowances = voice_sample.map(read_allowances).transpose()?.unwrap_or_default();
-    let store = NarrationStore::read(out, &book.title, &book.chunks())?;
+    let store = NarrationStore::read(out, &book.title, |limit| book.chunks(limit))?;
     let mut tally = Tally::default();
     let mut seen = HashSet::new();
     let mut skipped = 0;

@@ -1,7 +1,59 @@
 //! Turns book text into something a speech model reads well, in small chunks.
 
-/// Longest chunk sent to the model in one request, in characters.
+use crate::estimate::{Pace, SPLIT_ABOVE_SECONDS, char_weight, text_weight};
+
+/// Longest chunk sent to the model in one request, in characters, at any pace.
 pub const MAX_CHUNK_CHARS: usize = 500;
+/// Longest estimated audio for a chunk, 2 s under the length above which
+/// any-tts splits a request.
+pub const MAX_CHUNK_SECONDS: f64 = SPLIT_ABOVE_SECONDS - 2.0;
+
+/// How long a chunk may be: at most `MAX_CHUNK_CHARS` characters, and at most
+/// `weight` in text weight, as any-tts weighs text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChunkLimit {
+    chars: usize,
+    weight: f64,
+}
+
+impl ChunkLimit {
+    /// The limit that keeps a chunk's estimated audio at `pace` within
+    /// `MAX_CHUNK_SECONDS`.
+    pub fn for_pace(pace: &Pace) -> ChunkLimit {
+        ChunkLimit::with_weight(pace.weight_for(MAX_CHUNK_SECONDS))
+    }
+
+    /// At most `MAX_CHUNK_CHARS` characters and `weight` in text weight.
+    pub fn with_weight(weight: f64) -> ChunkLimit {
+        ChunkLimit { chars: MAX_CHUNK_CHARS, weight }
+    }
+
+    /// The most text weight a chunk may have.
+    pub fn weight(&self) -> f64 {
+        self.weight
+    }
+
+    fn fits(&self, text: &str) -> bool {
+        text.chars().count() <= self.chars && text_weight(text) <= self.weight
+    }
+
+    /// Whether `text` reaches 60% of either limit.
+    fn mostly_full(&self, text: &str) -> bool {
+        text.chars().count() * 10 >= self.chars * 6 || text_weight(text) * 10.0 >= self.weight * 6.0
+    }
+
+    /// The byte index where the longest start of `text` that fits ends.
+    fn fitting_end(&self, text: &str) -> usize {
+        let mut weight = 0.0;
+        for (count, (index, c)) in text.char_indices().enumerate() {
+            weight += char_weight(c);
+            if count >= self.chars || weight > self.weight {
+                return index;
+            }
+        }
+        text.len()
+    }
+}
 
 const ABBREVIATIONS: [(&str, &str); 4] = [
     ("Mr.", "Mister"),
@@ -265,15 +317,14 @@ fn split_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-/// Breaks an overlong sentence at the last clause or word boundary that fits.
-fn split_long(sentence: &str, max: usize) -> Vec<String> {
+/// Breaks an overlong sentence at the last clause or word boundary that fits,
+/// or where the limit falls in a word too long to fit.
+fn split_long(sentence: &str, max: &ChunkLimit) -> Vec<String> {
     let mut parts = Vec::new();
     let mut rest = sentence.trim();
-    while rest.chars().count() > max {
-        let limit = rest
-            .char_indices()
-            .nth(max)
-            .map_or(rest.len(), |(index, _)| index);
+    while !max.fits(rest) {
+        let first = rest.chars().next().map_or(0, char::len_utf8);
+        let limit = max.fitting_end(rest).max(first);
         let head = &rest[..limit];
         let in_second_half = |index: &usize| *index > limit / 2;
         let cut = head
@@ -292,9 +343,15 @@ fn split_long(sentence: &str, max: usize) -> Vec<String> {
     parts
 }
 
-/// Groups paragraphs into chunks that end on sentence boundaries. Headings get
-/// their own chunk, and a paragraph end closes a chunk that's mostly full.
-pub fn chunk(paragraphs: &[Paragraph], max: usize) -> Vec<String> {
+/// How many characters of `paragraphs` are narrated, once cleaned.
+pub fn spoken_chars(paragraphs: &[Paragraph]) -> usize {
+    paragraphs.iter().map(|paragraph| normalize(paragraph).chars().count()).sum()
+}
+
+/// Groups paragraphs into chunks within `max` that end on sentence boundaries.
+/// Headings get their own chunks, and a paragraph end closes a chunk that's
+/// mostly full.
+pub fn chunk(paragraphs: &[Paragraph], max: &ChunkLimit) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut close = |current: &mut String| {
@@ -309,13 +366,15 @@ pub fn chunk(paragraphs: &[Paragraph], max: usize) -> Vec<String> {
         }
         if paragraph.heading {
             close(&mut current);
-            current = text;
-            close(&mut current);
+            for part in split_long(&text, max) {
+                current = part;
+                close(&mut current);
+            }
             continue;
         }
         for sentence in split_sentences(&text) {
             for part in split_long(&sentence, max) {
-                if !current.is_empty() && current.chars().count() + 1 + part.chars().count() > max {
+                if !current.is_empty() && !max.fits(&format!("{current} {part}")) {
                     close(&mut current);
                 }
                 if !current.is_empty() {
@@ -324,7 +383,7 @@ pub fn chunk(paragraphs: &[Paragraph], max: usize) -> Vec<String> {
                 current.push_str(&part);
             }
         }
-        if current.chars().count() * 10 >= max * 6 {
+        if max.mostly_full(&current) {
             close(&mut current);
         }
     }
@@ -350,10 +409,29 @@ mod tests {
         }
     }
 
+    /// At most `chars` characters, of any weight.
+    fn chars(chars: usize) -> ChunkLimit {
+        ChunkLimit { chars, weight: f64::INFINITY }
+    }
+
+    /// voices/johnny-golden.wav is 16.92 s of this.
+    const JOHNNY: &str = "We had most of our needs we grew on the land. Most of all the small families then \
+        around this here part of the world worked like that, ya'know. The stronger ones, of course, went to sea. \
+        They used to work on the oars or sail in those times. Very tough.";
+    const JOHNNY_SECONDS: f64 = 16.92;
+
+    /// Chunk 3.2 of The Coral Island when chunks were only limited to 500
+    /// characters. johnny-golden.wav rendered it at 31.0 s, which any-tts split.
+    const CORAL_3_2: &str = "The beginning, My early life and character, I thirst for adventure in foreign lands \
+        and go to sea. Roving has always been, and still is, my ruling passion, the joy of my heart, the very \
+        sunshine of my existence. In childhood, in boyhood, and in man's estate, I have been a rover; not a mere \
+        rambler among the woody glens and upon the hill-tops of my own native land, but an enthusiastic rover \
+        throughout the length and breadth of the wide wide world.";
+
     #[test]
     fn long_sentences_fall_back_to_a_comma_after_an_early_semicolon() {
         let sentence = format!("Early clause; {} late clause, and some more words here", "word ".repeat(10));
-        let parts = split_long(&sentence, 90);
+        let parts = split_long(&sentence, &chars(90));
         assert!(parts[0].ends_with("late clause,"), "{parts:?}");
     }
 
@@ -425,12 +503,66 @@ mod tests {
     fn chunks_respect_the_limit_and_keep_every_word() {
         let long = "word, ".repeat(300);
         let paragraphs = vec![heading("Chapter I"), body("One two."), body(&long), body("Last one.")];
-        let chunks = chunk(&paragraphs, 100);
+        let chunks = chunk(&paragraphs, &chars(100));
         assert_eq!(chunks[0], "Chapter 1.");
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 100));
         let joined = chunks.join(" ");
         assert_eq!(joined.matches("word").count(), 300);
         assert!(joined.starts_with("Chapter 1. One two."));
         assert!(joined.ends_with("Last one."));
+    }
+
+    #[test]
+    fn a_chunk_any_tts_split_is_estimated_over_its_limit() {
+        assert_eq!(CORAL_3_2.chars().count(), 450);
+        let seconds = Pace::of_voice(JOHNNY_SECONDS, JOHNNY, 1.0).seconds(CORAL_3_2);
+        assert!((30.6..31.0).contains(&seconds), "{seconds}");
+    }
+
+    #[test]
+    fn the_voice_limit_splits_it_at_a_sentence_within_the_margin() {
+        let pace = Pace::of_voice(JOHNNY_SECONDS, JOHNNY, 1.0);
+        let chunks = chunk(&[body(CORAL_3_2)], &ChunkLimit::for_pace(&pace));
+        assert_eq!(chunks.len(), 2, "{chunks:?}");
+        assert_eq!(chunks.join(" "), CORAL_3_2);
+        for chunk in &chunks {
+            assert!(chunk.ends_with('.'), "{chunk}");
+            assert!(pace.seconds(chunk) <= MAX_CHUNK_SECONDS, "{chunk}");
+        }
+    }
+
+    #[test]
+    fn a_slower_speed_makes_shorter_chunks() {
+        let text = [CORAL_3_2; 4].join(" ");
+        let count = |speed| chunk(&[body(&text)], &ChunkLimit::for_pace(&Pace::of_voice(JOHNNY_SECONDS, JOHNNY, speed)));
+        let (normal, slow) = (count(1.0), count(0.8));
+        assert!(slow.len() > normal.len(), "{} chunks, then {}", normal.len(), slow.len());
+        let slow_pace = Pace::of_voice(JOHNNY_SECONDS, JOHNNY, 0.8);
+        assert!(slow.iter().all(|chunk| slow_pace.seconds(chunk) <= MAX_CHUNK_SECONDS));
+    }
+
+    #[test]
+    fn a_sentence_or_heading_too_long_for_the_limit_is_split_within_it() {
+        let limit = ChunkLimit::with_weight(60.0);
+        let paragraphs = [heading(&"A very long heading ".repeat(10)), body(&"and then some more words ".repeat(20))];
+        let chunks = chunk(&paragraphs, &limit);
+        assert!(chunks.len() > 10, "{chunks:?}");
+        assert!(chunks.iter().all(|chunk| text_weight(chunk) <= 60.0), "{chunks:?}");
+        let joined = chunks.join(" ");
+        assert_eq!(joined.matches("heading").count(), 10);
+        assert_eq!(joined.matches("words").count(), 20);
+    }
+
+    #[test]
+    fn a_word_too_long_for_the_limit_is_cut_where_it_falls() {
+        let word = "a".repeat(25);
+        assert_eq!(split_long(&word, &ChunkLimit::with_weight(10.0)), ["a".repeat(10), "a".repeat(10), "a".repeat(5)]);
+    }
+
+    #[test]
+    fn the_character_limit_still_applies_to_a_fast_voice() {
+        let chunks = chunk(&[body(&"Go on. ".repeat(200))], &ChunkLimit::with_weight(f64::INFINITY));
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= MAX_CHUNK_CHARS));
+        assert!(chunks[0].chars().count() > MAX_CHUNK_CHARS - 10);
     }
 }

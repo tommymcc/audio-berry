@@ -182,6 +182,7 @@ dependencies = [
  "scraper",
  "serde_json",
  "tokenizers",
+ "unicode-general-category",
 ]
 
 [[package]]

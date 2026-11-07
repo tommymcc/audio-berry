@@ -5,6 +5,7 @@ mod audition;
 mod book;
 mod cast;
 mod checks;
+mod estimate;
 mod clean;
 mod epub;
 mod files;

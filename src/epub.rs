@@ -1,6 +1,6 @@
 //! Reads an EPUB's spine into chapters of paragraphs.
 
-use crate::text::{MAX_CHUNK_CHARS, Paragraph, chunk};
+use crate::text::{ChunkLimit, Paragraph, chunk, spoken_chars};
 use epub::doc::{EpubDoc, NavPoint};
 use scraper::{ElementRef, Html, Node, Selector};
 use color_eyre::eyre::{Result, WrapErr, bail};
@@ -33,16 +33,21 @@ pub struct Book {
 }
 
 impl Chapter {
-    /// The chapter's text in chunks, as narrated.
-    pub fn chunks(&self) -> Vec<String> {
-        chunk(&self.paragraphs, MAX_CHUNK_CHARS)
+    /// The chapter's text in chunks within `limit`, as narrated.
+    pub fn chunks(&self, limit: &ChunkLimit) -> Vec<String> {
+        chunk(&self.paragraphs, limit)
+    }
+
+    /// How many characters of the chapter are narrated.
+    pub fn spoken_chars(&self) -> usize {
+        spoken_chars(&self.paragraphs)
     }
 }
 
 impl Book {
-    /// Each chapter's chunks, as narrated.
-    pub fn chunks(&self) -> Vec<Vec<String>> {
-        self.chapters.iter().map(Chapter::chunks).collect()
+    /// Each chapter's chunks within `limit`, as narrated.
+    pub fn chunks(&self, limit: &ChunkLimit) -> Vec<Vec<String>> {
+        self.chapters.iter().map(|chapter| chapter.chunks(limit)).collect()
     }
 }
 

@@ -2,6 +2,7 @@
 
 use crate::accuracy::Allowances;
 use crate::audio::decode_audio;
+use crate::estimate::Pace;
 use crate::files::read_if_present;
 use crate::sample_check::SampleCheck;
 use crate::store::fnv;
@@ -102,6 +103,13 @@ impl Voice {
     /// What's said in the sample.
     pub fn transcript(&self) -> &str {
         self.reference.transcript.as_deref().unwrap_or_default()
+    }
+
+    /// How fast any-tts expects this voice to speak at `speed`, judged from the
+    /// sample and its transcript.
+    pub fn pace(&self, speed: f64) -> Pace {
+        let seconds = self.reference.samples.len() as f64 / f64::from(SAMPLE_RATE);
+        Pace::of_voice(seconds, self.transcript(), speed)
     }
 
     /// Saves the sample as the model hears it. A long sample is trimmed, and its
