@@ -82,165 +82,187 @@ fn read_manifest(out: &Path) -> Result<Option<Manifest>> {
     read_if_present(&out.join(MANIFEST))?.map(|text| Manifest::parse(&text)).transpose()
 }
 
-/// A setting saved in `narration.txt` that decides which take is kept. None is
-/// a render setting, so each can change without touching the audio. A run uses
-/// the one given, else the one saved, else `DEFAULT`, and saves a given one.
+/// A keep setting, saved in `narration.txt` under `KEY`. A run uses the one
+/// given, else the one saved, else `DEFAULT`, and saves a given one.
 pub trait KeepSetting {
+    /// A value it can be given.
     type Value: Copy + PartialEq;
+    /// What `KeepRules` holds: `Value` for a setting with a default, or
+    /// `Option<Value>` for one without, where `None` is no value.
+    type Rule: Copy + PartialEq + From<Self::Value> + Into<Option<Self::Value>>;
     /// Its key in `narration.txt`.
     const KEY: &'static str;
     /// What a run uses with none given or saved.
-    const DEFAULT: Self::Value;
-    /// What `narration.txt` may hold, as the error for a bad line says.
-    fn valid() -> String;
-    /// Reads what `saved` wrote, if it's valid.
+    const DEFAULT: Self::Rule;
+    /// The values `narration.txt` may hold, as the error for a bad line names them.
+    fn valid_range_text() -> String;
+    /// Reads what `to_saved` wrote, if it's valid.
     fn from_saved(text: &str) -> Option<Self::Value>;
-    /// How `narration.txt` saves `value`, or `None` to leave its line out.
-    fn saved(value: Self::Value) -> Option<String>;
-    /// How a note names `value`, or `None` for no value, which isn't noted.
-    fn shown(value: Self::Value) -> Option<String>;
-    /// The note that a run uses the value a note names `shown`.
-    fn using(shown: &str) -> String;
+    /// How `narration.txt` saves `value`.
+    fn to_saved(value: Self::Value) -> String;
+    /// How a note names `value`.
+    fn display(value: Self::Value) -> String;
+    /// The note saying a run uses the value named `displayed`.
+    fn using_note(displayed: &str) -> String;
 }
 
-/// The noise limit takes must pass, in dB.
+/// The noise limit, in dB.
 pub struct NoiseLimit;
 
 impl KeepSetting for NoiseLimit {
     type Value = f32;
+    type Rule = f32;
     const KEY: &'static str = "noise_limit_db";
     const DEFAULT: f32 = DEFAULT_NOISE_LIMIT_DB;
-    fn valid() -> String {
+    fn valid_range_text() -> String {
         "a level from -100 to 0 dB".into()
     }
     fn from_saved(text: &str) -> Option<f32> {
         valid_noise_limit(text)
     }
-    fn saved(limit: f32) -> Option<String> {
-        Some(limit.to_string())
+    fn to_saved(limit: f32) -> String {
+        limit.to_string()
     }
-    fn shown(limit: f32) -> Option<String> {
-        Some(format!("{limit} dB"))
+    fn display(limit: f32) -> String {
+        format!("{limit} dB")
     }
-    fn using(shown: &str) -> String {
-        format!("Noise limit: {shown}")
+    fn using_note(displayed: &str) -> String {
+        format!("Noise limit: {displayed}")
     }
 }
 
 /// The take policy.
-pub struct Takes;
+pub struct TakePolicySetting;
 
-impl KeepSetting for Takes {
+impl KeepSetting for TakePolicySetting {
     type Value = TakePolicy;
+    type Rule = TakePolicy;
     const KEY: &'static str = "takes";
     const DEFAULT: TakePolicy = TakePolicy::FirstPassing;
-    fn valid() -> String {
+    fn valid_range_text() -> String {
         format!("first-passing or best-of-{} to best-of-{}", TAKES_RANGE.start(), TAKES_RANGE.end())
     }
     fn from_saved(text: &str) -> Option<TakePolicy> {
         TakePolicy::from_saved(text)
     }
-    fn saved(policy: TakePolicy) -> Option<String> {
-        Some(policy.saved())
+    fn to_saved(policy: TakePolicy) -> String {
+        policy.saved()
     }
-    fn shown(policy: TakePolicy) -> Option<String> {
-        Some(policy.to_string())
+    fn display(policy: TakePolicy) -> String {
+        policy.to_string()
     }
-    fn using(shown: &str) -> String {
-        format!("Takes: keeping {shown}")
+    fn using_note(displayed: &str) -> String {
+        format!("Takes: keeping {displayed}")
     }
 }
 
-/// The pitch range target in semitones that takes which pass are ranked by
-/// nearness to, if any.
-pub struct PitchRange;
+/// The pitch range target, in semitones, which has no default.
+pub struct PitchRangeTarget;
 
-impl KeepSetting for PitchRange {
-    type Value = Option<f32>;
+impl KeepSetting for PitchRangeTarget {
+    type Value = f32;
+    type Rule = Option<f32>;
     const KEY: &'static str = "pitch_range_st";
     const DEFAULT: Option<f32> = None;
-    fn valid() -> String {
+    fn valid_range_text() -> String {
         format!("a range from {} to {} semitones", PITCH_RANGE_LIMITS.start(), PITCH_RANGE_LIMITS.end())
     }
-    fn from_saved(text: &str) -> Option<Option<f32>> {
-        valid_pitch_range(text).map(Some)
+    fn from_saved(text: &str) -> Option<f32> {
+        valid_pitch_range(text)
     }
-    fn saved(range: Option<f32>) -> Option<String> {
-        range.map(|range| range.to_string())
+    fn to_saved(range: f32) -> String {
+        range.to_string()
     }
-    fn shown(range: Option<f32>) -> Option<String> {
-        Self::saved(range)
+    fn display(range: f32) -> String {
+        range.to_string()
     }
-    fn using(shown: &str) -> String {
-        format!("Pitch range: aiming for {shown} semitones")
+    fn using_note(displayed: &str) -> String {
+        format!("Pitch range: aiming for {displayed} semitones")
     }
 }
 
-/// Declares the keep settings, each as `field: KeepSetting`, in the order
-/// `narration.txt` saves them: `KeepSettings` and `KeepRules` get a field for
-/// each, and `KeepRules` reads, saves and settles each.
-macro_rules! keep_settings {
-    ($($field:ident: $setting:ident,)*) => {
-        /// The keep settings given on the command line, each `None` when not
-        /// given, so the output directory's saved one is used. `settle` turns
-        /// them into the `KeepRules` a run follows.
-        #[derive(Clone, Copy, Debug, Default, PartialEq)]
-        pub struct KeepSettings {
-            $(#[doc = concat!("See `", stringify!($setting), "`.")]
-            pub $field: Option<<$setting as KeepSetting>::Value>,)*
+/// The keep settings given on the command line, each `None` when not given, so
+/// the output directory's saved one is used. `settle` turns them into the
+/// `KeepRules` a run follows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KeepSettings {
+    /// See `NoiseLimit`.
+    pub noise_limit_db: Option<f32>,
+    /// See `TakePolicySetting`.
+    pub takes: Option<TakePolicy>,
+    /// See `PitchRangeTarget`.
+    pub pitch_range_target: Option<f32>,
+}
+
+/// The keep settings a run follows, settled from those given and those saved,
+/// with defaults filled in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeepRules {
+    /// The noise limit takes must pass, in dB.
+    pub noise_limit_db: f32,
+    /// The take policy.
+    pub takes: TakePolicy,
+    /// The pitch range, in semitones, that takes which pass are ranked by
+    /// nearness to, if any.
+    pub pitch_range_target: Option<f32>,
+}
+
+impl KeepRules {
+    /// Reads each setting from its line in `narration.txt`, which `line` finds,
+    /// with the default for one that's missing.
+    fn parse(line: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        Ok(Self {
+            noise_limit_db: parse_setting::<NoiseLimit>(line(NoiseLimit::KEY))?,
+            takes: parse_setting::<TakePolicySetting>(line(TakePolicySetting::KEY))?,
+            pitch_range_target: parse_setting::<PitchRangeTarget>(line(PitchRangeTarget::KEY))?,
+        })
+    }
+
+    /// Appends the lines `narration.txt` saves the settings as to `text`.
+    fn render(&self, text: &mut String) {
+        render_setting::<NoiseLimit>(self.noise_limit_db, text);
+        render_setting::<TakePolicySetting>(self.takes, text);
+        render_setting::<PitchRangeTarget>(self.pitch_range_target, text);
+    }
+
+    /// Settles each setting from the one given and the one `saved` in the
+    /// `narration.txt` at `path`, if there is one.
+    fn settle(saved: Option<&Self>, given: KeepSettings, path: &Path, settled: &mut Settled) -> Self {
+        Self {
+            noise_limit_db: settled.setting::<NoiseLimit>(
+                saved.map(|saved| saved.noise_limit_db),
+                given.noise_limit_db,
+                path,
+            ),
+            takes: settled.setting::<TakePolicySetting>(saved.map(|saved| saved.takes), given.takes, path),
+            pitch_range_target: settled.setting::<PitchRangeTarget>(
+                saved.map(|saved| saved.pitch_range_target),
+                given.pitch_range_target,
+                path,
+            ),
         }
-
-        /// The keep settings a run follows, settled from those given and those
-        /// saved, with defaults filled in.
-        #[derive(Clone, Copy, Debug, PartialEq)]
-        pub struct KeepRules {
-            $(#[doc = concat!("See `", stringify!($setting), "`.")]
-            pub $field: <$setting as KeepSetting>::Value,)*
-        }
-
-        impl KeepRules {
-            /// Reads each setting from its line, which `line` finds, with the
-            /// default for one that's missing.
-            fn parse(line: impl Fn(&str) -> Option<String>) -> Result<Self> {
-                Ok(Self { $($field: parse_setting::<$setting>(line($setting::KEY))?,)* })
-            }
-
-            /// Appends the lines `narration.txt` saves the settings as to `text`.
-            fn render(&self, text: &mut String) {
-                $(render_setting::<$setting>(self.$field, text);)*
-            }
-
-            /// Settles each setting from the one given and the one `saved` in the
-            /// `narration.txt` at `path`, if there is one.
-            fn settle(saved: Option<&Self>, given: KeepSettings, path: &Path, changes: &mut Changes) -> Self {
-                Self { $($field: settle_setting::<$setting>(saved.map(|saved| saved.$field), given.$field, path, changes),)* }
-            }
-        }
-    };
-}
-
-keep_settings! {
-    noise_limit_db: NoiseLimit,
-    takes: Takes,
-    pitch_range_target: PitchRange,
-}
-
-fn parse_setting<S: KeepSetting>(saved: Option<String>) -> Result<S::Value> {
-    let Some(text) = saved else { return Ok(S::DEFAULT) };
-    S::from_saved(&text).ok_or_else(|| {
-        eyre!("{MANIFEST} has {}={text}, which isn't {}. Correct or delete that line", S::KEY, S::valid())
-    })
-}
-
-fn render_setting<S: KeepSetting>(value: S::Value, text: &mut String) {
-    if let Some(saved) = S::saved(value) {
-        text.push_str(&format!("{}={saved}\n", S::KEY));
     }
 }
 
-/// What settling the keep settings found to save and say.
+/// The rule a setting's line in `narration.txt` holds, if any, or the default.
+fn parse_setting<S: KeepSetting>(line: Option<String>) -> Result<S::Rule> {
+    let Some(text) = line else { return Ok(S::DEFAULT) };
+    let value = S::from_saved(&text).ok_or_else(|| {
+        eyre!("{MANIFEST} has {}={text}, which isn't {}. Correct or delete that line", S::KEY, S::valid_range_text())
+    })?;
+    Ok(value.into())
+}
+
+/// Appends a setting's line to `text`, unless it has no value.
+fn render_setting<S: KeepSetting>(rule: S::Rule, text: &mut String) {
+    if let Some(value) = rule.into() {
+        text.push_str(&format!("{}={}\n", S::KEY, S::to_saved(value)));
+    }
+}
+
+/// What settling the keep settings found to save and print.
 #[derive(Default)]
-struct Changes {
+struct Settled {
     /// Whether to rewrite an existing `narration.txt` now. A new output
     /// directory saves its file with the first take instead.
     save_now: bool,
@@ -248,27 +270,26 @@ struct Changes {
     notes: Vec<String>,
 }
 
-/// A given setting wins, and is saved if it differs from the one `saved` in the
-/// `narration.txt` at `path`; otherwise the saved one is used, or the default
-/// with none saved. Notes a value given, or saved and not the default.
-fn settle_setting<S: KeepSetting>(
-    saved: Option<S::Value>,
-    given: Option<S::Value>,
-    path: &Path,
-    changes: &mut Changes,
-) -> S::Value {
-    let using = |value| S::shown(value).map(|shown| S::using(&shown));
-    let (value, note) = match (saved, given) {
-        (None, given) => (given.unwrap_or(S::DEFAULT), given.and_then(using)),
-        (Some(old), Some(new)) if old != new => {
-            changes.save_now = true;
-            let change = S::shown(old).map_or("now saved".into(), |old| format!("replacing {old}"));
-            (new, using(new).map(|note| format!("{note}, {change} in {}", path.display())))
-        }
-        (Some(old), given) => (old, (given.is_some() || old != S::DEFAULT).then(|| using(old)).flatten()),
-    };
-    changes.notes.extend(note);
-    value
+impl Settled {
+    /// A given setting wins, and is saved if it differs from the one `saved` in
+    /// the `narration.txt` at `path`; otherwise the saved one is used, or the
+    /// default with none saved. Notes a value given, or saved and not the default.
+    fn setting<S: KeepSetting>(&mut self, saved: Option<S::Rule>, given: Option<S::Value>, path: &Path) -> S::Rule {
+        let note = |rule: S::Rule| rule.into().map(|value| S::using_note(&S::display(value)));
+        let given = given.map(S::Rule::from);
+        let (rule, note) = match (saved, given) {
+            (None, given) => (given.unwrap_or(S::DEFAULT), given.and_then(note)),
+            (Some(old), Some(new)) if old != new => {
+                self.save_now = true;
+                let old: Option<S::Value> = old.into();
+                let change = old.map_or("now saved".into(), |old| format!("replacing {}", S::display(old)));
+                (new, note(new).map(|note| format!("{note}, {change} in {}", path.display())))
+            }
+            (Some(old), given) => (old, (given.is_some() || old != S::DEFAULT).then(|| note(old)).flatten()),
+        };
+        self.notes.extend(note);
+        rule
+    }
 }
 
 /// An output directory whose `KeepRules` are settled but which isn't open yet,
@@ -278,9 +299,10 @@ pub struct SettledDir {
     out: PathBuf,
     saved: Option<Manifest>,
     rules: KeepRules,
-    /// The noise limit given, else the one saved, else `None` for the default.
+    /// The noise limit given, else the one saved or defaulted in an existing
+    /// `narration.txt`, else `None` in a new output directory.
     sample_noise_limit: Option<f32>,
-    changes: Changes,
+    settled: Settled,
 }
 
 /// Settles the keep settings for a run in `out` from those `given` and those
@@ -288,14 +310,14 @@ pub struct SettledDir {
 pub fn settle(out: &Path, given: KeepSettings) -> Result<SettledDir> {
     let saved = read_manifest(out)?;
     let saved_rules = saved.as_ref().map(|saved| &saved.keep);
-    let mut changes = Changes::default();
-    let rules = KeepRules::settle(saved_rules, given, &out.join(MANIFEST), &mut changes);
+    let mut settled = Settled::default();
+    let rules = KeepRules::settle(saved_rules, given, &out.join(MANIFEST), &mut settled);
     Ok(SettledDir {
         out: out.to_path_buf(),
         sample_noise_limit: given.noise_limit_db.or(saved_rules.map(|saved| saved.noise_limit_db)),
         saved,
         rules,
-        changes,
+        settled,
     })
 }
 
@@ -306,7 +328,9 @@ impl SettledDir {
     }
 
     /// The noise limit to judge the voice sample against: the one given, else the
-    /// one saved, else `None`, so its advice can name the default.
+    /// one an existing `narration.txt` saved, or the default if it has no
+    /// `noise_limit_db` line, else `None` in a new output directory, so its advice
+    /// names the default.
     pub fn sample_noise_limit(&self) -> Option<f32> {
         self.sample_noise_limit
     }
@@ -333,10 +357,10 @@ impl SettledDir {
         };
         let store = NarrationStore { out: self.out, chunks, speed, manifest };
         store.require_same(self.saved)?;
-        if self.changes.save_now {
+        if self.settled.save_now {
             store.write_manifest()?;
         }
-        for note in &self.changes.notes {
+        for note in &self.settled.notes {
             eprintln!("{note}");
         }
         Ok(store)
@@ -677,6 +701,7 @@ impl NarrationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sample_check::SampleCheck;
     use crate::test_dir::TempDir;
     use any_tts::config::DType;
     use std::fs;
@@ -992,7 +1017,7 @@ mod tests {
         KeepSettings {
             noise_limit_db: Some(rules.noise_limit_db),
             takes: Some(rules.takes),
-            pitch_range_target: Some(rules.pitch_range_target),
+            pitch_range_target: rules.pitch_range_target,
         }
     }
 
@@ -1095,10 +1120,10 @@ mod tests {
     }
 
     /// The note settling `S` from `saved` and `given` prints, and whether it saves.
-    fn note<S: KeepSetting>(saved: Option<S::Value>, given: Option<S::Value>) -> (Option<String>, bool) {
-        let mut changes = Changes::default();
-        settle_setting::<S>(saved, given, Path::new("out/narration.txt"), &mut changes);
-        (changes.notes.pop(), changes.save_now)
+    fn note<S: KeepSetting>(saved: Option<S::Rule>, given: Option<S::Value>) -> (Option<String>, bool) {
+        let mut settled = Settled::default();
+        settled.setting::<S>(saved, given, Path::new("out/narration.txt"));
+        (settled.notes.pop(), settled.save_now)
     }
 
     #[test]
@@ -1115,26 +1140,29 @@ mod tests {
         assert_eq!(note::<NoiseLimit>(Some(DEFAULT_NOISE_LIMIT_DB), None), (None, false));
 
         let (best_of_2, best_of_4) = (Some(TakePolicy::BestOf(2)), Some(TakePolicy::BestOf(4)));
-        assert_eq!(note::<Takes>(None, best_of_4), (said("Takes: keeping the best of 4"), false));
+        assert_eq!(note::<TakePolicySetting>(None, best_of_4), (said("Takes: keeping the best of 4"), false));
         assert_eq!(
-            note::<Takes>(best_of_4, best_of_2),
+            note::<TakePolicySetting>(best_of_4, best_of_2),
             (said("Takes: keeping the best of 2, replacing the best of 4 in out/narration.txt"), true)
         );
-        assert_eq!(note::<Takes>(best_of_4, None), (said("Takes: keeping the best of 4"), false));
-        assert_eq!(note::<Takes>(Some(TakePolicy::FirstPassing), None), (None, false));
+        assert_eq!(note::<TakePolicySetting>(best_of_4, None), (said("Takes: keeping the best of 4"), false));
+        assert_eq!(note::<TakePolicySetting>(Some(TakePolicy::FirstPassing), None), (None, false));
 
-        let (none, wide, narrow) = (Some(None), Some(Some(12.4)), Some(Some(10.0)));
-        assert_eq!(note::<PitchRange>(None, wide), (said("Pitch range: aiming for 12.4 semitones"), false));
+        let (unset, wide, narrow) = (Some(PitchRangeTarget::DEFAULT), Some(12.4), Some(10.0));
+        assert_eq!(note::<PitchRangeTarget>(None, wide), (said("Pitch range: aiming for 12.4 semitones"), false));
         assert_eq!(
-            note::<PitchRange>(none, wide),
+            note::<PitchRangeTarget>(unset, wide),
             (said("Pitch range: aiming for 12.4 semitones, now saved in out/narration.txt"), true)
         );
         assert_eq!(
-            note::<PitchRange>(wide, narrow),
+            note::<PitchRangeTarget>(wide.map(Some), narrow),
             (said("Pitch range: aiming for 10 semitones, replacing 12.4 in out/narration.txt"), true)
         );
-        assert_eq!(note::<PitchRange>(narrow, narrow), (said("Pitch range: aiming for 10 semitones"), false));
-        assert_eq!(note::<PitchRange>(none, None), (None, false));
+        assert_eq!(
+            note::<PitchRangeTarget>(narrow.map(Some), narrow),
+            (said("Pitch range: aiming for 10 semitones"), false)
+        );
+        assert_eq!(note::<PitchRangeTarget>(unset, None), (None, false));
     }
 
     #[test]
@@ -1162,6 +1190,22 @@ mod tests {
         render_keeping(&dir, KeepSettings::default());
         assert_eq!(limit(None), Some(DEFAULT_NOISE_LIMIT_DB));
         assert_eq!(limit(Some(-60.0)), Some(-60.0));
+    }
+
+    #[test]
+    fn a_folder_without_a_saved_limit_gives_the_voice_sample_the_default_limit() {
+        let dir = folder_without_saved_settings("keep-older-sample");
+        let limit = settle(dir.path(), KeepSettings::default()).unwrap().sample_noise_limit();
+        assert_eq!(limit, Some(DEFAULT_NOISE_LIMIT_DB));
+        let advice = SampleCheck::from_floor(-45.3, limit).advice(Path::new("voices/dad.wav"), 10.7).unwrap();
+        assert!(advice.contains("above the noise limit of -55 dB"), "{advice}");
+    }
+
+    #[test]
+    fn giving_one_setting_to_a_folder_without_saved_settings_saves_the_default_noise_limit() {
+        let dir = folder_without_saved_settings("keep-older-one");
+        open_keeping(&dir, KeepSettings { takes: Some(TakePolicy::BestOf(3)), ..KeepSettings::default() });
+        assert_eq!(saved_lines(&dir), ["noise_limit_db=-55", "takes=best-of-3"]);
     }
 
     #[test]

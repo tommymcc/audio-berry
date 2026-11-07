@@ -8,12 +8,11 @@ pub const TAKES_RANGE: std::ops::RangeInclusive<u64> = 1..=10;
 
 /// How many takes of a chunk `book` and `retake` render, and which they keep.
 /// The output directory saves it in `narration.txt`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TakePolicy {
     /// Renders takes until one is good enough, up to a limit, keeping the best
     /// rendered. The goal of the takes, `checks::Goal`, says what's good enough
     /// and what the limit is.
-    #[default]
     FirstPassing,
     /// Renders exactly this many takes and keeps the best, from `--takes`.
     BestOf(u64),

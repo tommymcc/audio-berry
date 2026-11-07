@@ -48,7 +48,8 @@ impl SampleCheck {
         SampleCheck::from_floor(quality::measure(samples, SAMPLE_RATE).floor_db, noise_limit_db)
     }
 
-    fn from_floor(floor_db: f32, noise_limit_db: Option<f32>) -> SampleCheck {
+    /// Checks a voice sample whose floor is `floor_db`.
+    pub fn from_floor(floor_db: f32, noise_limit_db: Option<f32>) -> SampleCheck {
         let limit = noise_limit_db.unwrap_or(DEFAULT_NOISE_LIMIT_DB);
         let verdict = if floor_db > RAW_SAMPLE_DB {
             Verdict::Raw
