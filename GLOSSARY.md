@@ -6,6 +6,8 @@
 
 **Chunk number:** `<chapter number>.<position in that chapter>`, such as `3.12`. It stays the same whichever chapters a command selects.
 
+**Chunk limit:** how long a chunk may be: at most 500 characters, and at most 28 seconds of audio as any-tts estimates it, 2 seconds under the length above which any-tts splits a request into pieces joined by short silences: 30 seconds unless `OMNIVOICE_AUDIO_CHUNK_THRESHOLD` sets it. It comes from the voice sample: its length, what's said in it and the speed. The output directory saves it in `narration.txt` as `chunk_weight`, the most text weight a chunk may have, so `mishearings` finds the chunks without the voice sample. A directory with no `chunk_weight` has chunks limited only by characters. It isn't a render setting: when `book` or `retake` works out a different limit, it saves the new one and says so, and chunks whose text changes are generated again.
+
 **Take:** one rendering of a chunk at one seed.
 
 **Missing chunk:** a chunk with no audio in the output directory. Only `book` fills these. `retake` records only the chunks it's told to.

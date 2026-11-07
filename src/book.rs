@@ -4,8 +4,8 @@
 use crate::accuracy::Allowances;
 use crate::assemble::assemble;
 use crate::checks::{Goal, Standard, Verdict};
-use crate::estimate::{Pace, SPLIT_ABOVE_SECONDS};
 use crate::epub::{Book, read_book};
+use crate::estimate::{Pace, split_above_seconds, warn_if_split};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
 use crate::store::{self, Chunk, KeepSettings, NarrationStore, RenderSettings, fnv};
@@ -37,12 +37,15 @@ struct Session {
     store: NarrationStore,
     standard: Standard,
     takes: TakePolicy,
+    /// The voice's pace at the session's speed.
+    pace: Pace,
 }
 
 impl Session {
     /// Settles what decides which take is kept in `out` from `given` and what's
     /// saved there, loads the voice sample judged against the settled noise limit,
-    /// and opens `out` for `book` in that voice at `speed`, or the speed it saved.
+    /// and opens `out` for `book` in that voice at `speed`, or the speed it saved,
+    /// in chunks kept under the length any-tts splits.
     fn open(voice_sample: &Path, book: Book, out: &Path, speed: Option<f64>, given: KeepSettings) -> Result<Session> {
         let allowances = read_allowances_saying_so(voice_sample)?;
         let settled = store::settle(out, given)?;
@@ -50,24 +53,16 @@ impl Session {
         let voice = Voice::load(voice_sample, settled.sample_noise_limit())?;
         let render = RenderSettings::from_env(speed);
         let pace = voice.pace(settled.speed(&render));
-        let limit = ChunkLimit::for_pace(&pace);
+        let limit = ChunkLimit::under_split(&pace, split_above_seconds());
         let store = settled.open(&book.title, &book.chunks(&limit), &limit, voice.hash(), &render)?;
-        warn_of_splits(&store, &pace);
         let standard = Standard::of(&rules, store.speed(), allowances);
-        Ok(Session { book, voice, store, standard, takes: rules.takes })
+        Ok(Session { book, voice, store, standard, takes: rules.takes, pace })
     }
-}
 
-/// Warns of each chunk long enough at `pace` that any-tts will split it.
-fn warn_of_splits(store: &NarrationStore, pace: &Pace) {
-    for item in store.chunks() {
-        let seconds = pace.seconds(&item.text);
-        if seconds > SPLIT_ABOVE_SECONDS {
-            eprintln!(
-                "Warning: chunk {} is estimated at {seconds:.1}s, over the {SPLIT_ABOVE_SECONDS:.0}s above which \
-                 any-tts splits it into pieces joined by short silences.",
-                item.number()
-            );
+    /// Warns of each of `chunks` that any-tts will split.
+    fn warn_of_splits<'a>(&self, chunks: impl IntoIterator<Item = &'a Chunk>) {
+        for item in chunks {
+            warn_if_split(&self.pace, &item.text, &format!("chunk {}", item.number()));
         }
     }
 }
@@ -251,6 +246,7 @@ pub fn narrate(
     let pending = store.pending(&selected);
     let total = store.chunks().iter().filter(|item| selected.contains(&item.chapter)).count();
     println!("{total} chunks, {} to generate", pending.len());
+    session.warn_of_splits(pending.iter().copied());
     if !pending.is_empty() {
         let mut recorder = Recorder::load(&session)?;
         let mut progress = Progress::new(total, total - pending.len());
@@ -320,6 +316,7 @@ pub fn retake(
     let session = Session::open(voice_sample, read_book(epub)?, out, None, keep)?;
     let Session { book, store, standard, takes, .. } = &session;
     let wanted = store.select(targets)?;
+    session.warn_of_splits(wanted.iter().map(|selected| selected.chunk));
 
     let mut recorder = Recorder::load(&session)?;
     let mut progress = Progress::untimed(wanted.len());

@@ -367,14 +367,21 @@ impl SettledDir {
             chunk_weight: Some(limit.weight()),
             keep: self.rules,
         };
-        let new_limit = self.saved.as_ref().is_some_and(|saved| saved.chunk_weight != manifest.chunk_weight);
+        let limit_changed = self.saved.as_ref().is_some_and(|saved| saved.chunk_weight != manifest.chunk_weight);
         let store = NarrationStore { out: self.out, chunks, speed, manifest };
         store.require_same(self.saved)?;
-        if self.settled.save_now || new_limit {
+        if self.settled.save_now || limit_changed {
             store.write_manifest()?;
         }
         for note in &self.settled.notes {
             eprintln!("{note}");
+        }
+        if limit_changed {
+            eprintln!(
+                "Chunks resized to stay under the length any-tts splits, so some will be generated again. \
+                 {} saves the new limit.",
+                store.out.join(MANIFEST).display()
+            );
         }
         Ok(store)
     }
@@ -402,8 +409,9 @@ struct Manifest {
     voice: String,
     precision: String,
     speed: f64,
-    /// The `ChunkLimit` weight the chapters were split within, saved so the
-    /// chunks can be found again without the voice sample.
+    /// The `ChunkLimit` weight the chapters were split within, so the chunks can
+    /// be found again without the voice sample. `None` when `narration.txt` has
+    /// no `chunk_weight` line, and chunks are then limited only by characters.
     chunk_weight: Option<f64>,
     keep: KeepRules,
 }
@@ -484,7 +492,8 @@ fn chunks_of(chapters: &[Vec<String>], voice: &str, speed: f64) -> Vec<Chunk> {
 impl NarrationStore {
     /// Opens an output directory only to read what has been rendered there, in
     /// the voice and settings it saved, changing nothing. `chapters` splits the
-    /// book's chapters within the limit saved there.
+    /// book's chapters within the limit saved there, or only by characters in a
+    /// directory with none saved.
     pub fn read(
         out: &Path,
         book_title: &str,
@@ -496,16 +505,10 @@ impl NarrationStore {
         if manifest.book != book {
             bail!("{} narrates {}, not {book}", out.display(), manifest.book);
         }
-        let Some(weight) = manifest.chunk_weight else {
-            bail!(
-                "{} has no {CHUNK_WEIGHT} in its {MANIFEST}, so its chunks can't be found. \
-                 Run book there again to save it.",
-                out.display()
-            );
-        };
+        let limit = manifest.chunk_weight.map_or_else(ChunkLimit::unlimited_weight, ChunkLimit::with_weight);
         Ok(Self {
             out: out.to_path_buf(),
-            chunks: chunks_of(&chapters(&ChunkLimit::with_weight(weight)), &manifest.voice, manifest.speed),
+            chunks: chunks_of(&chapters(&limit), &manifest.voice, manifest.speed),
             speed: manifest.speed,
             manifest,
         })
@@ -801,11 +804,16 @@ mod tests {
     }
 
     #[test]
-    fn reading_a_folder_without_a_saved_limit_says_to_render_there_again() {
+    fn reading_a_folder_without_a_saved_limit_limits_chunks_only_by_characters() {
         let dir = TempDir::new("store-read-no-limit");
         fs::write(dir.join(MANIFEST), "book=A Book\nvoice=abc\nprecision=f16\nspeed=1\n").unwrap();
-        let error = NarrationStore::read(dir.path(), "A Book", |_| chapters(&[&["a"]])).err().unwrap().to_string();
-        assert!(error.ends_with("has no chunk_weight in its narration.txt, so its chunks can't be found. Run book there again to save it."), "{error}");
+        let mut limit = None;
+        NarrationStore::read(dir.path(), "A Book", |given| {
+            limit = Some(*given);
+            chapters(&[&["a"]])
+        })
+        .unwrap();
+        assert_eq!(limit, Some(ChunkLimit::unlimited_weight()));
     }
 
     fn open(dir: &TempDir, texts: &[&[&str]]) -> NarrationStore {

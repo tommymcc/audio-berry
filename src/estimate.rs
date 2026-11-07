@@ -1,20 +1,58 @@
 //! How long any-tts expects OmniVoice to take to say a text, which decides how
 //! much audio it generates and whether it splits the request. This mirrors
 //! `estimate_target_tokens_with_reference`, `text_weight`, `char_weight` and
-//! `add_final_punctuation` in any-tts's `src/models/omnivoice/model.rs`, at the
-//! revision Cargo.toml pins.
+//! `add_final_punctuation` in any-tts's `src/models/omnivoice/model.rs`, and
+//! how its `generate_token_chunks` decides to split, at the revision Cargo.toml
+//! pins.
 
 use unicode_general_category::{GeneralCategory, get_general_category};
 
-/// any-tts splits a request whose estimate is longer than this into pieces it
-/// generates separately and cross-fades, with 0.1 s of silence at each join.
-/// It's any-tts's `DEFAULT_AUDIO_CHUNK_THRESHOLD`, which the environment
-/// variable `OMNIVOICE_AUDIO_CHUNK_THRESHOLD` overrides.
-pub const SPLIT_ABOVE_SECONDS: f64 = 30.0;
+/// any-tts reads the estimated seconds above which it splits a request from this.
+const THRESHOLD_VAR: &str = "OMNIVOICE_AUDIO_CHUNK_THRESHOLD";
+/// any-tts's `DEFAULT_AUDIO_CHUNK_THRESHOLD`, used when `THRESHOLD_VAR` is unset
+/// or not a number.
+const DEFAULT_THRESHOLD_SECONDS: f32 = 30.0;
+/// any-tts reads the length of the pieces it splits a request into from this,
+/// and doesn't split when it's 0 or less.
+const DURATION_VAR: &str = "OMNIVOICE_AUDIO_CHUNK_DURATION";
+/// any-tts's `DEFAULT_AUDIO_CHUNK_DURATION`.
+const DEFAULT_DURATION_SECONDS: f32 = 15.0;
+/// OmniVoice's audio tokens per second: 24 kHz audio with a hop of 960 samples.
+const FRAME_RATE: f32 = 25.0;
 
 /// Endings any-tts leaves a voice sample's transcript with. It adds a full stop
-/// to a transcript ending in anything else.
+/// to a transcript ending in anything else. Each weighs 0.5, as punctuation.
 const TRANSCRIPT_ENDINGS: &str = "!\"'),.:;?]}‘’“”………、。】！），：；？";
+
+/// The estimated seconds above which any-tts splits a request into pieces it
+/// generates separately and cross-fades, with 0.1 s of silence at each join, as
+/// the environment sets it. `None` when any-tts doesn't split.
+pub fn split_above_seconds() -> Option<f64> {
+    split_above(std::env::var(THRESHOLD_VAR).ok().as_deref(), std::env::var(DURATION_VAR).ok().as_deref())
+}
+
+/// The threshold any-tts settles on from the values of `THRESHOLD_VAR` and
+/// `DURATION_VAR`, if set. A value that isn't a number gives the default.
+fn split_above(threshold: Option<&str>, duration: Option<&str>) -> Option<f64> {
+    let read = |value: Option<&str>, default| value.and_then(|value| value.parse::<f32>().ok()).unwrap_or(default);
+    let threshold = read(threshold, DEFAULT_THRESHOLD_SECONDS);
+    let duration = read(duration, DEFAULT_DURATION_SECONDS);
+    let frames = (threshold.max(0.0) * FRAME_RATE).round();
+    (duration > 0.0 && frames > 0.0).then_some(f64::from(threshold))
+}
+
+/// Warns, naming `what`, if `text` at `pace` is estimated long enough that
+/// any-tts will split it.
+pub fn warn_if_split(pace: &Pace, text: &str, what: &str) {
+    let Some(limit) = split_above_seconds() else { return };
+    let seconds = pace.seconds(text);
+    if seconds > limit {
+        eprintln!(
+            "Warning: {what} is estimated at {seconds:.1}s, over the {limit}s above which any-tts splits it \
+             into pieces joined by short silences."
+        );
+    }
+}
 
 /// A voice's estimated speaking time per unit of text weight, at one speed.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,7 +71,9 @@ impl Pace {
         if !transcript.chars().last().is_some_and(|last| TRANSCRIPT_ENDINGS.contains(last)) {
             weight += char_weight('.');
         }
-        Pace { seconds_per_weight: sample_seconds / weight.max(f64::MIN_POSITIVE) / speed }
+        // At least 0.5: the transcript ends in one of TRANSCRIPT_ENDINGS or gains
+        // a full stop.
+        Pace { seconds_per_weight: sample_seconds / weight / speed }
     }
 
     /// The estimated seconds of audio for `text`. any-tts lengthens estimates
@@ -170,6 +210,33 @@ mod tests {
         // "ab" weighs 2, and 2.5 with the full stop any-tts adds.
         assert_close(Pace::of_voice(5.0, "ab", 1.0).seconds("ab"), 4.0);
         assert_close(Pace::of_voice(5.0, " ab. ", 1.0).seconds("ab."), 5.0);
+    }
+
+    #[test]
+    fn transcript_endings_weigh_half_a_letter() {
+        assert!(TRANSCRIPT_ENDINGS.chars().all(|ending| char_weight(ending) == 0.5));
+    }
+
+    #[test]
+    fn estimates_match_any_tts() {
+        // From any-tts's length_estimate_matches_the_python_package, which uses
+        // its default reference of "Nice to meet you." in 25 tokens. Estimates
+        // under 50 tokens, which any-tts lengthens, are left out.
+        let pace = Pace::of_voice(25.0 / f64::from(FRAME_RATE), "Nice to meet you.", 1.0);
+        for (text, tokens) in [("Hello world, this is a test of the estimate.", 64), ("Ünïcode — “quoted” 1865!", 52)] {
+            assert_eq!((pace.seconds(text) * f64::from(FRAME_RATE)) as usize, tokens, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_split_threshold_is_read_as_any_tts_reads_it() {
+        assert_eq!(split_above(None, None), Some(30.0));
+        assert_eq!(split_above(Some("24.5"), None), Some(24.5));
+        assert_eq!(split_above(Some("long"), Some("short")), Some(30.0));
+        assert_eq!(split_above(Some("0"), None), None);
+        assert_eq!(split_above(Some("0.01"), None), None, "under half a frame");
+        assert_eq!(split_above(Some("-3"), None), None);
+        assert_eq!(split_above(None, Some("0")), None);
     }
 
     #[test]

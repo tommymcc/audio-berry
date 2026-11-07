@@ -1,12 +1,12 @@
 //! Turns book text into something a speech model reads well, in small chunks.
 
-use crate::estimate::{Pace, SPLIT_ABOVE_SECONDS, char_weight, text_weight};
+use crate::estimate::{Pace, char_weight, text_weight};
 
 /// Longest chunk sent to the model in one request, in characters, at any pace.
 pub const MAX_CHUNK_CHARS: usize = 500;
-/// Longest estimated audio for a chunk, 2 s under the length above which
-/// any-tts splits a request.
-pub const MAX_CHUNK_SECONDS: f64 = SPLIT_ABOVE_SECONDS - 2.0;
+/// How far under the length above which any-tts splits a request a chunk's
+/// estimated audio is kept, in seconds.
+pub const SPLIT_MARGIN_SECONDS: f64 = 2.0;
 
 /// How long a chunk may be: at most `MAX_CHUNK_CHARS` characters, and at most
 /// `weight` in text weight, as any-tts weighs text.
@@ -17,10 +17,17 @@ pub struct ChunkLimit {
 }
 
 impl ChunkLimit {
-    /// The limit that keeps a chunk's estimated audio at `pace` within
-    /// `MAX_CHUNK_SECONDS`.
-    pub fn for_pace(pace: &Pace) -> ChunkLimit {
-        ChunkLimit::with_weight(pace.weight_for(MAX_CHUNK_SECONDS))
+    /// The limit that keeps a chunk's estimated audio at `pace`
+    /// `SPLIT_MARGIN_SECONDS` under `split_above` seconds, or within it when it's
+    /// no more than the margin. With no `split_above`, only `MAX_CHUNK_CHARS`.
+    pub fn under_split(pace: &Pace, split_above: Option<f64>) -> ChunkLimit {
+        let max_seconds = |split: f64| if split > SPLIT_MARGIN_SECONDS { split - SPLIT_MARGIN_SECONDS } else { split };
+        ChunkLimit::with_weight(split_above.map_or(f64::INFINITY, |split| pace.weight_for(max_seconds(split))))
+    }
+
+    /// At most `MAX_CHUNK_CHARS` characters, of any weight.
+    pub fn unlimited_weight() -> ChunkLimit {
+        ChunkLimit::with_weight(f64::INFINITY)
     }
 
     /// At most `MAX_CHUNK_CHARS` characters and `weight` in text weight.
@@ -319,21 +326,21 @@ fn split_sentences(text: &str) -> Vec<String> {
 
 /// Breaks an overlong sentence at the last clause or word boundary that fits,
 /// or where the limit falls in a word too long to fit.
-fn split_long(sentence: &str, max: &ChunkLimit) -> Vec<String> {
+fn split_long(sentence: &str, limit: &ChunkLimit) -> Vec<String> {
     let mut parts = Vec::new();
     let mut rest = sentence.trim();
-    while !max.fits(rest) {
+    while !limit.fits(rest) {
         let first = rest.chars().next().map_or(0, char::len_utf8);
-        let limit = max.fitting_end(rest).max(first);
-        let head = &rest[..limit];
-        let in_second_half = |index: &usize| *index > limit / 2;
+        let fit_end = limit.fitting_end(rest).max(first);
+        let head = &rest[..fit_end];
+        let in_second_half = |index: &usize| *index > fit_end / 2;
         let cut = head
             .rfind(|c| ";:".contains(c))
             .filter(in_second_half)
             .or_else(|| head.rfind(',').filter(in_second_half))
             .map(|index| index + 1)
             .or_else(|| head.rfind(' '))
-            .unwrap_or(limit);
+            .unwrap_or(fit_end);
         parts.push(rest[..cut].trim().to_string());
         rest = rest[cut..].trim();
     }
@@ -348,10 +355,10 @@ pub fn spoken_chars(paragraphs: &[Paragraph]) -> usize {
     paragraphs.iter().map(|paragraph| normalize(paragraph).chars().count()).sum()
 }
 
-/// Groups paragraphs into chunks within `max` that end on sentence boundaries.
+/// Groups paragraphs into chunks within `limit` that end on sentence boundaries.
 /// Headings get their own chunks, and a paragraph end closes a chunk that's
 /// mostly full.
-pub fn chunk(paragraphs: &[Paragraph], max: &ChunkLimit) -> Vec<String> {
+pub fn chunk(paragraphs: &[Paragraph], limit: &ChunkLimit) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut close = |current: &mut String| {
@@ -366,15 +373,15 @@ pub fn chunk(paragraphs: &[Paragraph], max: &ChunkLimit) -> Vec<String> {
         }
         if paragraph.heading {
             close(&mut current);
-            for part in split_long(&text, max) {
+            for part in split_long(&text, limit) {
                 current = part;
                 close(&mut current);
             }
             continue;
         }
         for sentence in split_sentences(&text) {
-            for part in split_long(&sentence, max) {
-                if !current.is_empty() && !max.fits(&format!("{current} {part}")) {
+            for part in split_long(&sentence, limit) {
+                if !current.is_empty() && !limit.fits(&format!("{current} {part}")) {
                     close(&mut current);
                 }
                 if !current.is_empty() {
@@ -383,7 +390,7 @@ pub fn chunk(paragraphs: &[Paragraph], max: &ChunkLimit) -> Vec<String> {
                 current.push_str(&part);
             }
         }
-        if max.mostly_full(&current) {
+        if limit.mostly_full(&current) {
             close(&mut current);
         }
     }
@@ -420,8 +427,8 @@ mod tests {
         They used to work on the oars or sail in those times. Very tough.";
     const JOHNNY_SECONDS: f64 = 16.92;
 
-    /// Chunk 3.2 of The Coral Island when chunks were only limited to 500
-    /// characters. johnny-golden.wav rendered it at 31.0 s, which any-tts split.
+    /// Chunk 3.2 of The Coral Island as split at 500 characters alone, which
+    /// johnny-golden.wav rendered at 31.0 s, split by any-tts.
     const CORAL_3_2: &str = "The beginning, My early life and character, I thirst for adventure in foreign lands \
         and go to sea. Roving has always been, and still is, my ruling passion, the joy of my heart, the very \
         sunshine of my existence. In childhood, in boyhood, and in man's estate, I have been a rover; not a mere \
@@ -522,23 +529,32 @@ mod tests {
     #[test]
     fn the_voice_limit_splits_it_at_a_sentence_within_the_margin() {
         let pace = Pace::of_voice(JOHNNY_SECONDS, JOHNNY, 1.0);
-        let chunks = chunk(&[body(CORAL_3_2)], &ChunkLimit::for_pace(&pace));
+        let chunks = chunk(&[body(CORAL_3_2)], &ChunkLimit::under_split(&pace, Some(30.0)));
         assert_eq!(chunks.len(), 2, "{chunks:?}");
         assert_eq!(chunks.join(" "), CORAL_3_2);
         for chunk in &chunks {
             assert!(chunk.ends_with('.'), "{chunk}");
-            assert!(pace.seconds(chunk) <= MAX_CHUNK_SECONDS, "{chunk}");
+            assert!(pace.seconds(chunk) <= 28.0, "{chunk}");
         }
     }
 
     #[test]
     fn a_slower_speed_makes_shorter_chunks() {
         let text = [CORAL_3_2; 4].join(" ");
-        let count = |speed| chunk(&[body(&text)], &ChunkLimit::for_pace(&Pace::of_voice(JOHNNY_SECONDS, JOHNNY, speed)));
+        let pace = |speed| Pace::of_voice(JOHNNY_SECONDS, JOHNNY, speed);
+        let count = |speed| chunk(&[body(&text)], &ChunkLimit::under_split(&pace(speed), Some(30.0)));
         let (normal, slow) = (count(1.0), count(0.8));
         assert!(slow.len() > normal.len(), "{} chunks, then {}", normal.len(), slow.len());
-        let slow_pace = Pace::of_voice(JOHNNY_SECONDS, JOHNNY, 0.8);
-        assert!(slow.iter().all(|chunk| slow_pace.seconds(chunk) <= MAX_CHUNK_SECONDS));
+        assert!(slow.iter().all(|chunk| pace(0.8).seconds(chunk) <= 28.0));
+    }
+
+    #[test]
+    fn the_limit_follows_the_split_threshold() {
+        let pace = Pace::of_voice(JOHNNY_SECONDS, JOHNNY, 1.0);
+        let weight_for = |split| ChunkLimit::under_split(&pace, split).weight();
+        assert!((weight_for(Some(20.0)) - pace.weight_for(18.0)).abs() < 1e-9);
+        assert!((weight_for(Some(1.5)) - pace.weight_for(1.5)).abs() < 1e-9, "no margin below the margin");
+        assert_eq!(ChunkLimit::under_split(&pace, None), ChunkLimit::unlimited_weight());
     }
 
     #[test]
@@ -561,7 +577,7 @@ mod tests {
 
     #[test]
     fn the_character_limit_still_applies_to_a_fast_voice() {
-        let chunks = chunk(&[body(&"Go on. ".repeat(200))], &ChunkLimit::with_weight(f64::INFINITY));
+        let chunks = chunk(&[body(&"Go on. ".repeat(200))], &ChunkLimit::unlimited_weight());
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= MAX_CHUNK_CHARS));
         assert!(chunks[0].chars().count() > MAX_CHUNK_CHARS - 10);
     }

@@ -301,13 +301,16 @@ and at most 28 seconds of estimated audio. The estimate is the one any-tts makes
 from how long the voice sample takes to say its transcript, at the chosen speed,
 so a slower voice or speed gives shorter chunks. any-tts splits anything
 estimated over 30 seconds into pieces joined by short silences, which can be
-heard, so the chunks stay under that. A sentence too long for one chunk is split
-at a clause, or else between words. `narration.txt` saves the limit as
-`chunk_weight`, so `mishearings` finds the same chunks without the voice sample.
+heard, so the chunks stay 2 seconds under that. `OMNIVOICE_AUDIO_CHUNK_THRESHOLD`
+sets any-tts's 30 seconds, and the chunks follow it. A sentence too long for one
+chunk is split at a clause, or else between words, and `book`, `retake` and
+`speak` warn of any text still long enough to be split. `narration.txt` saves the
+limit as `chunk_weight` (see the [glossary](GLOSSARY.md)), so `mishearings` finds
+the same chunks without the voice sample. Since the chunks depend on the voice,
+`chapters` lists each chapter's characters but not its chunks.
 
 The Project Gutenberg copy of Alice linked above isn't the edition used in the
-benchmarks below, which split chapter 3 into 30 chunks rather than 29 when chunks
-were limited only to 500 characters.
+benchmarks below, so its chapters split into different chunks.
 
 The model sometimes adds background noise, skips words, runs on or says fluent
 nonsense, so every take is checked and retried up to 5 times with a new seed:
