@@ -26,8 +26,8 @@ const RAW_SAMPLE_DB: f32 = -40.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SampleCheck {
     floor_db: f32,
-    /// The noise limit given in the environment, if any.
-    noise_limit_db: Option<f32>,
+    /// The noise limit takes will be judged against.
+    noise_limit_db: f32,
     verdict: Verdict,
 }
 
@@ -57,7 +57,7 @@ impl SampleCheck {
         } else {
             Verdict::Fine
         };
-        SampleCheck { floor_db, noise_limit_db, verdict }
+        SampleCheck { floor_db, noise_limit_db: limit, verdict }
     }
 
     /// Follows the sample's length on every load, so a sample with a transcript
@@ -80,9 +80,11 @@ impl SampleCheck {
         match self.verdict {
             Verdict::Fine => None,
             Verdict::Noisy => {
-                let limit = match self.noise_limit_db {
-                    Some(limit) => format!("the noise limit of {limit} dB"),
-                    None => format!("the default noise limit of {DEFAULT_NOISE_LIMIT_DB} dB"),
+                let limit = self.noise_limit_db;
+                let limit = if limit == DEFAULT_NOISE_LIMIT_DB {
+                    format!("the default noise limit of {limit} dB")
+                } else {
+                    format!("the noise limit of {limit} dB")
                 };
                 // The next multiple of 5 dB above the floor takes are expected
                 // to have, as -50 was for a -45.3 dB sample.
@@ -169,6 +171,13 @@ mod tests {
         assert!(advice.contains("<end> voices/dad-clean.wav --reduction 20"), "{advice}");
         assert!(advice.contains("15 dB by default"), "{advice}");
         assert!(advice.contains("\"Noise limit\""), "{advice}");
+    }
+
+    #[test]
+    fn the_advice_names_a_limit_other_than_the_default() {
+        let advice = |limit| SampleCheck::from_floor(-45.3, limit).advice(Path::new("voices/dad.wav"), 10.7).unwrap();
+        assert!(advice(Some(-60.0)).contains("floors above the noise limit of -60 dB"), "{}", advice(Some(-60.0)));
+        assert!(advice(Some(-55.0)).contains("the default noise limit of -55 dB"), "{}", advice(Some(-55.0)));
     }
 
     #[test]

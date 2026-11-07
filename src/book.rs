@@ -7,7 +7,7 @@ use crate::checks::{Goal, Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::narrator::Narrator;
 use crate::progress::Progress;
-use crate::store::{Chunk, KeepSettings, NarrationStore, RenderSettings, fnv, noise_limit_for};
+use crate::store::{self, Chunk, KeepSettings, NarrationStore, RenderSettings, fnv};
 use crate::takes::{Kept, TakePolicy};
 use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
@@ -27,9 +27,29 @@ fn read_allowances_saying_so(voice_sample: &Path) -> Result<Allowances> {
     Ok(allowances)
 }
 
-fn open_store(book: &Book, voice: &Voice, out: &Path, speed: Option<f64>, keep: KeepSettings) -> Result<NarrationStore> {
-    let settings = RenderSettings::from_env(speed);
-    NarrationStore::open(out, &book.title, &book.chunks(), voice.hash(), &settings, keep)
+/// A book opened for rendering in an output directory, in one voice, with the
+/// standard its takes are judged by and the take policy that picks them.
+struct Session {
+    book: Book,
+    voice: Voice,
+    store: NarrationStore,
+    standard: Standard,
+    takes: TakePolicy,
+}
+
+impl Session {
+    /// Settles what decides which take is kept in `out` from `given` and what's
+    /// saved there, loads the voice sample judged against the settled noise limit,
+    /// and opens `out` for `book` in that voice at `speed`, or the speed it saved.
+    fn open(voice_sample: &Path, book: Book, out: &Path, speed: Option<f64>, given: KeepSettings) -> Result<Session> {
+        let allowances = read_allowances_saying_so(voice_sample)?;
+        let settled = store::settle(out, given)?;
+        let keep = *settled.keep();
+        let voice = Voice::load(voice_sample, Some(keep.noise_limit_db))?;
+        let store = settled.open(&book.title, &book.chunks(), voice.hash(), &RenderSettings::from_env(speed))?;
+        let standard = Standard::of(&keep, store.speed(), allowances);
+        Ok(Session { book, voice, store, standard, takes: keep.takes })
+    }
 }
 
 /// The take's pitch range for the progress output, when ranked by it.
@@ -73,10 +93,12 @@ struct Recorder<'a> {
 }
 
 impl<'a> Recorder<'a> {
-    /// Loads the narrator and the transcriber that checks it.
-    fn load(voice: &'a Voice, store: &NarrationStore, standard: &'a Standard) -> Result<Self> {
+    /// Loads the narrator and the transcriber that checks it, for the session's
+    /// voice, speed and standard.
+    fn load(session: &'a Session) -> Result<Self> {
         let narrator = Narrator::load()?;
         let transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
+        let Session { voice, store, standard, .. } = session;
         Ok(Recorder { narrator, transcriber, voice, speed: store.speed(), standard })
     }
 
@@ -197,11 +219,8 @@ pub fn narrate(
         None => (0..book.chapters.len()).collect(),
     };
 
-    let allowances = read_allowances_saying_so(voice_sample)?;
-    // Judge the sample against the limit its takes will be, which may be saved.
-    let voice = Voice::load(voice_sample, noise_limit_for(out, keep.noise_limit_db)?)?;
-    let store = open_store(&book, &voice, out, speed, keep)?;
-    let standard = Standard::of(&store, allowances);
+    let session = Session::open(voice_sample, book, out, speed, keep)?;
+    let Session { book, store, standard, takes, .. } = &session;
 
     let text_dir = out.join("text");
     fs::create_dir_all(&text_dir)?;
@@ -220,28 +239,28 @@ pub fn narrate(
     let total = store.chunks().iter().filter(|item| selected.contains(&item.chapter)).count();
     println!("{total} chunks, {} to generate", pending.len());
     if !pending.is_empty() {
-        let mut recorder = Recorder::load(&voice, &store, &standard)?;
+        let mut recorder = Recorder::load(&session)?;
         let mut progress = Progress::new(total, total - pending.len());
         for item in &pending {
-            let kept = recorder.best(item, &Goal::Book, 0, store.takes(), &mut progress)?;
+            let kept = recorder.best(item, &Goal::Book, 0, *takes, &mut progress)?;
             let take = &kept.take;
-            store.store(item, &take.audio, &take.verdict.accuracy.transcript, kept.rendered)?;
+            store.store(item, &take.audio, &take.verdict.accuracy.transcript, kept.tried())?;
             progress.chunk_done(&format!(
                 "{:.0}s of audio, {}, recall {:.2}{}",
                 take.audio.duration_secs(),
-                store.takes().describe(&kept),
+                takes.describe(&kept),
                 take.verdict.accuracy.recall,
-                pitch_range_note(&standard, &take.verdict),
+                pitch_range_note(standard, &take.verdict),
             ))?;
         }
         progress.finish();
     }
 
-    let flagged = write_report(&book, &store, &standard, out)?;
-    let m4b = assemble(&book, &store, out)?;
+    let flagged = write_report(book, store, standard, out)?;
+    let m4b = assemble(book, store, out)?;
     println!("Wrote {}", m4b.display());
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
-    print_missing(&store);
+    print_missing(store);
     Ok(())
 }
 
@@ -285,15 +304,11 @@ pub fn retake(
     targets: &[&str],
     keep: KeepSettings,
 ) -> Result<()> {
-    let book = read_book(epub)?;
-    let allowances = read_allowances_saying_so(voice_sample)?;
-    // Judge the sample against the limit its takes will be, which may be saved.
-    let voice = Voice::load(voice_sample, noise_limit_for(out, keep.noise_limit_db)?)?;
-    let store = open_store(&book, &voice, out, None, keep)?;
-    let standard = Standard::of(&store, allowances);
+    let session = Session::open(voice_sample, read_book(epub)?, out, None, keep)?;
+    let Session { book, store, standard, takes, .. } = &session;
     let wanted = store.select(targets)?;
 
-    let mut recorder = Recorder::load(&voice, &store, &standard)?;
+    let mut recorder = Recorder::load(&session)?;
     let mut progress = Progress::untimed(wanted.len());
     for (position, selected) in wanted.iter().enumerate() {
         let item = selected.chunk;
@@ -315,21 +330,17 @@ pub fn retake(
             item.text.chars().take(60).collect::<String>()
         ))?;
 
-        let kept = recorder.best(item, &goal, first_take, store.takes(), &mut progress)?;
-        let count = first_take + kept.rendered;
+        let kept = recorder.best(item, &goal, first_take, *takes, &mut progress)?;
         let better = current.is_none_or(|current| kept.take.verdict.judged() > current);
         let outcome = if better {
-            if store.has_audio(item) {
-                store.retire(item)?;
-            }
             let transcript = &kept.take.verdict.accuracy.transcript;
-            store.store(item, &kept.take.audio, transcript, count)?;
-            let pitch_range = pitch_range_note(&standard, &kept.take.verdict);
-            progress.line(&format!("  replaced with {}{pitch_range}: {transcript}", store.takes().describe(&kept)))?;
+            store.replace(item, &kept.take.audio, transcript, kept.tried())?;
+            let pitch_range = pitch_range_note(standard, &kept.take.verdict);
+            progress.line(&format!("  replaced with {}{pitch_range}: {transcript}", takes.describe(&kept)))?;
             "replaced"
         } else {
             // Still counts the tried seeds, so the next retake tries new ones.
-            store.record_tried(item, count)?;
+            store.record_tried(item, kept.tried())?;
             progress.line("  kept the current take; none was better")?;
             "kept the current take"
         };
@@ -337,9 +348,9 @@ pub fn retake(
     }
     progress.finish();
 
-    let flagged = write_report(&book, &store, &standard, out)?;
+    let flagged = write_report(book, store, standard, out)?;
     println!("{flagged} chunks need checking; see {}", out.join("report.tsv").display());
-    print_missing(&store);
+    print_missing(store);
     match rebuild_command(voice_sample, epub, out, &store.complete_chapters(), store.missing_count()) {
         Some(command) => println!("To rebuild the M4B and chapter WAVs, run:\n  {command}"),
         None => println!("No chapter is complete yet, so there's no M4B to rebuild."),

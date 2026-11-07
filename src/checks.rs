@@ -3,7 +3,7 @@
 
 use crate::pitch;
 use crate::quality::{self, Quality};
-use crate::store::NarrationStore;
+use crate::store::Keep;
 use crate::accuracy::{self, Accuracy, Allowances};
 use crate::takes::Judged;
 use any_tts::AudioSamples;
@@ -67,15 +67,11 @@ enum Aim {
 }
 
 impl Standard {
-    /// The standard of an output directory, from its speed, noise limit and pitch
-    /// range, and of its voice, from the words that voice may be heard saying as others.
-    pub fn of(store: &NarrationStore, allowances: Allowances) -> Standard {
-        Standard {
-            speed: store.speed(),
-            noise_limit_db: store.noise_limit_db(),
-            pitch_target: store.pitch_range_st(),
-            allowances,
-        }
+    /// The standard of an output directory, from its noise limit and pitch range in
+    /// `keep` and the `speed` it narrates at, and of its voice, from the words that
+    /// voice may be heard saying as others.
+    pub fn of(keep: &Keep, speed: f64, allowances: Allowances) -> Standard {
+        Standard { speed, noise_limit_db: keep.noise_limit_db, pitch_target: keep.pitch_target, allowances }
     }
 
     /// The pitch range takes are ranked by nearness to, if any.

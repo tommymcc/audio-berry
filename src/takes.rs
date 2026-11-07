@@ -46,6 +46,14 @@ pub struct Kept<T> {
     pub rendered: u64,
 }
 
+impl<T> Kept<T> {
+    /// How many seeds of the chunk have been tried, counting those before `first`,
+    /// so the next takes can try new ones.
+    pub fn tried(&self) -> u64 {
+        self.first + self.rendered
+    }
+}
+
 impl TakePolicy {
     /// How `narration.txt` saves it, such as `first-passing` or `best-of-3`.
     pub fn saved(self) -> String {
@@ -70,7 +78,7 @@ impl TakePolicy {
             TakePolicy::FirstPassing => format!("take {number}"),
             TakePolicy::BestOf(count) if kept.first == 0 => format!("take {number}, the best of {count}"),
             TakePolicy::BestOf(_) => {
-                format!("take {number}, the best of takes {}–{}", kept.first + 1, kept.first + kept.rendered)
+                format!("take {number}, the best of takes {}–{}", kept.first + 1, kept.tried())
             }
         }
     }
@@ -187,7 +195,7 @@ mod tests {
     #[test]
     fn takes_after_seeds_already_tried_are_numbered_on_from_them() {
         let (kept, rendered) = render(TakePolicy::BestOf(3), 7, &[(true, 0.4, true), (true, 0.6, true), (true, 0.5, true)]);
-        assert_eq!((kept.index, kept.first, kept.rendered), (8, 7, 3));
+        assert_eq!((kept.index, kept.first, kept.rendered, kept.tried()), (8, 7, 3, 10));
         assert_eq!(rendered, [7, 8, 9]);
         assert_eq!(TakePolicy::BestOf(3).describe(&kept), "take 9, the best of takes 8–10");
     }
