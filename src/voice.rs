@@ -130,7 +130,7 @@ pub fn read_allowances(sample: &Path) -> Result<Allowances> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Allowances::default()),
         Err(error) => return Err(eyre!("{}: {error}", path.display())),
     };
-    Ok(Allowances::parse(&text).map_err(|error| eyre!("{}: {error}", path.display()))?)
+    Allowances::parse(&text).map_err(|error| eyre!("{}: {error}", path.display()))
 }
 
 fn seconds(samples: &[f32]) -> f32 {
