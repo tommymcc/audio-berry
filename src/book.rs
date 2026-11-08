@@ -77,8 +77,8 @@ fn pitch_range_note(standard: &Standard, verdict: &Verdict) -> String {
 }
 
 /// The phrases heard in the wrong place, for the progress output.
-fn moved_note(accuracy: &Accuracy) -> String {
-    if accuracy.in_order() { String::new() } else { format!(", moved {}", accuracy.moved_note()) }
+fn moved_suffix(accuracy: &Accuracy) -> String {
+    if accuracy.in_order() { String::new() } else { format!(", moved {}", accuracy.moved_list()) }
 }
 
 /// Prints each chapter's number, title and size.
@@ -148,7 +148,7 @@ impl<'a> Recorder<'a> {
                     quality.seconds,
                     accuracy.recall,
                     accuracy.extra,
-                    moved_note(accuracy),
+                    moved_suffix(accuracy),
                 ))?,
                 Goal::Book => {}
                 Goal::Retake { .. } => {
@@ -157,7 +157,7 @@ impl<'a> Recorder<'a> {
                         take + 1,
                         accuracy.recall,
                         accuracy.extra,
-                        moved_note(accuracy),
+                        moved_suffix(accuracy),
                         current.verdict.heard(),
                         quality.floor_db,
                         pitch_range_note(standard, &current.verdict),
@@ -207,7 +207,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
             check.transcript,
             verdict.pitch_range.map(|range| format!("{range:.1}")).unwrap_or_default(),
             check.checker.as_deref().unwrap_or_default(),
-            accuracy.moved_note(),
+            accuracy.moved_list(),
         )?;
     }
     fs::write(out.join("report.tsv"), report)?;

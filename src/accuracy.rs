@@ -10,9 +10,10 @@ const MIN_RECALL: f32 = 0.92;
 const MAX_EXTRA: f32 = 0.12;
 
 /// The fewest words in a row of the text that count as a moved phrase when
-/// heard somewhere else. See `moved_phrases`. On 5,053 stored Whisper
-/// transcripts, one word flagged 76 chunks, mostly a common word such as "and"
-/// missed in one place and heard in another; two flagged one chunk, a real move.
+/// heard somewhere else. See `Alignment::moved_runs`. On 5,053 stored Whisper
+/// transcripts, one word flagged 75 chunks with 80 moves, 71 of them one of the
+/// texts' 50 commonest words, such as "and", missed in one place and heard in
+/// another; two words flagged one chunk, a real move.
 const MIN_MOVED_WORDS: usize = 2;
 
 pub struct Accuracy {
@@ -20,8 +21,12 @@ pub struct Accuracy {
     pub recall: f32,
     /// Words heard that aren't in the text, relative to the text's length.
     pub extra: f32,
-    /// Each phrase of the text heard in another place, as its words were
-    /// compared: lowercase, with numbers under 100 spelled out.
+    /// Each phrase of the text heard in another place, in the text's order. A
+    /// phrase that traded places with the words beside it in the text is named
+    /// with them in the order heard, as `first / before / second`; any other is
+    /// named alone. Words are as compared: lowercase, numbers under 100 spelled
+    /// out, and numbers of 100 or more in digits where the other side has them
+    /// in digits.
     pub moved: Vec<String>,
     pub transcript: String,
 }
@@ -46,9 +51,9 @@ impl Accuracy {
         self.moved.is_empty()
     }
 
-    /// The moved phrases for `report.tsv`, each in quotes, or nothing.
-    pub fn moved_note(&self) -> String {
-        self.moved.iter().map(|phrase| format!("\"{phrase}\"")).collect::<Vec<_>>().join("; ")
+    /// The moved phrases joined by ` | `, as `report.tsv` shows them, or nothing.
+    pub fn moved_list(&self) -> String {
+        self.moved.join(" | ")
     }
 }
 
@@ -107,6 +112,12 @@ impl Allowances {
         !self.heard_as.is_empty() && self.heard_as.get(written).is_some_and(|heard_as| heard_as.contains(heard))
     }
 
+    /// Whether `heard` counts as the text's `written` word: the same word, or
+    /// one it may be heard as.
+    pub fn matches(&self, written: &str, heard: &str) -> bool {
+        written == heard || self.allows(written, heard)
+    }
+
     /// How many pairs there are.
     pub fn len(&self) -> usize {
         self.heard_as.values().map(HashSet::len).sum()
@@ -143,22 +154,6 @@ fn words_of_both(first: &str, second: &str) -> (Vec<String>, Vec<String>) {
     (numbers::match_digits(&first, &second), numbers::match_digits(&second, &first))
 }
 
-/// How many words, in order, `expected[i..]` and `heard[j..]` have in common, as
-/// `table[i][j]`. A word matches itself, or a word the allowances let it be heard as.
-fn common_subsequences(expected: &[String], heard: &[String], allowances: &Allowances) -> Vec<Vec<usize>> {
-    let mut table = vec![vec![0usize; heard.len() + 1]; expected.len() + 1];
-    for (i, word) in expected.iter().enumerate().rev() {
-        for (j, other) in heard.iter().enumerate().rev() {
-            table[i][j] = if word == other || allowances.allows(word, other) {
-                table[i + 1][j + 1] + 1
-            } else {
-                table[i + 1][j].max(table[i][j + 1])
-            };
-        }
-    }
-    table
-}
-
 /// Joins neighbouring words where `other` has them as one word, so "quarter
 /// deck" matches "quarterdeck" and "e book" matches "ebook".
 fn join_split_words(words: &[String], other: &[String]) -> Vec<String> {
@@ -187,81 +182,212 @@ fn aligned_words(text: &str, transcript: &str) -> (Vec<String>, Vec<String>) {
     (expected, heard)
 }
 
-/// How much of `text` was heard in `transcript`, and how much more besides. A
-/// word heard as another that `allowances` allow counts as heard.
-pub fn compare(text: &str, transcript: &str, allowances: &Allowances) -> Accuracy {
-    let (expected, heard) = aligned_words(text, transcript);
-    let table = common_subsequences(&expected, &heard, allowances);
-    let matched = table[0][0];
-    let length = expected.len().max(1) as f32;
-    Accuracy {
-        recall: matched as f32 / length,
-        extra: heard.len().saturating_sub(matched) as f32 / length,
-        moved: moved_phrases(&expected, &heard, &table, allowances),
-        transcript: transcript.to_string(),
-    }
+/// A text's words lined up with the words heard, by the longest common
+/// subsequence of the two, where a word matches itself or a word the
+/// allowances let it be heard as.
+struct Alignment<'a> {
+    expected: Vec<String>,
+    heard: Vec<String>,
+    allowances: &'a Allowances,
+    /// How many words, in order, `expected[i..]` and `heard[j..]` have in
+    /// common, as `table[i][j]`.
+    table: Vec<Vec<usize>>,
 }
 
-/// Which words of `expected` and of `heard` the longest common subsequence in
-/// `table` pairs up.
-fn paired(
-    expected: &[String],
-    heard: &[String],
-    table: &[Vec<usize>],
-    allowances: &Allowances,
-) -> (Vec<bool>, Vec<bool>) {
-    let (mut expected_paired, mut heard_paired) = (vec![false; expected.len()], vec![false; heard.len()]);
-    let (mut i, mut j) = (0, 0);
-    while i < expected.len() && j < heard.len() {
-        if expected[i] == heard[j] || allowances.allows(&expected[i], &heard[j]) {
-            expected_paired[i] = true;
-            heard_paired[j] = true;
-            i += 1;
-            j += 1;
-        } else if table[i + 1][j] >= table[i][j + 1] {
-            i += 1;
-        } else {
-            j += 1;
+/// One step through an alignment, in the order of both texts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Step {
+    /// A word of the text and the word heard for it.
+    Paired(usize, usize),
+    /// A word of the text heard nowhere in its place.
+    Missed(usize),
+    /// A word heard that isn't in the text in its place.
+    Added(usize),
+}
+
+/// A run of words of the text heard in the same order, but not where the
+/// common subsequence has them: `expected[text]` heard as `heard[transcript]`.
+#[derive(Clone, Debug)]
+struct Run {
+    text: std::ops::Range<usize>,
+    transcript: std::ops::Range<usize>,
+}
+
+impl<'a> Alignment<'a> {
+    fn new(text: &str, transcript: &str, allowances: &'a Allowances) -> Alignment<'a> {
+        let (expected, heard) = aligned_words(text, transcript);
+        let mut table = vec![vec![0usize; heard.len() + 1]; expected.len() + 1];
+        for i in (0..expected.len()).rev() {
+            for j in (0..heard.len()).rev() {
+                table[i][j] = if allowances.matches(&expected[i], &heard[j]) {
+                    table[i + 1][j + 1] + 1
+                } else {
+                    table[i + 1][j].max(table[i][j + 1])
+                };
+            }
         }
+        Alignment { expected, heard, allowances, table }
     }
-    (expected_paired, heard_paired)
-}
 
-/// The phrases of `expected` heard in another place: runs of at least
-/// `MIN_MOVED_WORDS` words that the common subsequence in `table` leaves out on
-/// both sides, because they were heard in the same order as written but not in
-/// the same place relative to the words around them. Words match as `table`'s
-/// do, through the allowances. The longest such run is taken first, and each
-/// word belongs to one run at most. They come in the text's order.
-fn moved_phrases(expected: &[String], heard: &[String], table: &[Vec<usize>], allowances: &Allowances) -> Vec<String> {
-    let (mut expected_used, mut heard_used) = paired(expected, heard, table, allowances);
-    // Each phrase, after where it starts in `expected`.
-    let mut moved = Vec::new();
-    loop {
-        // run[i + 1][j + 1]: how many unpaired words in a row match, ending at
-        // `expected[i]` and `heard[j]`.
-        let mut run = vec![vec![0usize; heard.len() + 1]; expected.len() + 1];
-        let (mut longest, mut end) = (0, (0, 0));
-        for (i, word) in expected.iter().enumerate() {
-            for (j, other) in heard.iter().enumerate() {
-                let free = !expected_used[i] && !heard_used[j];
-                if free && (word == other || allowances.allows(word, other)) {
-                    run[i + 1][j + 1] = run[i][j] + 1;
-                    if run[i + 1][j + 1] > longest {
-                        longest = run[i + 1][j + 1];
-                        end = (i + 1, j + 1);
+    /// How many words of the text were heard in order.
+    fn matched(&self) -> usize {
+        self.table[0][0]
+    }
+
+    fn matches(&self, i: usize, j: usize) -> bool {
+        self.allowances.matches(&self.expected[i], &self.heard[j])
+    }
+
+    /// The common subsequence as steps. Words that match are paired as soon as
+    /// they meet. Otherwise the step keeps the longer common subsequence ahead,
+    /// and on a tie counts the text's word missed before the heard word added.
+    fn steps(&self) -> Vec<Step> {
+        let (expected, heard) = (self.expected.len(), self.heard.len());
+        let mut steps = Vec::with_capacity(expected + heard);
+        let (mut i, mut j) = (0, 0);
+        while i < expected && j < heard {
+            if self.matches(i, j) {
+                steps.push(Step::Paired(i, j));
+                i += 1;
+                j += 1;
+            } else if self.table[i + 1][j] >= self.table[i][j + 1] {
+                steps.push(Step::Missed(i));
+                i += 1;
+            } else {
+                steps.push(Step::Added(j));
+                j += 1;
+            }
+        }
+        steps.extend((i..expected).map(Step::Missed));
+        steps.extend((j..heard).map(Step::Added));
+        steps
+    }
+
+    /// Each phrase of the text heard in another place, described as
+    /// `Accuracy::moved` says, in the text's order. See `moved_runs`.
+    fn moved(&self) -> Vec<String> {
+        let pairs: Vec<(usize, usize)> = self
+            .steps()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Paired(i, j) => Some((i, j)),
+                _ => None,
+            })
+            .collect();
+        self.moved_runs(&pairs).iter().map(|run| self.describe(run, &pairs)).collect()
+    }
+
+    /// The runs of at least `MIN_MOVED_WORDS` words that `pairs` leaves out on
+    /// both sides, but that match word for word between them: words heard in
+    /// the order written, in another place relative to the words around them.
+    ///
+    /// The longest run is taken first; of runs as long, the one that ends first
+    /// in the text, then in the transcript. Each word belongs to one run at
+    /// most. A word of a moved phrase that the subsequence pairs elsewhere, as a
+    /// "the" can be, splits the run there, so a phrase of two such words isn't
+    /// found. A run heard right beside the same words heard again is a repeat,
+    /// not a move, and isn't counted. Runs one word apart on both sides, as when
+    /// a word in the middle of a moved phrase was misheard, are joined. They
+    /// come in the text's order.
+    fn moved_runs(&self, pairs: &[(usize, usize)]) -> Vec<Run> {
+        let (mut expected_used, mut heard_used) = (vec![false; self.expected.len()], vec![false; self.heard.len()]);
+        for &(i, j) in pairs {
+            expected_used[i] = true;
+            heard_used[j] = true;
+        }
+        let mut runs: Vec<Run> = Vec::new();
+        loop {
+            // run[i + 1][j + 1]: how many unused words in a row match, ending at
+            // `expected[i]` and `heard[j]`.
+            let mut run = vec![vec![0usize; self.heard.len() + 1]; self.expected.len() + 1];
+            let (mut longest, mut end) = (0, (0, 0));
+            for i in 0..self.expected.len() {
+                for j in 0..self.heard.len() {
+                    if !expected_used[i] && !heard_used[j] && self.matches(i, j) {
+                        run[i + 1][j + 1] = run[i][j] + 1;
+                        if run[i + 1][j + 1] > longest {
+                            longest = run[i + 1][j + 1];
+                            end = (i + 1, j + 1);
+                        }
                     }
                 }
             }
+            if longest < MIN_MOVED_WORDS {
+                break;
+            }
+            let found = Run { text: end.0 - longest..end.0, transcript: end.1 - longest..end.1 };
+            expected_used[found.text.clone()].fill(true);
+            heard_used[found.transcript.clone()].fill(true);
+            if !self.repeated(&found.transcript) {
+                runs.push(found);
+            }
         }
-        if longest < MIN_MOVED_WORDS {
-            moved.sort();
-            return moved.into_iter().map(|(_, phrase)| phrase).collect();
+        runs.sort_by_key(|run| run.text.start);
+        let mut joined: Vec<Run> = Vec::new();
+        for run in runs {
+            match joined.last_mut() {
+                Some(last)
+                    if run.text.start <= last.text.end + 1
+                        && run.transcript.start >= last.transcript.end
+                        && run.transcript.start <= last.transcript.end + 1 =>
+                {
+                    last.text.end = run.text.end;
+                    last.transcript.end = run.transcript.end;
+                }
+                _ => joined.push(run),
+            }
         }
-        let (i, j) = end;
-        expected_used[i - longest..i].fill(true);
-        heard_used[j - longest..j].fill(true);
-        moved.push((i - longest, expected[i - longest..i].join(" ")));
+        joined
+    }
+
+    /// Whether the words heard in `range` are heard again right before or after.
+    fn repeated(&self, range: &std::ops::Range<usize>) -> bool {
+        let words = &self.heard[range.clone()];
+        let before = range.start.checked_sub(words.len()).map(|start| &self.heard[start..range.start]);
+        let after = self.heard.get(range.end..range.end + words.len());
+        before == Some(words) || after == Some(words)
+    }
+
+    /// The moved run's words, or when it traded places with the words next to
+    /// it in the text, both phrases in the order heard: `first / before / second`.
+    ///
+    /// The run swapped with the paired words it was heard on the other side of,
+    /// when those come straight after it in the text, for a run heard late, or
+    /// straight before it, for a run heard early, with nothing between but
+    /// words missed.
+    fn describe(&self, run: &Run, pairs: &[(usize, usize)]) -> String {
+        let phrase = |range: std::ops::Range<usize>| self.expected[range].join(" ");
+        let moved = phrase(run.text.clone());
+        let paired = |range: std::ops::Range<usize>| range.into_iter().any(|i| pairs.iter().any(|&(p, _)| p == i));
+        // How many pairs come before the run in the text, and in the transcript.
+        let in_text = pairs.partition_point(|&(i, _)| i < run.text.start);
+        let in_transcript = pairs.partition_point(|&(_, j)| j < run.transcript.start);
+        if in_transcript > in_text {
+            let (first, last) = (pairs[in_text].0, pairs[in_transcript - 1].0);
+            if !paired(run.text.end..first) {
+                return format!("{} / before / {moved}", phrase(first..last + 1));
+            }
+        } else if in_transcript < in_text {
+            let (first, last) = (pairs[in_transcript].0, pairs[in_text - 1].0);
+            if !paired(last + 1..run.text.start) {
+                return format!("{moved} / before / {}", phrase(first..last + 1));
+            }
+        }
+        moved
+    }
+}
+
+/// How much of `text` was heard in `transcript`, and how much more besides. A
+/// word heard as another that `allowances` allow counts as heard.
+pub fn compare(text: &str, transcript: &str, allowances: &Allowances) -> Accuracy {
+    let alignment = Alignment::new(text, transcript, allowances);
+    let matched = alignment.matched();
+    let length = alignment.expected.len().max(1) as f32;
+    Accuracy {
+        recall: matched as f32 / length,
+        extra: alignment.heard.len().saturating_sub(matched) as f32 / length,
+        moved: alignment.moved(),
+        transcript: transcript.to_string(),
     }
 }
 
@@ -276,37 +402,27 @@ pub struct Substitutions {
 
 /// Lines `transcript` up with `text` and finds the words heard as others.
 pub fn substitutions(text: &str, transcript: &str) -> Substitutions {
-    let (expected, heard) = aligned_words(text, transcript);
-    let table = common_subsequences(&expected, &heard, &Allowances::default());
+    let none = Allowances::default();
+    let alignment = Alignment::new(text, transcript, &none);
     let mut found = Vec::new();
-    // The words between two matches, on each side.
+    // The words between two pairs, on each side.
     let (mut missed, mut instead): (Vec<&String>, Vec<&String>) = (Vec::new(), Vec::new());
-    let (mut i, mut j) = (0, 0);
-    loop {
-        let at_end = i == expected.len() || j == heard.len();
-        if at_end {
-            missed.extend(&expected[i..]);
-            instead.extend(&heard[j..]);
+    let mut flush = |missed: &mut Vec<&String>, instead: &mut Vec<&String>| {
+        if let ([written], [other]) = (missed.as_slice(), instead.as_slice()) {
+            found.push(WordPair::new(written, other));
         }
-        if at_end || expected[i] == heard[j] {
-            if let ([written], [other]) = (missed.as_slice(), instead.as_slice()) {
-                found.push(WordPair::new(written, other));
-            }
-            missed.clear();
-            instead.clear();
-            if at_end {
-                return Substitutions { text_words: expected, found };
-            }
-            i += 1;
-            j += 1;
-        } else if table[i + 1][j] >= table[i][j + 1] {
-            missed.push(&expected[i]);
-            i += 1;
-        } else {
-            instead.push(&heard[j]);
-            j += 1;
+        missed.clear();
+        instead.clear();
+    };
+    for step in alignment.steps() {
+        match step {
+            Step::Paired(..) => flush(&mut missed, &mut instead),
+            Step::Missed(i) => missed.push(&alignment.expected[i]),
+            Step::Added(j) => instead.push(&alignment.heard[j]),
         }
     }
+    flush(&mut missed, &mut instead);
+    Substitutions { text_words: alignment.expected.clone(), found }
 }
 
 /// Whether `text` has the phrase's words in a row, ignoring case and punctuation.
@@ -320,7 +436,7 @@ pub fn contains_phrase(text: &str, phrase: &str) -> bool {
 pub fn heard_phrase(transcript: &str, phrase: &str, allowances: &Allowances) -> bool {
     let (transcript, phrase) = words_of_both(transcript, phrase);
     let matches = |window: &[String]| {
-        phrase.iter().zip(window).all(|(written, heard)| written == heard || allowances.allows(written, heard))
+        phrase.iter().zip(window).all(|(written, heard)| allowances.matches(written, heard))
     };
     !phrase.is_empty() && transcript.windows(phrase.len()).any(matches)
 }
@@ -480,23 +596,25 @@ mod tests {
         assert_eq!(found.text_words, ["the", "quarterdeck", "twelve", "feet"]);
     }
 
-    /// Chunk 3.16 of The Coral Island, and what was heard: the last phrase said
-    /// before the one it follows in the book, after a word or two leaked in.
-    const CORAL_TEXT: &str = "Now, while engaged in the coasting trade, I fell in with many seamen who had travelled \
-        to almost every quarter of the globe; and I freely confess that my heart glowed ardently within me as they \
-        recounted their wild adventures in foreign lands, the dreadful storms they had weathered, the appalling \
-        dangers they had escaped, the wonderful creatures they had seen both on the land and in the sea,";
-    const CORAL_HEARD: &str = "Very tough. Now, while engaged in the coasting trade, I fell in with many seamen who \
-        had travelled to almost every quarter of the globe. And I freely confessed that my heart glowed ardently \
-        within me as they recounted their wild adventures in foreign lands. The dreadful storms they had weathered, \
-        the appalling dangers they had escaped, both on the land and in the sea, the wonderful creatures they \
-        had seen,";
+    /// A chunk's text and a transcript of a take of it, from the Whisper
+    /// transcripts stored for The Coral Island: two phrases said in each other's
+    /// place, after a few words that aren't in the text.
+    const SWAPPED_TEXT: &str = "Now, while engaged in the coasting trade, I fell in with many seamen who had \
+        travelled to almost every quarter of the globe; and I freely confess that my heart glowed ardently within me \
+        as they recounted their wild adventures in foreign lands, the dreadful storms they had weathered, the \
+        appalling dangers they had escaped, the wonderful creatures they had seen both on the land and in the sea,";
+    const SWAPPED_HEARD: &str = "Very tough. Now, while engaged in the coasting trade, I fell in with many seamen \
+        who had travelled to almost every quarter of the globe. And I freely confessed that my heart glowed \
+        ardently within me as they recounted their wild adventures in foreign lands. The dreadful storms they had \
+        weathered, the appalling dangers they had escaped, both on the land and in the sea, the wonderful \
+        creatures they had seen,";
+    const SWAP: &str = "both on the land and in the sea / before / the wonderful creatures they had seen";
 
     #[test]
-    fn a_phrase_heard_in_the_wrong_place_is_found() {
-        let accuracy = compare(CORAL_TEXT, CORAL_HEARD, &none());
-        assert_eq!(accuracy.moved, ["the wonderful creatures they had seen"]);
-        assert_eq!(accuracy.moved_note(), "\"the wonderful creatures they had seen\"");
+    fn phrases_heard_in_each_other_s_place_are_both_named() {
+        let accuracy = compare(SWAPPED_TEXT, SWAPPED_HEARD, &none());
+        assert_eq!(accuracy.moved, [SWAP]);
+        assert_eq!(accuracy.moved_list(), SWAP);
         assert!(!accuracy.in_order());
         assert!(!accuracy.acceptable() && !accuracy.exact());
     }
@@ -509,16 +627,45 @@ mod tests {
             waiting for the boat that his father had promised would come back before the end of the summer.";
         let accuracy = compare(text, heard, &none());
         assert!(accuracy.recall >= MIN_RECALL && accuracy.extra <= MAX_EXTRA, "{} {}", accuracy.recall, accuracy.extra);
-        // The longer phrase keeps its place, so the shorter is the one moved.
-        assert_eq!(accuracy.moved, ["across the water"]);
+        assert_eq!(accuracy.moved, ["for a long while / before / across the water"]);
         assert!(!accuracy.acceptable());
+    }
+
+    #[test]
+    fn a_swap_is_named_the_same_whichever_half_the_alignment_keeps() {
+        // Halves of the same length, so either could be the one left in place.
+        let text = "at last the old man went down to the river to fish";
+        let heard = "the old man at last went down to the river to fish";
+        assert_eq!(compare(text, heard, &none()).moved, ["the old man / before / at last"]);
+        let heard = "at last went down the old man to the river to fish";
+        assert_eq!(compare(text, heard, &none()).moved, ["went down / before / the old man"]);
+    }
+
+    #[test]
+    fn a_phrase_moved_far_is_named_with_what_it_was_heard_across() {
+        let text = "one day the old man went down to the river and there he sat in the sun until evening came";
+        let heard = "the old man one day went down to the river and there he sat until evening came in the sun";
+        let accuracy = compare(text, heard, &none());
+        assert_eq!(accuracy.moved, ["the old man / before / one day", "until evening came / before / in the sun"]);
+        assert_eq!(
+            accuracy.moved_list(),
+            "the old man / before / one day | until evening came / before / in the sun"
+        );
+    }
+
+    #[test]
+    fn a_swap_across_words_missed_names_only_the_words_heard() {
+        // "at dusk" isn't heard, so the halves are the words either side of it.
+        let text = "into the woods at dusk they ran and the night came down";
+        let heard = "they ran into the woods and the night came down";
+        assert_eq!(compare(text, heard, &none()).moved, ["they ran / before / into the woods"]);
     }
 
     #[test]
     fn words_heard_in_order_move_nothing() {
         for (text, heard) in [
             ("the quick brown fox jumps over the lazy dog", "the quick brown fox jumps over the lazy dog"),
-            // Repeated and dropped words, as Whisper hears some takes.
+            // Words repeated and dropped, as some stored transcripts have them.
             ("the quick brown fox jumps over the lazy dog", "the quick brown the quick brown fox jumps over the dog"),
             ("the quick brown fox jumps over the lazy dog", "the quick brown fox jumps over the lazy dog the lazy dog"),
             ("the quick brown fox jumps over the lazy dog", "quick fox over lazy"),
@@ -527,17 +674,36 @@ mod tests {
         ] {
             let accuracy = compare(text, heard, &none());
             assert!(accuracy.in_order(), "{heard}: {:?}", accuracy.moved);
-            assert_eq!(accuracy.moved_note(), "");
+            assert_eq!(accuracy.moved_list(), "");
         }
     }
 
     #[test]
-    fn each_moved_phrase_is_named() {
-        let text = "one day the old man went down to the river and there he sat in the sun until the evening came";
-        let heard = "the old man one day went down to the river and there he sat until the evening came in the sun";
+    fn a_stutter_beside_words_missed_elsewhere_is_no_move() {
+        // "of the" is missed after "top" and said twice after "end": a repeat
+        // and a drop, which recall and extra already count.
+        let text = "He climbed to the top of the mast and tied the end of the rope to it.";
+        let heard = "He climbed to the top mast and tied the end of the of the rope to it.";
         let accuracy = compare(text, heard, &none());
-        assert_eq!(accuracy.moved, ["one day", "in the sun"]);
-        assert_eq!(accuracy.moved_note(), "\"one day\"; \"in the sun\"");
+        assert!(accuracy.in_order(), "{:?}", accuracy.moved);
+        assert!(!accuracy.acceptable(), "the words missed still fail it");
+    }
+
+    #[test]
+    fn a_moved_phrase_with_a_word_misheard_is_named_whole() {
+        let heard = SWAPPED_HEARD.replace("wonderful creatures", "wonderful creature");
+        assert_eq!(compare(SWAPPED_TEXT, &heard, &none()).moved, [SWAP]);
+    }
+
+    #[test]
+    fn a_common_word_paired_elsewhere_splits_a_moved_phrase() {
+        // The subsequence pairs the moved "the" with the text's second "the",
+        // which wasn't said, leaving only "net" out of place: too little to
+        // call a phrase. Taking such words into a run flagged two transcripts
+        // stored for other books that had words missed, not moved.
+        let text = "He laid the net beside the boat and went home.";
+        let heard = "He laid beside the net boat and went home.";
+        assert!(compare(text, heard, &none()).in_order());
     }
 
     #[test]
@@ -545,10 +711,10 @@ mod tests {
         let text = "At the end of the day he paid 45 pounds for the old grey horse and rode it home.";
         let heard = "At the end of the day he paid for the old grey horse forty-five pounds and rode it home.";
         let accuracy = compare(text, heard, &none());
-        assert_eq!(accuracy.moved, ["forty five pounds"]);
+        assert_eq!(accuracy.moved, ["for the old grey horse / before / forty five pounds"]);
         let text = "He sat quite still all through the night in the boat with his hands upon the oars.";
         let heard = "He sat quite still and the boat all through the night with his hands upon the oars.";
-        assert_eq!(compare(text, heard, &allow("in = and")).moved, ["in the boat"]);
+        assert_eq!(compare(text, heard, &allow("in = and")).moved, ["in the boat / before / all through the night"]);
     }
 
     #[test]
