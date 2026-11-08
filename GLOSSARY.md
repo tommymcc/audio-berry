@@ -36,8 +36,10 @@
 
 **Voice sample:** the recording a narration's voice is cloned from, such as `voices/me.wav`, with what's said in it in a `.txt` file beside it. `clean` makes one from a noisy recording.
 
+**Checker:** the model that hears what's said in each take, so it can be compared with the text: Parakeet TDT 0.6b v3. Whisper `base.en` was the checker before it, and transcripts it heard in older output directories are kept. Each chunk's check file records its checker, except those from before checkers were recorded, which were all heard by Whisper. Whisper still transcribes voice samples and recordings for `sections`.
+
 **Section:** a stretch of a recording, from one pause to another, that `sections` suggests making into a voice sample.
 
 **Reduction:** the most noise `clean` removes from a recording when making a voice sample, in dB, 15 unless `--reduction` sets it. It's DeepFilterNet's attenuation limit. It changes the voice sample, unlike the floor and noise limit, which measure and judge takes. A higher reduction gives quieter takes but a clone less like the speaker.
 
-**Allowance:** a word of the book that a voice may be heard saying as another, such as `in = and` for a speaker whose "in" Whisper hears as "and". It's one-way, and kept beside the voice sample in a `.allowances` file, such as `voices/me.allowances`. It isn't part of the voice: changing it keeps the audio already rendered and only changes which takes pass from then on. `mishearings` suggests candidates.
+**Allowance:** a word of the book that a voice may be heard saying as another, such as `in = and` for a speaker whose "in" the checker hears as "and". It's one-way, and kept beside the voice sample in a `.allowances` file, such as `voices/me.allowances`. It isn't part of the voice: changing it keeps the audio already rendered and only changes which takes pass from then on. `mishearings` suggests candidates.

@@ -6,7 +6,7 @@ use crate::audio::decode_audio_up_to;
 use crate::clean::{self, CLEANING_RATE, DEFAULT_REDUCTION_DB};
 use crate::quality::{self, FRAME_SECONDS};
 use crate::shell;
-use crate::transcribe::{CHECK_MODEL, Phrase, Transcriber};
+use crate::transcribe::{Phrase, Transcriber};
 use crate::voice::SAMPLE_RATE;
 use any_tts::AudioSamples;
 use color_eyre::eyre::{Result, bail};
@@ -21,7 +21,7 @@ pub const DEFAULT_COUNT: usize = 3;
 /// a peak of 0.7 GB of memory, and medium.en in 97 seconds with 5.4 GB, with
 /// timestamps as rough. Its words are only shown: a voice sample's first use
 /// transcribes it with medium.en.
-const MODEL: &str = CHECK_MODEL;
+const MODEL: &str = "base.en";
 
 /// The longest recording looked through. Memory grows with length, since the
 /// whole recording is cleaned at once: on the CPU, 10 minutes took 3.5 minutes

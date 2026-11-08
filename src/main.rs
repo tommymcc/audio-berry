@@ -4,6 +4,7 @@ mod audio;
 mod audition;
 mod book;
 mod cast;
+mod checker;
 mod checks;
 mod clean;
 mod epub;
@@ -31,7 +32,7 @@ use color_eyre::eyre::{Result, bail};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-/// Beyond this, the length checks and Whisper haven't been tried.
+/// Beyond this, the length checks and the checker haven't been tried.
 const SPEED_RANGE: std::ops::RangeInclusive<f64> = 0.5..=2.0;
 
 /// Narrates DRM-free EPUB books locally, in a voice cloned from a short sample.

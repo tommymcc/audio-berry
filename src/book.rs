@@ -3,6 +3,7 @@
 
 use crate::accuracy::Allowances;
 use crate::assemble::assemble;
+use crate::checker::Checker;
 use crate::checks::{Goal, Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::estimate::{Pace, split_above_seconds, warn_if_split};
@@ -11,7 +12,6 @@ use crate::progress::Progress;
 use crate::store::{self, Chunk, KeepSettings, NarrationStore, RenderSettings, fnv};
 use crate::takes::{Kept, TakePolicy};
 use crate::text::ChunkLimit;
-use crate::transcribe::{self, Transcriber};
 use crate::voice::{Voice, allowances_path, read_allowances};
 use any_tts::AudioSamples;
 use color_eyre::eyre::{Result, bail};
@@ -94,20 +94,20 @@ struct Take {
 /// Renders takes of chunks in one voice and checks each against one standard.
 struct Recorder<'a> {
     narrator: Narrator,
-    transcriber: Transcriber,
+    checker: Checker,
     voice: &'a Voice,
     speed: f64,
     standard: &'a Standard,
 }
 
 impl<'a> Recorder<'a> {
-    /// Loads the narrator and the transcriber that checks it, for the session's
+    /// Loads the narrator and the checker that hears its takes, for the session's
     /// voice, speed and standard.
     fn load(session: &'a Session) -> Result<Self> {
         let narrator = Narrator::load()?;
-        let transcriber = Transcriber::start(transcribe::CHECK_MODEL)?;
+        let checker = Checker::start()?;
         let Session { voice, store, standard, .. } = session;
-        Ok(Recorder { narrator, transcriber, voice, speed: store.speed(), standard })
+        Ok(Recorder { narrator, checker, voice, speed: store.speed(), standard })
     }
 
     /// Renders and checks one take for `goal`. Seeds follow from the text, so
@@ -115,8 +115,8 @@ impl<'a> Recorder<'a> {
     fn take(&mut self, item: &Chunk, goal: &Goal, take: u64) -> Result<Take> {
         let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
         let audio = self.narrator.say(self.voice, &item.text, self.speed, Some(base_seed + take))?;
-        let transcript = self.transcriber.transcribe(&audio)?;
-        let verdict = self.standard.judge(goal, &item.text, &audio, &transcript);
+        let heard = self.checker.hear(&audio)?;
+        let verdict = self.standard.judge(goal, &item.text, &audio, &heard.text);
         Ok(Take { audio, verdict })
     }
 
@@ -170,7 +170,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
     // New columns go last, so anything reading columns by position still works.
     let mut report = String::from(
         "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\t\
-         pitch_range_st\n",
+         pitch_range_st\tchecker\n",
     );
     let mut flagged = 0;
     for item in store.chunks().iter().filter(|item| store.has_audio(item)) {
@@ -184,7 +184,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
         flagged += usize::from(!pass);
         writeln!(
             report,
-            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
             book.chapters[item.chapter].title,
             item.number(),
             path.file_name().unwrap_or_default().to_string_lossy(),
@@ -199,6 +199,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
             item.text,
             check.transcript,
             verdict.pitch_range.map(|range| format!("{range:.1}")).unwrap_or_default(),
+            check.checker.as_deref().unwrap_or_default(),
         )?;
     }
     fs::write(out.join("report.tsv"), report)?;

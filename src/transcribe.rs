@@ -1,6 +1,6 @@
-//! Hears what's said in audio with a local Whisper model, so generated speech can
-//! be checked against its text, because the model sometimes produces fluent
-//! nonsense that sounds clean and runs to a plausible length.
+//! Hears what's said in audio with a local Whisper model: the words of a voice
+//! sample, and the phrases of a recording `sections` looks through. Takes are
+//! checked by `checker` instead.
 
 use crate::audio::resample_as_saved;
 use any_tts::{AudioSamples, DeviceSelection};
@@ -17,8 +17,6 @@ use fs_err as fs;
 use std::io::Write;
 use tokenizers::Tokenizer;
 
-/// Fast enough to check every take, at the cost of some misheard words.
-pub const CHECK_MODEL: &str = "base.en";
 /// A voice's transcript is only written once and every take depends on it.
 pub const VOICE_TRANSCRIPTION_MODEL: &str = "medium.en";
 

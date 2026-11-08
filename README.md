@@ -3,8 +3,9 @@
 Narrates text in a cloned voice, entirely on your own machine, and plays the
 result on a Cast speaker. Speech runs on OmniVoice through a fork of
 [`any-tts`](https://github.com/tommymcc/any-tts). The only network access is
-downloading the models once (about 3.3 GB for speech, plus the Whisper models
-for checking) and talking to speakers on your LAN.
+downloading the models once (about 3.3 GB for speech, 2.6 GB of Parakeet for
+checking takes, and the Whisper models for voice samples) and talking to
+speakers on your LAN.
 
 ## Make an audiobook
 
@@ -51,7 +52,8 @@ from Project Gutenberg.
 
 5. **Narrate the book.** This narrates every chapter. To narrate only some, add
    their numbers from the list, such as `2 3 4`. If it stops, run the same command
-   again and it carries on where it left off.
+   again and it carries on where it left off. The first run downloads the model
+   that checks each take (about 2.6 GB).
 
    ```sh
    ./target/release/audio-berry book voices/me.wav book.epub output/my-book
@@ -74,6 +76,18 @@ chapters 1 to 13, since chapter 14 is Project Gutenberg's license.
 - An NVIDIA GPU, with `nvidia-smi` working. A 25-second clip peaked at about
   2.9 GB of VRAM on an 8 GB card. The CUDA build fails without a GPU. Build with
   `--no-default-features` for CPU only, which hasn't been tested with OmniVoice.
+- For the CUDA build, the CUDA 13 runtime, cuBLAS 13 and cuDNN 9 for CUDA 13,
+  which the checker needs to run on the GPU through ONNX Runtime. On Ubuntu,
+  from NVIDIA's CUDA repository, these are the `cuda-cudart-13-1`,
+  `libcublas-13-1` and `libcudnn9-cuda-13` packages. `book` and `retake` stop
+  with an error naming any that are missing, rather than check takes on the CPU.
+  The build puts ONNX Runtime's CUDA provider, `libonnxruntime_providers_cuda.so`,
+  beside the binary in `target/release`, and it has to stay there.
+
+  With the checker loaded, a `book` run of chapter 3 of `coral-island.epub`
+  (115 takes of up to 27.9 s) peaked at 6565 MiB of VRAM on an 8 GB card,
+  sampled every 0.2 s, and 2.7 GB of RAM. Checking a take took a median of
+  191 ms, and 318 ms for the first.
 - Or an Apple Silicon Mac, built with `--no-default-features --features metal`.
 
 ### Apple Silicon
@@ -82,6 +96,12 @@ Metal has been tested on one Mac with 32 GB of memory, narrating 62 seconds of
 audio from Alice. All 7 chunks passed their checks on the first take, and it took
 230 s including loading the model. Its peak memory footprint was 7.4 GB. A full
 chapter, retrying a failed take, `retake` and `play` haven't been tried on a Mac.
+That test ran before Parakeet checked takes, when Whisper `base.en` did.
+
+On a Mac, the checker runs on ONNX Runtime's CoreML provider, and stops with an
+error if that can't start rather than running on the CPU. This hasn't been built
+or run on a Mac. `parakeet-rs`, the crate it runs through, says CoreML runs
+Parakeet slower than the CPU, as the model's input shapes vary.
 
 The `Model loaded` line says which device it's using, which should be `metal:0`.
 On Metal the model runs at F32, with the audio decoder and voice encoder on the
@@ -209,7 +229,7 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ```
 
 7. **Add allowances, if needed.** Once you've narrated some of a book, if
-   Whisper hears the speaker's accent the same wrong way again and again, such as
+   the checker hears the speaker's accent the same wrong way again and again, such as
    "in" as "and", `mishearings` lists the candidates and an `.allowances` file
    beside the sample lets those takes pass. See [Allowances](#allowances).
 
@@ -318,12 +338,25 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
 - **Background noise:** the quietest 5% of the take must be below -55 dB.
   Some voices need a different limit; see [Noise limit](#noise-limit).
 - **Length:** the duration must be plausible for the amount of text.
-- **Accuracy:** Whisper, running on candle like OmniVoice, transcribes the take
-  locally and compares it with the text. The models download on first use:
-  `base.en` (290 MB) for checks and `medium.en` (3 GB) for voice samples.
-  Whisper mishears some correct speech, so treat a flag as a reason to listen,
-  not as proof of a mistake. If it mishears a speaker's accent the same way
-  again and again, see [Allowances](#allowances).
+- **Accuracy:** the checker, NVIDIA's Parakeet TDT 0.6b v3 running on ONNX
+  Runtime, transcribes the take locally and compares it with the text. It
+  downloads on first use from the `parakeet-tdt-0.6b-v3` folder of
+  [`altunenes/parakeet-rs`](https://huggingface.co/altunenes/parakeet-rs)
+  (2.6 GB). Voice samples are still transcribed by Whisper `medium.en` (3 GB),
+  running on candle like OmniVoice, and `sections` uses Whisper `base.en`
+  (290 MB). The checker mishears some correct speech, so treat a flag as a
+  reason to listen, not as proof of a mistake. If it mishears a speaker's
+  accent the same way again and again, see [Allowances](#allowances).
+
+  Numbers match however they're written, so the book's "1066" matches
+  "ten sixty-six" and "250" matches "two hundred and fifty", since Parakeet
+  writes some numbers in words and some in digits.
+
+  Until Parakeet, Whisper `base.en` checked takes. Its transcripts in an older
+  output directory are kept, and `report.tsv` judges them as before, so nothing
+  is rendered again. Each chunk's check file records the checker that heard it,
+  shown in the `checker` column of `report.tsv`, which is empty for a take
+  heard by Whisper.
 
 If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
@@ -459,7 +492,7 @@ rendered with a limit that wasn't saved. If it was, give that limit once:
 
 ## Allowances
 
-Whisper mishears some speakers' accents the same way again and again. If it
+The checker mishears some speakers' accents the same way again and again. If it
 hears a speaker's "in" as "and", good takes fail the word check, get rendered
 again and end up marked `CHECK`. Allowances tell the check which words a voice
 may be heard saying as others. They go in a file beside the voice sample, named
@@ -467,7 +500,7 @@ like its `.txt` but ending `.allowances`, so `voices/dad.wav` has
 `voices/dad.allowances`:
 
 ```text
-# Dad's accent: the book's word = what Whisper hears
+# Dad's accent: the book's word = what the checker hears
 in = and
 at = had
 ```
@@ -521,6 +554,12 @@ Moby-Dick render, most lines were names and old or British spellings, which
 aren't the speaker's own. Copy only what is, such as a word other voices are
 heard saying correctly.
 
+The Moby-Dick list above came from Whisper `base.en`, which checked takes before
+Parakeet. Another model mishears differently, so an allowance written for
+Whisper may no longer be needed. `mishearings` counts every kept take's
+transcript, whichever checker heard it; the `checker` column of `report.tsv`
+says which one did.
+
 Be careful with common words. `in = and` also passes a take that really says
 "and" where the book says "in", so every allowance hides some real mistakes.
 Allow only what you've heard the speaker say right.
@@ -570,7 +609,7 @@ the text as it was sent to the model in `text/`, and its saved settings in
 Narrating chapter 3 of `aliceDynamic.epub` (30 chunks, 536.8 s of audio) in a new
 output directory, on an RTX 3070 Laptop GPU and a Ryzen 9 5900HS. Each build ran 3
 times, taking turns. The times cover the whole command, including loading the model,
-checking every take with Whisper and building the M4B.
+checking every take with Whisper `base.en`, the checker then, and building the M4B.
 
 | Build | Median | Range | Realtime |
 |---|---|---|---|

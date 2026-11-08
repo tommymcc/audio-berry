@@ -4,8 +4,9 @@
 #   scripts/metal_check.sh <voice-sample>
 #
 # Everything goes in a new folder under output/: the report, the audio to listen
-# to, and the book it downloads. A voice sample with no .txt beside it also
-# downloads the 3 GB transcription model.
+# to, and the book it downloads. The first run downloads the 2.6 GB model that
+# checks takes, and a voice sample with no .txt beside it also downloads the
+# 3 GB transcription model.
 set -u
 
 if [ $# -ne 1 ] || [ ! -f "$1" ]; then

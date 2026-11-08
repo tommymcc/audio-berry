@@ -1,6 +1,7 @@
 //! An output directory: one narration of one book, in one voice, with one set
 //! of render settings. Owns chunk numbering, the cache key and the files.
 
+use crate::checker;
 use crate::narrator::PRECISION_VAR;
 use crate::quality::{DEFAULT_NOISE_LIMIT_DB, valid_noise_limit};
 use crate::accuracy::contains_phrase;
@@ -79,6 +80,31 @@ pub struct Check {
     /// Seeds tried so far, so the next retake tries new ones.
     pub takes: u64,
     pub transcript: String,
+    /// The model that heard the transcript, or `None` for a check file written
+    /// before it was recorded, when Whisper heard every take.
+    pub checker: Option<String>,
+}
+
+impl Check {
+    /// The check file's contents: the takes tried, the transcript, and the
+    /// checker if known, a line each.
+    fn to_saved(&self) -> String {
+        let Check { takes, transcript, checker } = self;
+        match checker {
+            Some(checker) => format!("{takes}\n{transcript}\n{checker}"),
+            None => format!("{takes}\n{transcript}"),
+        }
+    }
+
+    /// Reads what `to_saved` wrote, or a check file from before the checker was
+    /// recorded, which has only the first two lines.
+    fn from_saved(text: &str) -> Result<Check> {
+        let mut lines = text.splitn(3, '\n');
+        let (Some(takes), Some(transcript)) = (lines.next(), lines.next()) else {
+            bail!("malformed chunk check file");
+        };
+        Ok(Check { takes: takes.parse()?, transcript: transcript.to_string(), checker: lines.next().map(String::from) })
+    }
 }
 
 fn read_manifest(out: &Path) -> Result<Option<Manifest>> {
@@ -682,12 +708,14 @@ impl NarrationStore {
         incomplete.len()
     }
 
-    /// Saves a chunk's audio and check file, replacing the audio in one step.
+    /// Saves a chunk's audio and check file, replacing the audio in one step. The
+    /// check file records the checker in use, which heard `transcript`.
     pub fn store(&self, chunk: &Chunk, audio: &AudioSamples, transcript: &str, takes: u64) -> Result<()> {
         self.save_manifest()?;
         let path = self.audio_path(chunk);
         let transcript = transcript.replace(['\n', '\t'], " ");
-        fs::write(path.with_extension("check"), format!("{takes}\n{transcript}"))?;
+        let check = Check { takes, transcript, checker: Some(checker::MODEL.to_string()) };
+        fs::write(path.with_extension("check"), check.to_saved())?;
         let temporary = path.with_extension("tmp");
         audio.save_wav(&temporary).wrap_err_with(|| format!("couldn't save {}", temporary.display()))?;
         fs::rename(&temporary, path)?;
@@ -696,17 +724,16 @@ impl NarrationStore {
 
     /// Reads the stored check for a chunk that has audio.
     pub fn check(&self, chunk: &Chunk) -> Result<Check> {
-        let sidecar = fs::read_to_string(self.audio_path(chunk).with_extension("check"))?;
-        let (takes, transcript) = sidecar.split_once('\n').ok_or_else(|| eyre!("malformed chunk check file"))?;
-        Ok(Check { takes: takes.parse()?, transcript: transcript.to_string() })
+        Check::from_saved(&fs::read_to_string(self.audio_path(chunk).with_extension("check"))?)
     }
 
-    /// Records more tried seeds without changing the audio.
+    /// Records more tried seeds without changing the audio, its transcript or
+    /// the checker that heard it.
     pub fn record_tried(&self, chunk: &Chunk, takes: u64) -> Result<()> {
-        let transcript = self.check(chunk)?.transcript;
+        let check = Check { takes, ..self.check(chunk)? };
         let path = self.audio_path(chunk).with_extension("check");
         let temporary = path.with_extension("check.tmp");
-        fs::write(&temporary, format!("{takes}\n{transcript}"))?;
+        fs::write(&temporary, check.to_saved())?;
         fs::rename(&temporary, path)?;
         Ok(())
     }
@@ -1295,15 +1322,31 @@ mod tests {
         assert_eq!(saved_lines(&dir), ["noise_limit_db=-55", "takes=best-of-3"]);
     }
 
+    /// A check saying `takes` and `transcript`, heard by the checker in use now.
+    fn checked(takes: u64, transcript: &str) -> Check {
+        Check { takes, transcript: transcript.into(), checker: Some(checker::MODEL.into()) }
+    }
+
     #[test]
-    fn a_stored_take_can_be_read_back() {
+    fn a_stored_take_can_be_read_back_with_the_checker_that_heard_it() {
         let dir = TempDir::new("store-roundtrip");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         assert!(!store.has_audio(chunk));
         store.store(chunk, &tone(), "heard\tthis\nline", 2).unwrap();
         assert!(store.has_audio(chunk));
-        assert_eq!(store.check(chunk).unwrap(), Check { takes: 2, transcript: "heard this line".into() });
+        assert_eq!(store.check(chunk).unwrap(), checked(2, "heard this line"));
+    }
+
+    #[test]
+    fn a_check_file_from_before_checkers_were_recorded_reads_with_none() {
+        let dir = TempDir::new("store-old-check");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        store.store(chunk, &tone(), "heard", 1).unwrap();
+        fs::write(store.audio_path(chunk).with_extension("check"), "4\nheard by whisper").unwrap();
+        let check = store.check(chunk).unwrap();
+        assert_eq!(check, Check { takes: 4, transcript: "heard by whisper".into(), checker: None });
     }
 
     #[test]
@@ -1312,7 +1355,7 @@ mod tests {
         render_at(&dir, Some(0.9));
         let store = NarrationStore::read(dir.path(), "A Book", |_| chapters(&[&["Hello there."]])).unwrap();
         assert_eq!(store.speed(), 0.9);
-        assert_eq!(store.check(&store.chunks()[0]).unwrap(), Check { takes: 1, transcript: "a".into() });
+        assert_eq!(store.check(&store.chunks()[0]).unwrap(), checked(1, "a"));
         assert!(NarrationStore::read(dir.path(), "Another Book", |_| chapters(&[&["Hello there."]])).is_err());
     }
 
@@ -1341,7 +1384,19 @@ mod tests {
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), "heard", 1).unwrap();
         store.record_tried(chunk, 7).unwrap();
-        assert_eq!(store.check(chunk).unwrap(), Check { takes: 7, transcript: "heard".into() });
+        assert_eq!(store.check(chunk).unwrap(), checked(7, "heard"));
+    }
+
+    #[test]
+    fn recording_tried_seeds_keeps_an_old_check_files_unrecorded_checker() {
+        let dir = TempDir::new("store-tried-old");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        store.store(chunk, &tone(), "heard", 1).unwrap();
+        let path = store.audio_path(chunk).with_extension("check");
+        fs::write(&path, "4\nheard by whisper").unwrap();
+        store.record_tried(chunk, 9).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "9\nheard by whisper");
     }
 
     #[test]
@@ -1351,12 +1406,13 @@ mod tests {
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), "heard", 3).unwrap();
         store.replace(chunk, &AudioSamples::new(vec![0.2; 480], 24_000), "new", 5).unwrap();
-        assert_eq!(store.check(chunk).unwrap(), Check { takes: 5, transcript: "new".into() });
+        assert_eq!(store.check(chunk).unwrap(), checked(5, "new"));
         assert_eq!(AudioSamples::from_wav_file(store.audio_path(chunk)).unwrap().samples.len(), 480);
         let name = store.audio_path(chunk).file_stem().unwrap().to_str().unwrap().to_string();
         let old = dir.join("replaced").join(format!("{name}-3.wav"));
         assert_eq!(AudioSamples::from_wav_file(&old).unwrap().samples.len(), 240);
-        assert_eq!(fs::read_to_string(old.with_extension("check")).unwrap(), "3\nheard");
+        let old_check = fs::read_to_string(old.with_extension("check")).unwrap();
+        assert_eq!(old_check, format!("3\nheard\n{}", checker::MODEL));
     }
 
     #[test]
@@ -1365,7 +1421,7 @@ mod tests {
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         store.replace(chunk, &tone(), "heard", 2).unwrap();
-        assert_eq!(store.check(chunk).unwrap(), Check { takes: 2, transcript: "heard".into() });
+        assert_eq!(store.check(chunk).unwrap(), checked(2, "heard"));
         assert!(!dir.join("replaced").exists());
     }
 

@@ -6,8 +6,8 @@ license = "MIT"
 
 [features]
 default = ["cuda"]
-cuda = ["any-tts/cuda"]
-metal = ["any-tts/metal"]
+cuda = ["any-tts/cuda", "parakeet-rs/cuda"]
+metal = ["any-tts/metal", "parakeet-rs/coreml"]
 
 [dependencies]
 # The integration branch of the fork, which has native OmniVoice voice cloning.
@@ -24,6 +24,8 @@ flate2 = "1"
 fs-err = "3.3.2"
 indicatif = "0.18"
 mdns-sd = "0.21"
+# Parakeet TDT, which checks takes, on ONNX Runtime.
+parakeet-rs = "0.4.4"
 # The version deep_filter uses, for passing audio to it.
 ndarray = "0.15"
 # Already built for deep_filter; the autocorrelation in pitch tracking.
