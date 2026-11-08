@@ -141,11 +141,12 @@ struct Spanned {
 /// Lowercases into words, with commas between thousands dropped and numbers
 /// under 100 spelled out, as `numbers` writes them.
 fn words(text: &str) -> Vec<String> {
-    plain(spanned_words(text))
+    split(spanned_words(text)).0
 }
 
-fn plain(words: Vec<Spanned>) -> Vec<String> {
-    words.into_iter().map(|spanned| spanned.word).collect()
+/// The words, and the bytes each came from.
+fn split(words: Vec<Spanned>) -> (Vec<String>, Vec<Range<usize>>) {
+    words.into_iter().map(|spanned| (spanned.word, spanned.bytes)).unzip()
 }
 
 /// The words of `text` as `words` gives them, each with its bytes in `text`.
@@ -190,7 +191,7 @@ fn spanned_words(text: &str) -> Vec<Spanned> {
 /// and the other has in digits put in digits.
 fn words_of_both(first: &str, second: &str) -> (Vec<String>, Vec<String>) {
     let (first, second) = spanned_words_of_both(first, second);
-    (plain(first), plain(second))
+    (split(first).0, split(second).0)
 }
 
 /// `words_of_both`, with each word's bytes in its text.
@@ -202,9 +203,8 @@ fn spanned_words_of_both(first: &str, second: &str) -> (Vec<Spanned>, Vec<Spanne
 /// `words` with each number spelled out there, of 100 or more, that `other` has
 /// in digits, put in digits.
 fn in_digits(words: &[Spanned], other: &[Spanned]) -> Vec<Spanned> {
-    let plain = |words: &[Spanned]| words.iter().map(|spanned| spanned.word.clone()).collect::<Vec<_>>();
     let mut index = 0;
-    numbers::match_digits(&plain(words), &plain(other))
+    numbers::match_digits(&split(words.to_vec()).0, &split(other.to_vec()).0)
         .into_iter()
         .map(|(word, count)| {
             let bytes = words[index].bytes.start..words[index + count - 1].bytes.end;
@@ -279,9 +279,6 @@ struct Run {
 
 impl<'a> Alignment<'a> {
     fn new(text: &str, transcript: &str, allowances: &'a Allowances) -> Alignment<'a> {
-        let split = |words: Vec<Spanned>| -> (Vec<String>, Vec<Range<usize>>) {
-            words.into_iter().map(|spanned| (spanned.word, spanned.bytes)).unzip()
-        };
         let (expected, heard) = aligned_words(text, transcript);
         let ((expected, expected_bytes), (heard, heard_bytes)) = (split(expected), split(heard));
         let mut table = vec![vec![0usize; heard.len() + 1]; expected.len() + 1];
