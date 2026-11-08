@@ -1,7 +1,7 @@
 //! Narrates a whole book, and retakes chosen chunks: renders checked takes,
 //! reports on them, then assembles the audio.
 
-use crate::accuracy::Allowances;
+use crate::accuracy::{Accuracy, Allowances};
 use crate::assemble::assemble;
 use crate::checker::Checker;
 use crate::checks::{Goal, Standard, Verdict};
@@ -76,6 +76,11 @@ fn pitch_range_note(standard: &Standard, verdict: &Verdict) -> String {
     }
 }
 
+/// The phrases heard in the wrong place, for the progress output.
+fn moved_note(accuracy: &Accuracy) -> String {
+    if accuracy.in_order() { String::new() } else { format!(", moved {}", accuracy.moved_note()) }
+}
+
 /// Prints each chapter's number, title and size.
 pub fn list_chapters(path: &Path) -> Result<()> {
     let book = read_book(path)?;
@@ -137,20 +142,22 @@ impl<'a> Recorder<'a> {
             let Verdict { quality, accuracy, .. } = &current.verdict;
             match goal {
                 Goal::Book if !current.verdict.good_enough() => progress.line(&format!(
-                    "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}",
+                    "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}{}",
                     take + 1,
                     quality.floor_db,
                     quality.seconds,
                     accuracy.recall,
                     accuracy.extra,
+                    moved_note(accuracy),
                 ))?,
                 Goal::Book => {}
                 Goal::Retake { .. } => {
                     progress.line(&format!(
-                        "  take {}: recall {:.2}, extra {:.2}, phrase heard {}, floor {:.0} dB{}",
+                        "  take {}: recall {:.2}, extra {:.2}{}, phrase heard {}, floor {:.0} dB{}",
                         take + 1,
                         accuracy.recall,
                         accuracy.extra,
+                        moved_note(accuracy),
                         current.verdict.heard(),
                         quality.floor_db,
                         pitch_range_note(standard, &current.verdict),
@@ -170,7 +177,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
     // New columns go last, so anything reading columns by position still works.
     let mut report = String::from(
         "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\t\
-         pitch_range_st\tchecker\n",
+         pitch_range_st\tchecker\tmoved\n",
     );
     let mut flagged = 0;
     for item in store.chunks().iter().filter(|item| store.has_audio(item)) {
@@ -184,7 +191,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
         flagged += usize::from(!pass);
         writeln!(
             report,
-            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}",
             book.chapters[item.chapter].title,
             item.number(),
             path.file_name().unwrap_or_default().to_string_lossy(),
@@ -200,6 +207,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
             check.transcript,
             verdict.pitch_range.map(|range| format!("{range:.1}")).unwrap_or_default(),
             check.checker.as_deref().unwrap_or_default(),
+            accuracy.moved_note(),
         )?;
     }
     fs::write(out.join("report.tsv"), report)?;
