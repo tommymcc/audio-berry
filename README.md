@@ -366,6 +366,23 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
   `report.tsv` judges each transcript by the same rules, so no audio is
   rendered again.
 
+- **Order:** no phrase of the book may be heard in the wrong place. The model
+  sometimes says a phrase early or late, such as "both on the land and in the
+  sea" before "the wonderful creatures they had seen" when the book has them the
+  other way round. Recall only loses the moved words, so a long chunk could pass
+  on accuracy alone. A take fails when 2 or more words in a row of the book are
+  heard in the same order but somewhere else, and `report.tsv` names each
+  [moved phrase](GLOSSARY.md) in its `moved` column, as its words were
+  compared: lowercase, with numbers spelled out. Of two phrases that swapped
+  places, the shorter is the one named. Words match as they do for accuracy,
+  through numbers and allowances.
+
+  A single word out of place isn't counted. On the 5,053 kept takes of three
+  books whose Whisper transcripts were stored, counting single words would have
+  flagged 76 chunks, and the 8 of those looked at were all false, mostly a
+  common word such as "and" missed in one place and heard in another. Two words
+  in a row flagged only one chunk, a real moved phrase.
+
 If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
 cached in `chunks/`, so rerunning the same command resumes an interrupted book.
