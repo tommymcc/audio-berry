@@ -32,13 +32,19 @@
 
 **Nearness:** how near a take's pitch range is to the target: the smaller of the two ratios between range and target, 1 when exact. It ranks in steps of 0.05, so takes in the same step are ranked by how they're heard. It only ranks takes that pass. Like the take policy, the target is saved in `narration.txt` and isn't a render setting.
 
-**Keep settings:** the noise limit, take policy and pitch range target: what decides which take of a chunk is kept, rather than how it sounds, so none of them is a render setting. Each one given replaces the one saved in `narration.txt`, and each one not given is the saved one, or its default in a new output directory. A run settles them before loading the voice, since the voice sample is judged against the noise limit.
+**Silence:** a stretch of a take whose 10 ms frames are all within 10 dB of its floor, measured in those frames and ignoring digital silence.
+
+**Mid-phrase pause:** a silence as long as the pause limit or longer between two words of a chunk's text with no punctuation between them, such as "the night in which I was ⏸ born". Quotation marks, apostrophes and a hyphen joining two words aren't punctuation here. The checker's word start times place each silence between two words heard, by its middle, and accuracy's alignment finds the words of the text they were heard for. A silence before the first word heard starts or after the last one ends is the take's start or end, not a pause. A take with one doesn't pass, and `report.tsv` names each in its `pauses` column as `was … born 0.72 s`.
+
+**Pause limit:** the shortest silence that counts as a mid-phrase pause, 0.6 seconds unless `--pause-limit` sets it, or `off`. Like the noise limit, it's saved in `narration.txt` and isn't a render setting. A take checked before word times were saved in its check file has its pauses unmeasured, and isn't failed for them.
+
+**Keep settings:** the noise limit, take policy, pitch range target and pause limit: what decides which take of a chunk is kept, rather than how it sounds, so none of them is a render setting. Each one given replaces the one saved in `narration.txt`, and each one not given is the saved one, or its default in a new output directory. A run settles them before loading the voice, since the voice sample is judged against the noise limit.
 
 **Voice sample:** the recording a narration's voice is cloned from, such as `voices/me.wav`, with what's said in it in a `.txt` file beside it. `clean` makes one from a noisy recording.
 
 **Checker:** the model that transcribes each take, so it can be compared with the text: Parakeet TDT 0.6b v3. Each chunk's check file records the checker that heard its transcript. A check file with no checker recorded holds a transcript heard by Whisper, which transcribes voice samples and the recordings `sections` looks through.
 
-**Transcript:** what a model heard said in some audio, as text. A take's transcript is the checker's, kept in the chunk's check file and shown in `report.tsv`; the checker also gives when each word was said.
+**Transcript:** what a model heard said in some audio, as text. A take's transcript is the checker's, kept in the chunk's check file and shown in `report.tsv`; the checker also gives when each word was said, which the check file keeps too, on a fourth line.
 
 **Section:** a stretch of a recording, from one pause to another, that `sections` suggests making into a voice sample.
 

@@ -255,8 +255,8 @@ audio-berry clean [OPTIONS] <recording> <start> <end> <output.wav>
 
 `audio-berry <command> --help` describes a command's arguments and options:
 `--speed <factor>` for `speak`, `book` and `audition`, `--seed <n>` for `speak`
-and `audition`, `--takes <n>` and `--pitch-range <semitones>` for `book` and
-`retake`, `--noise-limit <dB>` and `--precision <f32|f16|bf16>` for `speak`,
+and `audition`, `--takes <n>`, `--pitch-range <semitones>` and
+`--pause-limit <seconds|off>` for `book` and `retake`, `--noise-limit <dB>` and `--precision <f32|f16|bf16>` for `speak`,
 `book`, `retake` and `audition`, and `--reduction <dB>` for `sections` and
 `clean`. An environment variable can give `--noise-limit`
 (`AUDIO_BERRY_NOISE_LIMIT_DB`), `--seed` (`OMNIVOICE_SEED`) or `--precision`
@@ -391,6 +391,12 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
   two words, one of which the alignment pairs elsewhere, as a "the" can be,
   isn't found.
 
+- **Pauses:** no silence of 0.6 seconds or more may fall between two words the
+  book doesn't punctuate. The model sometimes stops in the middle of a phrase,
+  as in "the night in which I was ⏸ born". Listening to 9 such pauses, each of
+  0.64 s or more sounded wrong (6 of 6), and each of 0.51 s or less sounded
+  fine (3 of 3), whatever the words. See [Pauses](#pauses).
+
 If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
 cached in `chunks/`, so rerunning the same command resumes an interrupted book.
@@ -523,6 +529,48 @@ rendered with a limit that wasn't saved. If it was, give that limit once:
 ./target/release/audio-berry book voices/dad.wav book.epub output/book --noise-limit -50
 ```
 
+## Pauses
+
+A take fails when it has a [mid-phrase pause](GLOSSARY.md): a silence of at
+least the pause limit, 0.6 seconds by default, between two words of the book
+with no punctuation between them. Silence is measured in the audio, in 10 ms
+frames within 10 dB of the take's own floor, since the checker's word end times
+run on into the silence after a word. The checker's word start times only place
+each silence between two words heard, by its middle, and the alignment that
+measures accuracy finds the words of the book they were heard for. Commas,
+full stops, dashes, brackets and the like explain a pause; quotation marks,
+apostrophes and a hyphen joining two words don't. Punctuation beside a word the
+checker missed explains it too. Silence at the start and end of a take doesn't
+count.
+
+`report.tsv` names each pause in its `pauses` column, with the book's words
+either side and the silence's length, separated by ` | `:
+
+```text
+mother … when 0.97 s | clothes … and 0.93 s
+```
+
+Rejected `book` takes and every `retake` take name them too, as `paused was …
+born 0.72 s`. When the checker misheard the word before or after a pause, the
+nearest words it heard are named instead: "an admiral in", heard as "an
+admiring in", names `an … in`.
+
+On chapter 3 of `coral-island.epub` (23 chunks), the checker found 14 pauses
+in 13 chunks, the same 14 that forced alignment had found and none besides.
+Measuring a take's pauses took a median of 0.5 ms, beside the checker's 160 ms.
+
+`--pause-limit <seconds>`, from 0.3 to 5, changes the limit, and
+`--pause-limit off` stops checking. Like the noise limit, it's saved in
+`narration.txt`, giving it again replaces it, and changing it renders nothing
+again: only new takes and the `CHECK` flags in `report.tsv` are judged against
+the new value.
+
+The check file of each take saves when each word was heard, which places its
+pauses. A take checked before these were saved, or heard by Whisper, has none,
+so `report.tsv` shows `unmeasured` in its `pauses` column, and the take isn't
+failed for pauses. Its audio is kept as it is, and a `retake` of it measures
+only its new takes. With the limit off, the column is empty.
+
 ## Allowances
 
 The checker mishears some speakers' accents the same way again and again. If it
@@ -601,8 +649,8 @@ Allow only what you've heard the speaker say right.
 An output directory holds one book in one voice, with one speed and model
 precision (`--precision`). It saves them in `narration.txt` with its first take, and
 later runs reuse the saved speed, so you don't have to repeat `--speed`. It also
-saves the [noise limit](#noise-limit), `--takes` and `--pitch-range`, which can
-change at any time. A run with a different book, voice, speed or precision stops
+saves the [noise limit](#noise-limit), `--takes`, `--pitch-range` and
+`--pause-limit`, which can change at any time. A run with a different book, voice, speed or precision stops
 with an error rather than rendering everything again, so use a new directory for
 those. Correcting a voice's
 `.txt` file counts as a different voice, but changing its [allowances](#allowances)
