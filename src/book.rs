@@ -8,7 +8,6 @@ use crate::checks::{Goal, Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::estimate::{Pace, split_above_seconds, warn_if_split};
 use crate::narrator::Narrator;
-use crate::pauses::PauseLimit;
 use crate::progress::Progress;
 use crate::store::{self, Chunk, KeepSettings, NarrationStore, RenderSettings, fnv};
 use crate::takes::{Kept, TakePolicy};
@@ -82,19 +81,12 @@ fn moved_suffix(accuracy: &Accuracy) -> String {
     if accuracy.in_order() { String::new() } else { format!(", moved {}", accuracy.moved_list()) }
 }
 
-/// The pauses in the middle of a phrase, for the progress output.
-fn pauses_suffix(verdict: &Verdict) -> String {
-    if verdict.evenly_paced() { String::new() } else { format!(", paused {}", verdict.pause_list()) }
-}
-
-/// The pauses in the middle of a phrase, as `report.tsv` shows them: empty with
-/// the pause limit off or none found, and `unmeasured` for a take whose check
-/// file has no word timings to place silences by.
-fn pauses_column(limit: PauseLimit, verdict: &Verdict) -> String {
-    match (limit, &verdict.pauses) {
-        (PauseLimit::Off, _) => String::new(),
-        (PauseLimit::Seconds(_), None) => "unmeasured".into(),
-        (PauseLimit::Seconds(_), Some(_)) => verdict.pause_list(),
+/// The mid-phrase pauses found, for the progress output.
+fn mid_phrase_pauses_suffix(verdict: &Verdict) -> String {
+    if verdict.no_mid_phrase_pause() {
+        String::new()
+    } else {
+        format!(", paused {}", verdict.mid_phrase_pause_list())
     }
 }
 
@@ -139,7 +131,7 @@ impl<'a> Recorder<'a> {
         let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
         let audio = self.narrator.say(self.voice, &item.text, self.speed, Some(base_seed + take))?;
         let heard = self.checker.transcribe(&audio)?;
-        let verdict = self.standard.judge(goal, &item.text, &audio, &heard.text, Some(&heard.words));
+        let verdict = self.standard.judge(goal, &item.text, &audio, &heard.heard());
         Ok(Take { audio, heard, verdict })
     }
 
@@ -167,7 +159,7 @@ impl<'a> Recorder<'a> {
                     accuracy.recall,
                     accuracy.extra,
                     moved_suffix(accuracy),
-                    pauses_suffix(&current.verdict),
+                    mid_phrase_pauses_suffix(&current.verdict),
                 ))?,
                 Goal::Book => {}
                 Goal::Retake { .. } => {
@@ -177,7 +169,7 @@ impl<'a> Recorder<'a> {
                         accuracy.recall,
                         accuracy.extra,
                         moved_suffix(accuracy),
-                        pauses_suffix(&current.verdict),
+                        mid_phrase_pauses_suffix(&current.verdict),
                         current.verdict.heard(),
                         quality.floor_db,
                         pitch_range_note(standard, &current.verdict),
@@ -204,7 +196,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
         let path = store.audio_path(item);
         let audio = AudioSamples::from_wav_file(&path)?;
         let check = store.check(item)?;
-        let verdict = standard.judge(&Goal::Book, &item.text, &audio, &check.transcript, check.words.as_deref());
+        let verdict = standard.judge(&Goal::Book, &item.text, &audio, &check.heard());
         let pass = verdict.good_enough();
         let Verdict { quality, accuracy, .. } = &verdict;
         let characters = item.text.chars().count();
@@ -228,7 +220,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
             verdict.pitch_range.map(|range| format!("{range:.1}")).unwrap_or_default(),
             check.checker.as_deref().unwrap_or_default(),
             accuracy.moved_list(),
-            pauses_column(standard.pause_limit(), &verdict),
+            verdict.pauses_column(),
         )?;
     }
     fs::write(out.join("report.tsv"), report)?;
@@ -358,7 +350,7 @@ pub fn retake(
         let (first_take, current) = if store.has_audio(item) {
             let check = store.check(item)?;
             let audio = AudioSamples::from_wav_file(&path)?;
-            let verdict = standard.judge(&goal, &item.text, &audio, &check.transcript, check.words.as_deref());
+            let verdict = standard.judge(&goal, &item.text, &audio, &check.heard());
             (check.takes, Some(verdict.judged()))
         } else {
             (0, None)

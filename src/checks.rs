@@ -1,8 +1,8 @@
 //! Decides whether a take is good enough for its goal, and which of a chunk's
 //! takes is best, since the model varies between seeds.
 
-use crate::checker::Word;
-use crate::pauses::{self, Pause, PauseLimit};
+use crate::checker::Heard;
+use crate::pauses::{MidPhrasePauses, PauseLimit};
 use crate::pitch;
 use crate::quality::{self, Quality};
 use crate::store::KeepRules;
@@ -54,10 +54,8 @@ pub struct Verdict {
     /// How near the pitch range is to the target, from `pitch::nearness`, or
     /// 0 with no target or no range.
     nearness: f32,
-    /// Each pause in the middle of a phrase as long as the pause limit or
-    /// longer, or `None` when the pause limit is off or the take has no word
-    /// timings to place silences by.
-    pub pauses: Option<Vec<Pause>>,
+    /// Each mid-phrase pause, or that none were looked for.
+    pub mid_phrase_pauses: MidPhrasePauses,
     plausible: bool,
     clean: bool,
     aim: Aim,
@@ -82,26 +80,15 @@ impl Standard {
         Standard { speed, noise_limit_db, pitch_range_target, pause_limit, allowances }
     }
 
-    /// The shortest pause in the middle of a phrase that fails a take, or off.
-    pub fn pause_limit(&self) -> PauseLimit {
-        self.pause_limit
-    }
-
     /// The pitch range target takes are ranked by nearness to, if any.
     pub fn pitch_range_target(&self) -> Option<f32> {
         self.pitch_range_target
     }
 
-    /// Measures a take of `text` for `goal`, given what was heard in it, and the
-    /// words heard with their times if known, which place its pauses.
-    pub fn judge(
-        &self,
-        goal: &Goal,
-        text: &str,
-        audio: &AudioSamples,
-        transcript: &str,
-        words: Option<&[Word]>,
-    ) -> Verdict {
+    /// Measures a take of `text` for `goal`, given what was heard in it. The
+    /// words heard with their times, if known, place its mid-phrase pauses.
+    pub fn judge(&self, goal: &Goal, text: &str, audio: &AudioSamples, heard: &Heard) -> Verdict {
+        let Heard { transcript, words } = *heard;
         let quality = quality::measure(&audio.samples, audio.sample_rate);
         let characters = text.chars().count();
         let target = self.pitch_range_target;
@@ -116,14 +103,11 @@ impl Standard {
                 Aim::Retake { heard: phrases.iter().all(|phrase| self.heard(phrase, transcript)) }
             }
         };
-        let pauses = match (self.pause_limit.seconds(), words) {
-            (Some(limit), Some(words)) => Some(pauses::mid_phrase(text, words, audio, limit, &self.allowances)),
-            _ => None,
-        };
+        let mid_phrase_pauses = MidPhrasePauses::check(self.pause_limit, text, words, audio, &self.allowances);
         Verdict {
             pitch_range,
             nearness,
-            pauses,
+            mid_phrase_pauses,
             plausible: quality::plausible_length_at(characters, quality.seconds, self.speed),
             clean: quality.clean(self.noise_limit_db),
             accuracy: accuracy::compare(text, transcript, &self.allowances),
@@ -150,7 +134,7 @@ impl Verdict {
         let passes = match self.aim {
             Aim::Book => self.passes(),
             Aim::Retake { heard } => {
-                self.plausible && self.clean && heard && self.accuracy.in_order() && self.evenly_paced()
+                self.plausible && self.clean && heard && self.accuracy.in_order() && self.no_mid_phrase_pause()
             }
         };
         Judged { passes, rank: self.rank() }
@@ -178,23 +162,30 @@ impl Verdict {
     /// Whether the take is a plausible length, clean and heard well enough, with
     /// no phrase in the wrong place and no pause in the middle of a phrase.
     fn passes(&self) -> bool {
-        self.plausible && self.clean && self.accuracy.acceptable() && self.evenly_paced()
+        self.plausible && self.clean && self.accuracy.acceptable() && self.no_mid_phrase_pause()
     }
 
     /// Whether the take passes and every word was heard, with nothing more.
     fn flawless(&self) -> bool {
-        self.plausible && self.clean && self.accuracy.exact() && self.evenly_paced()
+        self.plausible && self.clean && self.accuracy.exact() && self.no_mid_phrase_pause()
     }
 
-    /// Whether no pause in the middle of a phrase was found. A take whose pauses
-    /// weren't measured has none found.
-    pub fn evenly_paced(&self) -> bool {
-        self.pauses.as_ref().is_none_or(Vec::is_empty)
+    /// Whether no mid-phrase pause was found: true too when they weren't
+    /// measured, as for a take with no word times, or with the pause limit off.
+    pub fn no_mid_phrase_pause(&self) -> bool {
+        self.mid_phrase_pauses.none_found()
     }
 
-    /// The pauses in the middle of a phrase, joined by ` | `, or nothing.
-    pub fn pause_list(&self) -> String {
-        self.pauses.as_deref().map(pauses::list).unwrap_or_default()
+    /// The mid-phrase pauses found, joined by ` | `, or nothing.
+    pub fn mid_phrase_pause_list(&self) -> String {
+        self.mid_phrase_pauses.list()
+    }
+
+    /// The `pauses` column of `report.tsv`: the mid-phrase pauses found,
+    /// `unmeasured` for a take with no word times, or nothing with the pause
+    /// limit off.
+    pub fn pauses_column(&self) -> String {
+        self.mid_phrase_pauses.column()
     }
 
     /// How the take ranks against others of the same chunk. Nearness to the
@@ -246,6 +237,18 @@ fn in_steps(nearness: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checker::Word;
+
+    /// `transcript` heard, with no word times, as in a check file from before
+    /// they were saved.
+    fn untimed(transcript: &str) -> Heard<'_> {
+        Heard { transcript, words: None }
+    }
+
+    /// `PAUSED_TEXT` heard as `words`.
+    fn timed(words: &[Word]) -> Heard<'_> {
+        Heard { transcript: PAUSED_TEXT, words: Some(words) }
+    }
 
     fn silence(seconds: f32) -> AudioSamples {
         AudioSamples::new(vec![0.0; (seconds * 24_000.0) as usize], 24_000)
@@ -266,7 +269,7 @@ mod tests {
     #[test]
     fn a_take_of_the_right_length_heard_right_passes() {
         let standard = standard(1.0);
-        let verdict = standard.judge(&Goal::Book, TEXT, &silence(4.0), TEXT, None);
+        let verdict = standard.judge(&Goal::Book, TEXT, &silence(4.0), &untimed(TEXT));
         assert!(verdict.passes());
         let Rank { plausible, clean, heard, nearness, score } = verdict.rank();
         assert_eq!((plausible, clean, heard, nearness, score), (true, true, true, 0.0, 1.0));
@@ -277,17 +280,17 @@ mod tests {
     fn a_take_far_too_long_for_its_speed_fails() {
         // About 70 characters plausibly takes 2.3 to 11.8 seconds at normal speed.
         let normal = standard(1.0);
-        assert!(!normal.judge(&Goal::Book, TEXT, &silence(20.0), TEXT, None).passes());
+        assert!(!normal.judge(&Goal::Book, TEXT, &silence(20.0), &untimed(TEXT)).passes());
         let slow = standard(0.5);
-        assert!(slow.judge(&Goal::Book, TEXT, &silence(20.0), TEXT, None).passes());
+        assert!(slow.judge(&Goal::Book, TEXT, &silence(20.0), &untimed(TEXT)).passes());
     }
 
     #[test]
     fn a_take_heard_wrong_fails_but_ranks_by_accuracy() {
         let standard = standard(1.0);
-        let wrong = standard.judge(&Goal::Book, TEXT, &silence(4.0), "The quick brown cat.", None);
+        let wrong = standard.judge(&Goal::Book, TEXT, &silence(4.0), &untimed("The quick brown cat."));
         assert!(!wrong.passes());
-        assert!(wrong.rank() < standard.judge(&Goal::Book, TEXT, &silence(4.0), TEXT, None).rank());
+        assert!(wrong.rank() < standard.judge(&Goal::Book, TEXT, &silence(4.0), &untimed(TEXT)).rank());
     }
 
     /// A take of a plausible length, heard with this recall and extra words.
@@ -299,7 +302,7 @@ mod tests {
             accuracy,
             pitch_range: None,
             nearness: 0.0,
-            pauses: None,
+            mid_phrase_pauses: MidPhrasePauses::Off,
             plausible: true,
             clean,
             aim: Aim::Book,
@@ -363,9 +366,9 @@ mod tests {
     fn a_take_is_measured_only_against_a_target() {
         let hum = (0..96_000).map(|i| (i as f32 * std::f32::consts::TAU * 120.0 / 24_000.0).sin() * 0.3).collect();
         let audio = AudioSamples::new(hum, 24_000);
-        assert_eq!(standard(1.0).judge(&Goal::Book, TEXT, &audio, TEXT, None).pitch_range, None);
+        assert_eq!(standard(1.0).judge(&Goal::Book, TEXT, &audio, &untimed(TEXT)).pitch_range, None);
         let targeted = Standard { pitch_range_target: Some(12.4), ..standard(1.0) };
-        let verdict = targeted.judge(&Goal::Book, TEXT, &audio, TEXT, None);
+        let verdict = targeted.judge(&Goal::Book, TEXT, &audio, &untimed(TEXT));
         let range = verdict.pitch_range.unwrap();
         assert!(range < 0.5, "a steady hum is flat: {range}");
         assert_eq!(verdict.rank().nearness, in_steps(pitch::nearness(range, 12.4)));
@@ -426,7 +429,7 @@ mod tests {
         let standard = standard(1.0);
         let judge = |phrase: &str, transcript: &str| {
             let phrases = [phrase.to_string()];
-            standard.judge(&Goal::Retake { phrases: &phrases }, &text, &silence(5.0), transcript, None)
+            standard.judge(&Goal::Retake { phrases: &phrases }, &text, &silence(5.0), &untimed(transcript))
         };
         // Two words missed and two added: recall 0.93 and extra 0.07, acceptable.
         let acceptable = text.replacen("quick brown", "slow red", 1);
@@ -447,8 +450,8 @@ mod tests {
         let standard = standard(1.0);
         let phrases = ["lazy dog".to_string()];
         let retake = Goal::Retake { phrases: &phrases };
-        let heard = standard.judge(&retake, TEXT, &silence(4.0), "The quick brown fox jumps over the lazy dog.", None);
-        let missed = standard.judge(&retake, TEXT, &silence(4.0), &TEXT.replace("lazy", "hazy"), None);
+        let heard = standard.judge(&retake, TEXT, &silence(4.0), &untimed("The quick brown fox jumps over the lazy dog."));
+        let missed = standard.judge(&retake, TEXT, &silence(4.0), &untimed(&TEXT.replace("lazy", "hazy")));
         assert!(heard.heard() && !missed.heard());
         assert!(missed.accuracy.score() > heard.accuracy.score());
         assert!(heard.judged() > missed.judged());
@@ -459,15 +462,15 @@ mod tests {
         let standard = standard(1.0);
         let phrases = ["lazy dog".to_string()];
         let retake = Goal::Retake { phrases: &phrases };
-        assert!(standard.judge(&retake, TEXT, &silence(4.0), TEXT, None).good_enough());
+        assert!(standard.judge(&retake, TEXT, &silence(4.0), &untimed(TEXT)).good_enough());
         let missed_one = TEXT.replacen("again ", "", 1);
-        let passing = standard.judge(&retake, TEXT, &silence(4.0), &missed_one, None);
+        let passing = standard.judge(&retake, TEXT, &silence(4.0), &untimed(&missed_one));
         assert!(passing.passes() && !passing.good_enough(), "it passes for book, but isn't flawless");
-        assert!(standard.judge(&Goal::Book, TEXT, &silence(4.0), &missed_one, None).good_enough());
+        assert!(standard.judge(&Goal::Book, TEXT, &silence(4.0), &untimed(&missed_one)).good_enough());
         let other_phrase = ["lazy cat".to_string()];
-        let unheard = standard.judge(&Goal::Retake { phrases: &other_phrase }, TEXT, &silence(4.0), TEXT, None);
+        let unheard = standard.judge(&Goal::Retake { phrases: &other_phrase }, TEXT, &silence(4.0), &untimed(TEXT));
         assert!(!unheard.good_enough());
-        let no_phrases = standard.judge(&Goal::Retake { phrases: &[] }, TEXT, &silence(4.0), TEXT, None);
+        let no_phrases = standard.judge(&Goal::Retake { phrases: &[] }, TEXT, &silence(4.0), &untimed(TEXT));
         assert!(no_phrases.heard() && no_phrases.good_enough());
     }
 
@@ -481,7 +484,7 @@ mod tests {
     #[test]
     fn a_book_take_with_a_moved_phrase_fails_below_one_that_passes() {
         let standard = standard(1.0);
-        let moved = standard.judge(&Goal::Book, LONG_TEXT, &silence(10.0), MOVED, None);
+        let moved = standard.judge(&Goal::Book, LONG_TEXT, &silence(10.0), &untimed(MOVED));
         assert!(moved.accuracy.recall >= 0.92 && moved.accuracy.extra <= 0.12);
         assert!(!moved.passes() && !moved.good_enough());
         // Three words missed and four added, but in order: it passes, with a lower score.
@@ -489,7 +492,7 @@ mod tests {
             .replacen("the shore", "a beach", 1)
             .replacen("the boat", "a boat", 1)
             .replacen("dawn", "dawn today", 1);
-        let in_order = standard.judge(&Goal::Book, LONG_TEXT, &silence(10.0), &missed, None);
+        let in_order = standard.judge(&Goal::Book, LONG_TEXT, &silence(10.0), &untimed(&missed));
         assert!(in_order.passes() && in_order.accuracy.score() < moved.accuracy.score());
         assert!(in_order.judged() > moved.judged());
     }
@@ -498,10 +501,10 @@ mod tests {
     fn a_retake_with_a_moved_phrase_does_not_pass() {
         let standard = standard(1.0);
         let goal = Goal::Retake { phrases: &[] };
-        let moved = standard.judge(&goal, LONG_TEXT, &silence(10.0), MOVED, None);
+        let moved = standard.judge(&goal, LONG_TEXT, &silence(10.0), &untimed(MOVED));
         assert!(!moved.judged().passes && !moved.good_enough());
         let missed = LONG_TEXT.replacen("the shore", "a beach", 1);
-        let in_order = standard.judge(&goal, LONG_TEXT, &silence(10.0), &missed, None);
+        let in_order = standard.judge(&goal, LONG_TEXT, &silence(10.0), &untimed(&missed));
         assert!(in_order.judged().passes);
         assert!(in_order.judged() > moved.judged());
     }
@@ -529,12 +532,12 @@ mod tests {
     fn a_take_with_a_pause_in_the_middle_of_a_phrase_fails_below_one_without() {
         let standard = standard(1.0);
         let (audio, words) = take_pausing(0.7);
-        let paused = standard.judge(&Goal::Book, PAUSED_TEXT, &audio, PAUSED_TEXT, Some(&words));
-        assert_eq!(paused.pause_list(), "lazy … dog 0.70 s");
-        assert!(!paused.evenly_paced() && !paused.passes() && !paused.good_enough());
+        let paused = standard.judge(&Goal::Book, PAUSED_TEXT, &audio, &timed(&words));
+        assert_eq!(paused.mid_phrase_pause_list(), "lazy … dog 0.70 s");
+        assert!(!paused.no_mid_phrase_pause() && !paused.passes() && !paused.good_enough());
         let (audio, words) = take_pausing(0.5);
-        let even = standard.judge(&Goal::Book, PAUSED_TEXT, &audio, PAUSED_TEXT, Some(&words));
-        assert!(even.passes() && even.pauses == Some(Vec::new()));
+        let even = standard.judge(&Goal::Book, PAUSED_TEXT, &audio, &timed(&words));
+        assert!(even.passes() && even.mid_phrase_pauses == MidPhrasePauses::Measured(Vec::new()));
         assert!(even.judged() > paused.judged());
     }
 
@@ -543,20 +546,20 @@ mod tests {
         let standard = standard(1.0);
         let (audio, words) = take_pausing(0.7);
         let goal = Goal::Retake { phrases: &[] };
-        let verdict = standard.judge(&goal, PAUSED_TEXT, &audio, PAUSED_TEXT, Some(&words));
+        let verdict = standard.judge(&goal, PAUSED_TEXT, &audio, &timed(&words));
         assert!(!verdict.judged().passes && !verdict.good_enough());
     }
 
     #[test]
     fn pauses_are_not_measured_without_timings_or_with_the_limit_off() {
         let (audio, words) = take_pausing(0.7);
-        let unmeasured = standard(1.0).judge(&Goal::Book, PAUSED_TEXT, &audio, PAUSED_TEXT, None);
-        assert!(unmeasured.pauses.is_none() && unmeasured.passes());
+        let unmeasured = standard(1.0).judge(&Goal::Book, PAUSED_TEXT, &audio, &untimed(PAUSED_TEXT));
+        assert!(unmeasured.mid_phrase_pauses == MidPhrasePauses::Unmeasured && unmeasured.passes());
         let off = Standard { pause_limit: PauseLimit::Off, ..standard(1.0) };
-        let verdict = off.judge(&Goal::Book, PAUSED_TEXT, &audio, PAUSED_TEXT, Some(&words));
-        assert!(verdict.pauses.is_none() && verdict.passes());
+        let verdict = off.judge(&Goal::Book, PAUSED_TEXT, &audio, &timed(&words));
+        assert!(verdict.mid_phrase_pauses == MidPhrasePauses::Off && verdict.passes());
         let longer = Standard { pause_limit: PauseLimit::Seconds(0.8), ..standard(1.0) };
-        assert!(longer.judge(&Goal::Book, PAUSED_TEXT, &audio, PAUSED_TEXT, Some(&words)).passes());
+        assert!(longer.judge(&Goal::Book, PAUSED_TEXT, &audio, &timed(&words)).passes());
     }
 
     #[test]
@@ -569,10 +572,10 @@ mod tests {
     fn a_take_with_mishearings_the_voice_allows_passes() {
         let text = "In the morning, in the boat, in silence, he sat in the stern in the rain.";
         let heard = "And the morning, and the boat, and silence, he sat and the stern and the rain.";
-        assert!(!standard(1.0).judge(&Goal::Book, text, &silence(4.0), heard, None).passes());
+        assert!(!standard(1.0).judge(&Goal::Book, text, &silence(4.0), &untimed(heard)).passes());
         let allowances = Allowances::parse("in = and").unwrap();
         let accent = Standard { allowances, ..standard(1.0) };
-        let verdict = accent.judge(&Goal::Book, text, &silence(4.0), heard, None);
+        let verdict = accent.judge(&Goal::Book, text, &silence(4.0), &untimed(heard));
         assert!(verdict.passes());
         assert_eq!(verdict.accuracy.recall, 1.0);
     }

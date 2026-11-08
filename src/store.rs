@@ -1,7 +1,7 @@
 //! An output directory: one narration of one book, in one voice, with one set
 //! of render settings. Owns chunk numbering, the cache key and the files.
 
-use crate::checker::{self, Transcript, Word};
+use crate::checker::{self, Heard, Transcript, Word};
 use crate::narrator::PRECISION_VAR;
 use crate::quality::{DEFAULT_NOISE_LIMIT_DB, valid_noise_limit};
 use crate::accuracy::contains_phrase;
@@ -84,12 +84,31 @@ pub struct Check {
     /// The checker that heard the transcript, or `None` for a check file with
     /// only two lines, whose transcript Whisper heard.
     pub checker: Option<String>,
-    /// The words the checker heard, with when each was said, or `None` for a
-    /// check file of three lines or fewer, which has no timings.
-    pub words: Option<Vec<Word>>,
+    /// The words the checker heard, with when each was said, if saved.
+    pub words: WordTimes,
+}
+
+/// The fourth line of a check file: the words the checker heard, with when
+/// each was said.
+#[derive(Debug, PartialEq)]
+pub enum WordTimes {
+    /// A check file of three lines or fewer, saved before word times were.
+    Missing,
+    Timed(Vec<Word>),
+    /// A line that can't be read, kept as it is, and why.
+    Unreadable { line: String, problem: String },
 }
 
 impl Check {
+    /// What was heard, with the words' times if they could be read.
+    pub fn heard(&self) -> Heard<'_> {
+        let words = match &self.words {
+            WordTimes::Timed(words) => Some(words.as_slice()),
+            WordTimes::Missing | WordTimes::Unreadable { .. } => None,
+        };
+        Heard { transcript: &self.transcript, words }
+    }
+
     /// The check file's contents: the takes tried, the transcript, the checker
     /// if known and the words heard with their times if known, a line each.
     fn to_saved(&self) -> String {
@@ -98,16 +117,24 @@ impl Check {
         if let Some(checker) = checker {
             saved.push('\n');
             saved.push_str(checker);
-            if let Some(words) = words {
-                saved.push('\n');
-                saved.push_str(&words_to_saved(words));
+            match words {
+                WordTimes::Missing => {}
+                WordTimes::Timed(words) => {
+                    saved.push('\n');
+                    saved.push_str(&words_to_saved(words));
+                }
+                WordTimes::Unreadable { line, .. } => {
+                    saved.push('\n');
+                    saved.push_str(line);
+                }
             }
         }
         saved
     }
 
     /// Reads what `to_saved` wrote: two lines, three with the checker, or four
-    /// with the words heard.
+    /// with the words heard. A words line that can't be read is kept as
+    /// `WordTimes::Unreadable`, not an error, as the rest still can be.
     fn from_saved(text: &str) -> Result<Check> {
         let mut lines = text.splitn(4, '\n');
         let (Some(takes), Some(transcript)) = (lines.next(), lines.next()) else {
@@ -115,33 +142,44 @@ impl Check {
         };
         let takes = takes.parse().map_err(|_| eyre!("it starts {takes:?}, which isn't a count of takes"))?;
         let checker = lines.next().map(String::from);
-        let words = lines.next().map(words_from_saved).transpose()?;
+        let words = match lines.next() {
+            None => WordTimes::Missing,
+            Some(line) => match words_from_saved(line) {
+                Ok(words) => WordTimes::Timed(words),
+                Err(problem) => WordTimes::Unreadable { line: line.to_string(), problem },
+            },
+        };
         Ok(Check { takes, transcript: transcript.to_string(), checker, words })
     }
 }
 
 /// Words heard, as a check file saves them: `text@start-end` for each, in
-/// seconds, separated by spaces. Whitespace in a word's text is left out.
+/// seconds, separated by spaces. Whitespace in a word's text is left out, and
+/// times below 0 are saved as 0.
 fn words_to_saved(words: &[Word]) -> String {
+    let at_least_0 = |seconds: f32| if seconds > 0.0 { seconds } else { 0.0 };
     let saved: Vec<String> = words
         .iter()
         .map(|word| {
             let text: String = word.text.chars().filter(|c| !c.is_whitespace()).collect();
-            format!("{text}@{}-{}", word.start, word.end)
+            format!("{text}@{}-{}", at_least_0(word.start), at_least_0(word.end))
         })
         .collect();
     saved.join(" ")
 }
 
-/// Reads what `words_to_saved` wrote.
-fn words_from_saved(line: &str) -> Result<Vec<Word>> {
+/// Reads what `words_to_saved` wrote, also reading a start time of `-0`, or
+/// says which word it can't read.
+fn words_from_saved(line: &str) -> Result<Vec<Word>, String> {
     line.split_whitespace()
         .map(|saved| {
             let word = saved.rsplit_once('@').and_then(|(text, times)| {
-                let (start, end) = times.split_once('-')?;
+                // The hyphen between the times, after any sign on the start.
+                let between = times.get(1..)?.find('-')? + 1;
+                let (start, end) = (&times[..between], &times[between + 1..]);
                 Some(Word { text: text.to_string(), start: start.parse().ok()?, end: end.parse().ok()? })
             });
-            word.ok_or_else(|| eyre!("its words line has {saved:?}, which isn't a word heard with its times"))
+            word.ok_or_else(|| format!("{saved:?} isn't a word heard with its times"))
         })
         .collect()
 }
@@ -489,6 +527,16 @@ impl SettledDir {
     }
 }
 
+/// Says a check file's words line can't be read, so the take's mid-phrase
+/// pauses are unmeasured, and how to fix it.
+fn unreadable_words_warning(path: &Path, number: &str, problem: &str) -> String {
+    format!(
+        "Warning: the words line of {} can't be read ({problem}), so chunk {number}'s mid-phrase pauses are \
+         unmeasured. Retake chunk {number} to check it again, or delete that line, the fourth, to stop this warning.",
+        path.display()
+    )
+}
+
 /// Reads a chunk number such as `3.12` as its chapter and position.
 fn parse_number(target: &str) -> Option<(usize, usize)> {
     let (chapter, position) = target.split_once('.')?;
@@ -792,7 +840,7 @@ impl NarrationStore {
         let path = self.audio_path(chunk);
         let transcript = heard.text.replace(['\n', '\t'], " ");
         let check =
-            Check { takes, transcript, checker: Some(checker::MODEL.to_string()), words: Some(heard.words.clone()) };
+            Check { takes, transcript, checker: Some(checker::MODEL.to_string()), words: WordTimes::Timed(heard.words.clone()) };
         fs::write(path.with_extension("check"), check.to_saved())?;
         let temporary = path.with_extension("tmp");
         audio.save_wav(&temporary).wrap_err_with(|| format!("couldn't save {}", temporary.display()))?;
@@ -801,13 +849,20 @@ impl NarrationStore {
     }
 
     /// Reads the stored check for a chunk that has audio.
+    /// A words line that can't be read leaves the take's mid-phrase pauses
+    /// unmeasured, and prints a warning saying how to fix it.
     pub fn check(&self, chunk: &Chunk) -> Result<Check> {
         let path = self.audio_path(chunk).with_extension("check");
-        Check::from_saved(&fs::read_to_string(&path)?).wrap_err_with(|| format!("couldn't read {}", path.display()))
+        let check = Check::from_saved(&fs::read_to_string(&path)?)
+            .wrap_err_with(|| format!("couldn't read {}", path.display()))?;
+        if let WordTimes::Unreadable { problem, .. } = &check.words {
+            eprintln!("{}", unreadable_words_warning(&path, &chunk.number(), problem));
+        }
+        Ok(check)
     }
 
-    /// Records more tried seeds without changing the audio, its transcript or
-    /// the checker that heard it.
+    /// Records more tried seeds without changing the audio, its transcript, the
+    /// checker that heard it or the words heard with their times.
     pub fn record_tried(&self, chunk: &Chunk, takes: u64) -> Result<()> {
         let check = Check { takes, ..self.check(chunk)? };
         let path = self.audio_path(chunk).with_extension("check");
@@ -1434,7 +1489,12 @@ mod tests {
     /// A check saying `takes` and `transcript`, heard by `checker::MODEL`, with
     /// no words timed.
     fn checked(takes: u64, transcript: &str) -> Check {
-        Check { takes, transcript: transcript.into(), checker: Some(checker::MODEL.into()), words: Some(Vec::new()) }
+        Check {
+            takes,
+            transcript: transcript.into(),
+            checker: Some(checker::MODEL.into()),
+            words: WordTimes::Timed(Vec::new()),
+        }
     }
 
     fn timed() -> Vec<Word> {
@@ -1454,9 +1514,9 @@ mod tests {
             saved,
             format!("2\nChapter, wasn't 3,000@\n{}\nChapter@0.08-0.56 wasn't@0.64-0.96 3,000@@1.1-1.75", checker::MODEL)
         );
-        assert_eq!(store.check(chunk).unwrap().words, Some(timed()));
+        assert_eq!(store.check(chunk).unwrap().words, WordTimes::Timed(timed()));
         store.record_tried(chunk, 4).unwrap();
-        assert_eq!(store.check(chunk).unwrap().words, Some(timed()));
+        assert_eq!(store.check(chunk).unwrap().words, WordTimes::Timed(timed()));
     }
 
     #[test]
@@ -1468,21 +1528,48 @@ mod tests {
         let path = store.audio_path(chunk).with_extension("check");
         let three_lines = format!("4\nheard before timings\n{}", checker::MODEL);
         fs::write(&path, &three_lines).unwrap();
-        assert_eq!(store.check(chunk).unwrap(), Check { words: None, ..checked(4, "heard before timings") });
+        let check = store.check(chunk).unwrap();
+        assert_eq!(check, Check { words: WordTimes::Missing, ..checked(4, "heard before timings") });
+        assert_eq!(check.heard().words, None);
         store.record_tried(chunk, 9).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), three_lines.replacen('4', "9", 1));
     }
 
     #[test]
-    fn a_bad_words_line_is_an_error() {
+    fn a_bad_words_line_leaves_the_words_untimed_and_is_kept() {
         let dir = TempDir::new("store-bad-words");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), &heard("heard"), 1).unwrap();
         let path = store.audio_path(chunk).with_extension("check");
-        fs::write(&path, format!("1\nheard\n{}\nheard@soon", checker::MODEL)).unwrap();
-        let error = format!("{:#}", store.check(chunk).unwrap_err());
-        assert!(error.contains("its words line has \"heard@soon\""), "{error}");
+        let saved = format!("1\nheard\n{}\nheard@0.1-0.4 then@soon", checker::MODEL);
+        fs::write(&path, &saved).unwrap();
+        let check = store.check(chunk).unwrap();
+        let problem = "\"then@soon\" isn't a word heard with its times".to_string();
+        assert_eq!(check.words, WordTimes::Unreadable { line: "heard@0.1-0.4 then@soon".into(), problem });
+        assert_eq!((check.heard().transcript, check.heard().words), ("heard", None));
+        store.record_tried(chunk, 2).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved.replacen('1', "2", 1));
+    }
+
+    #[test]
+    fn the_warning_for_a_bad_words_line_says_how_to_fix_it() {
+        let warning = unreadable_words_warning(Path::new("out/chunks/abc.check"), "3.12", "\"x\" isn't a word");
+        assert_eq!(
+            warning,
+            "Warning: the words line of out/chunks/abc.check can't be read (\"x\" isn't a word), so chunk 3.12's \
+             mid-phrase pauses are unmeasured. Retake chunk 3.12 to check it again, or delete that line, the fourth, \
+             to stop this warning."
+        );
+    }
+
+    #[test]
+    fn times_below_0_are_saved_as_0_and_minus_0_reads_as_0() {
+        let word = |start, end| Word { text: "Hi".into(), start, end };
+        assert_eq!(words_to_saved(&[word(-0.08, 0.4), word(-0.0, -0.0)]), "Hi@0-0.4 Hi@0-0");
+        assert_eq!(words_from_saved("Hi@-0-0.4 Hi@0--0"), Ok(vec![word(0.0, 0.4), word(0.0, 0.0)]));
+        assert!(words_from_saved("Hi@0.4").is_err());
+        assert!(words_from_saved("Hi@-0.1").is_err());
     }
 
     #[test]
@@ -1504,7 +1591,8 @@ mod tests {
         store.store(chunk, &tone(), &heard("heard"), 1).unwrap();
         fs::write(store.audio_path(chunk).with_extension("check"), "4\nheard by Whisper").unwrap();
         let check = store.check(chunk).unwrap();
-        assert_eq!(check, Check { takes: 4, transcript: "heard by Whisper".into(), checker: None, words: None });
+        let whisper = Check { takes: 4, transcript: "heard by Whisper".into(), checker: None, words: WordTimes::Missing };
+        assert_eq!(check, whisper);
     }
 
     #[test]

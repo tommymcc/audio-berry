@@ -40,7 +40,21 @@ pub struct Word {
     pub end: f32,
 }
 
+/// What was heard in a take, as a take is judged by it: the transcript, and the
+/// words heard with their times when known. A check file from before word times
+/// were saved has none.
+#[derive(Clone, Copy, Debug)]
+pub struct Heard<'a> {
+    pub transcript: &'a str,
+    pub words: Option<&'a [Word]>,
+}
+
 impl Transcript {
+    /// The transcript and its words with their times.
+    pub fn heard(&self) -> Heard<'_> {
+        Heard { transcript: &self.text, words: Some(&self.words) }
+    }
+
     /// Parakeet's words, leaving out the punctuation it gives as words of their own.
     fn from_result(result: TranscriptionResult) -> Transcript {
         let words = result

@@ -17,7 +17,7 @@ use std::fmt;
 /// Silence is measured in frames this long.
 const FRAME_SECONDS: f32 = 0.01;
 /// A frame is silent when its level is at most this far above the take's
-/// floor, ignoring digital silence, measured in the same frames.
+/// silence floor.
 const SILENCE_ABOVE_FLOOR_DB: f32 = 10.0;
 
 /// The pause limit unless one is given, in seconds. Listening to 9 pauses at a
@@ -86,25 +86,34 @@ pub fn valid_pause_limit(value: &str) -> Option<PauseLimit> {
 
 /// A stretch of silence, in seconds from the start of the take.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Silence {
-    pub start: f32,
-    pub end: f32,
+struct Silence {
+    start: f32,
+    end: f32,
 }
 
 impl Silence {
-    pub fn seconds(&self) -> f32 {
+    fn seconds(&self) -> f32 {
         self.end - self.start
     }
 }
 
+/// A take's silence floor, in dB: the level of the quietest 5% of its
+/// `FRAME_SECONDS` frames, ignoring digital silence. It isn't the floor the
+/// noise limit judges, which is over 50 ms frames and counts digital silence:
+/// the pause limit was calibrated by ear against silences measured this way,
+/// and 10 ms frames find where a silence starts and ends to within 10 ms.
+fn silence_floor(levels: &[f32]) -> Option<f32> {
+    quality::floor_ignoring_digital_silence(levels)
+}
+
 /// Each stretch of `samples` at least `shortest` seconds long whose
-/// `FRAME_SECONDS` frames are all within `SILENCE_ABOVE_FLOOR_DB` of the floor,
-/// ignoring digital silence, in order. Digital silence counts as silent. Audio
-/// that's all digital silence has no floor, and no silences are found in it.
-pub fn silences(samples: &[f32], sample_rate: u32, shortest: f32) -> Vec<Silence> {
+/// `FRAME_SECONDS` frames are all within `SILENCE_ABOVE_FLOOR_DB` of the
+/// silence floor, in order. Digital silence counts as silent. Audio that's all
+/// digital silence has no silence floor, and no silences are found in it.
+fn silences(samples: &[f32], sample_rate: u32, shortest: f32) -> Vec<Silence> {
     let size = ((sample_rate as f32 * FRAME_SECONDS) as usize).max(1);
     let levels = quality::levels_of_frames(samples, size);
-    let Some(floor) = quality::floor_ignoring_digital_silence(&levels) else {
+    let Some(floor) = silence_floor(&levels) else {
         return Vec::new();
     };
     let shortest_frames = (shortest / FRAME_SECONDS).round() as usize;
@@ -130,9 +139,10 @@ pub fn silences(samples: &[f32], sample_rate: u32, shortest: f32) -> Vec<Silence
     found
 }
 
-/// A silence between two words of the text with no punctuation between them.
+/// A mid-phrase pause: a silence between two words of the text with no
+/// punctuation between them.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Pause {
+pub struct MidPhrasePause {
     /// The word of the text before the pause, as written.
     pub before: String,
     /// The word of the text after it, as written.
@@ -140,16 +150,75 @@ pub struct Pause {
     pub seconds: f32,
 }
 
-impl fmt::Display for Pause {
+impl fmt::Display for MidPhrasePause {
     /// As `was … born 0.72 s`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} … {} {:.2} s", self.before, self.after, self.seconds)
     }
 }
 
-/// The pauses joined by ` | `, as `report.tsv` and the take lines show them.
-pub fn list(pauses: &[Pause]) -> String {
-    pauses.iter().map(Pause::to_string).collect::<Vec<_>>().join(" | ")
+/// The mid-phrase pauses joined by ` | `, as `report.tsv` and the take lines
+/// show them.
+fn list(pauses: &[MidPhrasePause]) -> String {
+    pauses.iter().map(MidPhrasePause::to_string).collect::<Vec<_>>().join(" | ")
+}
+
+/// What checking a take for mid-phrase pauses found.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MidPhrasePauses {
+    /// The pause limit is off.
+    Off,
+    /// The take has no word times to place silences by, as a take checked
+    /// before they were saved.
+    Unmeasured,
+    /// Each one found, which may be none.
+    Measured(Vec<MidPhrasePause>),
+}
+
+impl MidPhrasePauses {
+    /// Checks a take of `text` against `limit`, given the words heard in it
+    /// with their times, if known. See `mid_phrase`.
+    pub fn check(
+        limit: PauseLimit,
+        text: &str,
+        words: Option<&[Word]>,
+        audio: &AudioSamples,
+        allowances: &Allowances,
+    ) -> MidPhrasePauses {
+        match (limit.seconds(), words) {
+            (None, _) => MidPhrasePauses::Off,
+            (Some(_), None) => MidPhrasePauses::Unmeasured,
+            (Some(shortest), Some(words)) => {
+                MidPhrasePauses::Measured(mid_phrase(text, words, audio, shortest, allowances))
+            }
+        }
+    }
+
+    /// Whether none was found. True when unmeasured or off, so such a take
+    /// isn't failed for one.
+    pub fn none_found(&self) -> bool {
+        match self {
+            MidPhrasePauses::Measured(found) => found.is_empty(),
+            MidPhrasePauses::Off | MidPhrasePauses::Unmeasured => true,
+        }
+    }
+
+    /// Those found, joined by ` | `, or nothing.
+    pub fn list(&self) -> String {
+        match self {
+            MidPhrasePauses::Measured(found) => list(found),
+            MidPhrasePauses::Off | MidPhrasePauses::Unmeasured => String::new(),
+        }
+    }
+
+    /// The `pauses` column of `report.tsv`: those found, `unmeasured`, or
+    /// nothing with the pause limit off.
+    pub fn column(&self) -> String {
+        match self {
+            MidPhrasePauses::Unmeasured => "unmeasured".into(),
+            other => other.list(),
+        }
+    }
 }
 
 /// The silences of at least `shortest` seconds in a take of `text` that fall
@@ -158,19 +227,22 @@ pub fn list(pauses: &[Pause]) -> String {
 ///
 /// Each silence is placed by its middle: after the last word of the text paired
 /// with a word heard that starts before then, and before the next word paired.
-/// Words of the text missed between those two are part of the boundary, so
+/// A word heard as starting inside the silence and ending after it is said
+/// after it, so the silence is placed before that word instead: the checker's
+/// start times can fall a little early. Words of the text missed between the
+/// two words either side are part of the boundary, so
 /// punctuation next to them explains the pause too. A silence that starts
 /// before the first word heard starts, or ends after the last one ends, or with
 /// no paired word on one side, is the take's start or end, not a pause: the
 /// checker's start times can fall inside the silence before the first word. A
 /// boundary with more than one silence is named once, with the longest.
-pub fn mid_phrase(
+fn mid_phrase(
     text: &str,
     words: &[Word],
     audio: &AudioSamples,
     shortest: f32,
     allowances: &Allowances,
-) -> Vec<Pause> {
+) -> Vec<MidPhrasePause> {
     let (Some(first), Some(last)) = (words.first(), words.iter().map(|word| word.end).reduce(f32::max)) else {
         return Vec::new();
     };
@@ -192,11 +264,19 @@ pub fn mid_phrase(
         heard.push_str(&word.text);
     }
     let pairs = accuracy::pairs(text, &heard, allowances);
-    let said_at = |pair: &Pair| words[offsets.partition_point(|&offset| offset <= pair.heard.start) - 1].start;
-    let mut pauses: Vec<(usize, Pause)> = Vec::new();
+    // The word heard at a byte of `heard`.
+    let word_at = |byte: usize| &words[offsets.partition_point(|&offset| offset <= byte) - 1];
+    let said_at = |pair: &Pair| word_at(pair.heard.start).start;
+    let follows = |pair: &Pair, silence: &Silence| {
+        said_at(pair) > silence.start && word_at(pair.heard.end - 1).end > silence.end
+    };
+    let mut pauses: Vec<(usize, MidPhrasePause)> = Vec::new();
     for silence in silences {
         let middle = (silence.start + silence.end) / 2.0;
-        let next = pairs.partition_point(|pair| said_at(pair) < middle);
+        let mut next = pairs.partition_point(|pair| said_at(pair) < middle);
+        while next > 0 && follows(&pairs[next - 1], &silence) {
+            next -= 1;
+        }
         let (Some(before), Some(after)) = (next.checked_sub(1).map(|index| &pairs[index]), pairs.get(next)) else {
             continue;
         };
@@ -204,7 +284,7 @@ pub fn mid_phrase(
         if punctuated(between) {
             continue;
         }
-        let pause = Pause {
+        let pause = MidPhrasePause {
             before: text[before.written.clone()].to_string(),
             after: text[after.written.clone()].to_string(),
             seconds: silence.seconds(),
@@ -218,20 +298,23 @@ pub fn mid_phrase(
     pauses.into_iter().map(|(_, pause)| pause).collect()
 }
 
-/// Apostrophes and quotation marks, which don't mark a pause: in `call me "an
-/// old-fashioned fellow"` the phrase runs on into the quotation.
-const NOT_PAUSES: [char; 7] = ['\'', '’', '‘', '"', '“', '”', '`'];
+/// The marks that end a sentence or a phrase, and brackets. Quotation marks
+/// aren't among them: in `call me "an old-fashioned fellow"` the phrase runs on
+/// into the quotation.
+const PAUSE_MARKS: [char; 15] = ['.', ',', ';', ':', '!', '?', '…', '—', '–', '(', ')', '[', ']', '{', '}'];
 
 /// Whether the text between two words, with any words missed between them,
-/// has punctuation that marks a pause. Apostrophes, quotation marks and a
-/// hyphen joining two words, as in "well-known", don't.
+/// has a mark that explains a pause: one of `PAUSE_MARKS`, or a hyphen used
+/// as a dash, beside a space or another hyphen, as in " - " or "--". A hyphen
+/// joining two words, as in "well-known", and symbols such as "%" or "&" don't.
 fn punctuated(between: &str) -> bool {
-    let marks: String = between
-        .chars()
-        .filter(|c| !c.is_alphanumeric() && !c.is_whitespace() && !NOT_PAUSES.contains(c))
-        .collect();
-    let joining_hyphen = marks == "-" && !between.contains(char::is_whitespace);
-    !marks.is_empty() && !joining_hyphen
+    let chars: Vec<char> = between.chars().collect();
+    let dash_beside = |index: Option<usize>| {
+        index.and_then(|index| chars.get(index)).is_some_and(|c| c.is_whitespace() || *c == '-')
+    };
+    chars.iter().enumerate().any(|(index, c)| {
+        PAUSE_MARKS.contains(c) || (*c == '-' && (dash_beside(index.checked_sub(1)) || dash_beside(Some(index + 1))))
+    })
 }
 
 #[cfg(test)]
@@ -342,8 +425,20 @@ mod tests {
         assert_eq!(pauses.len(), 1, "{pauses:?}");
         assert_eq!((pauses[0].before.as_str(), pauses[0].after.as_str()), ("was", "born"));
         assert!((pauses[0].seconds - 0.72).abs() < 0.015, "{pauses:?}");
-        let shown = Pause { seconds: 0.72, ..pauses[0].clone() };
+        let shown = MidPhrasePause { seconds: 0.72, ..pauses[0].clone() };
         assert_eq!(shown.to_string(), "was … born 0.72 s");
+    }
+
+    #[test]
+    fn a_word_heard_as_starting_early_in_the_pause_before_it_still_follows_the_pause() {
+        // "born" is said after the 0.72 s silence, but heard as starting 0.2 s
+        // into it, before its middle. The comma after "born" doesn't explain
+        // the pause before it.
+        let (audio, mut words) = born_take();
+        words[4].start = 2.0;
+        let pauses = mid_phrase(BORN, &words, &audio, 0.6, &Allowances::default());
+        assert_eq!(pauses.len(), 1, "{pauses:?}");
+        assert_eq!((pauses[0].before.as_str(), pauses[0].after.as_str()), ("was", "born"));
     }
 
     #[test]
@@ -397,11 +492,13 @@ mod tests {
     }
 
     #[test]
-    fn punctuation_is_any_mark_but_an_apostrophe_a_quotation_mark_or_a_joining_hyphen() {
-        for between in [", ", "; ", ". ", "—", " – ", ",\" ", " (", "? ", " - ", "--"] {
+    fn punctuation_is_a_sentence_or_phrase_mark_a_dash_or_a_bracket() {
+        for between in
+            [", ", "; ", ". ", ": ", "! ", "? ", "… ", "—", " – ", ",\" ", " (", ") ", " [", " - ", "--", " -", "- "]
+        {
             assert!(punctuated(between), "{between:?}");
         }
-        for between in [" ", "-", "’", "'", "\u{a0}", " \"", "\" ", " “", "” "] {
+        for between in [" ", "-", "’", "'", "\u{a0}", " \"", "\" ", " “", "” ", " % ", " £", " & ", "*", "_", " / ", " # "] {
             assert!(!punctuated(between), "{between:?}");
         }
         assert!(punctuated(" boat, "), "punctuation beside a word missed");
@@ -410,10 +507,29 @@ mod tests {
 
     #[test]
     fn pauses_are_listed_with_a_plain_separator() {
-        let pause = |before: &str, after: &str, seconds| Pause { before: before.into(), after: after.into(), seconds };
-        let pauses = [pause("was", "born", 0.72), pause("the", "sea", 1.1)];
-        assert_eq!(list(&pauses), "was … born 0.72 s | the … sea 1.10 s");
-        assert_eq!(list(&[]), "");
+        let pause =
+            |before: &str, after: &str, seconds| MidPhrasePause { before: before.into(), after: after.into(), seconds };
+        let found = MidPhrasePauses::Measured(vec![pause("was", "born", 0.72), pause("the", "sea", 1.1)]);
+        assert_eq!(found.list(), "was … born 0.72 s | the … sea 1.10 s");
+        assert_eq!(found.column(), found.list());
+        assert!(!found.none_found());
+        let none = MidPhrasePauses::Measured(Vec::new());
+        assert_eq!((none.list(), none.column(), none.none_found()), (String::new(), String::new(), true));
+        let unmeasured = MidPhrasePauses::Unmeasured;
+        let shown = (unmeasured.list(), unmeasured.column(), unmeasured.none_found());
+        assert_eq!(shown, (String::new(), "unmeasured".to_string(), true));
+        assert_eq!((MidPhrasePauses::Off.column(), MidPhrasePauses::Off.none_found()), (String::new(), true));
+    }
+
+    #[test]
+    fn a_take_is_checked_only_with_word_times_and_a_limit() {
+        let (audio, words) = born_take();
+        let none = Allowances::default();
+        let check = |limit, words| MidPhrasePauses::check(limit, BORN, words, &audio, &none);
+        assert_eq!(check(PauseLimit::Off, Some(&words)), MidPhrasePauses::Off);
+        assert_eq!(check(PauseLimit::DEFAULT, None), MidPhrasePauses::Unmeasured);
+        let found = check(PauseLimit::DEFAULT, Some(&words));
+        assert!(matches!(&found, MidPhrasePauses::Measured(found) if found.len() == 1), "{found:?}");
     }
 
     #[test]
