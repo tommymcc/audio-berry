@@ -37,7 +37,7 @@ pub struct Quality {
     pub seconds: f32,
 }
 
-fn to_db(linear: f32) -> f32 {
+pub fn to_db(linear: f32) -> f32 {
     20.0 * linear.max(1e-5).log10()
 }
 
@@ -62,7 +62,11 @@ pub fn floor_of_sorted(levels: &[f32]) -> Option<f32> {
 }
 
 fn frame_levels(samples: &[f32], sample_rate: u32) -> Vec<f32> {
-    let size = frame_size(sample_rate);
+    levels_of_frames(samples, frame_size(sample_rate))
+}
+
+/// The linear level of each whole frame of `size` samples.
+pub fn levels_of_frames(samples: &[f32], size: usize) -> Vec<f32> {
     samples
         .chunks_exact(size)
         .map(|frame| (frame.iter().map(|s| s * s).sum::<f32>() / size as f32).sqrt())
@@ -136,7 +140,7 @@ const DIGITAL_SILENCE: f32 = 1e-5;
 /// The floor of a take's frames that aren't digital silence. Takes start with
 /// about 0.1 s of it, which in a short take is more than the quietest 5% of its
 /// frames, so `measure`'s floor would be that rather than the room tone.
-fn floor_ignoring_digital_silence(levels: &[f32]) -> Option<f32> {
+pub fn floor_ignoring_digital_silence(levels: &[f32]) -> Option<f32> {
     let mut sound: Vec<f32> = levels.iter().copied().filter(|level| *level > DIGITAL_SILENCE).collect();
     sound.sort_by(f32::total_cmp);
     floor_of_sorted(&sound).map(to_db)

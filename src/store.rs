@@ -1,11 +1,12 @@
 //! An output directory: one narration of one book, in one voice, with one set
 //! of render settings. Owns chunk numbering, the cache key and the files.
 
-use crate::checker;
+use crate::checker::{self, Transcript, Word};
 use crate::narrator::PRECISION_VAR;
 use crate::quality::{DEFAULT_NOISE_LIMIT_DB, valid_noise_limit};
 use crate::accuracy::contains_phrase;
 use crate::files::read_if_present;
+use crate::pauses::{PauseLimit, pause_limits_text, valid_pause_limit};
 use crate::pitch::{PITCH_RANGE_LIMITS, valid_pitch_range};
 use crate::takes::{TAKES_RANGE, TakePolicy};
 use crate::text::ChunkLimit;
@@ -75,7 +76,7 @@ impl Chunk {
 }
 
 /// What's known about a stored take without loading its audio.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Check {
     /// Seeds tried so far, so the next retake tries new ones.
     pub takes: u64,
@@ -83,28 +84,66 @@ pub struct Check {
     /// The checker that heard the transcript, or `None` for a check file with
     /// only two lines, whose transcript Whisper heard.
     pub checker: Option<String>,
+    /// The words the checker heard, with when each was said, or `None` for a
+    /// check file of three lines or fewer, which has no timings.
+    pub words: Option<Vec<Word>>,
 }
 
 impl Check {
-    /// The check file's contents: the takes tried, the transcript, and the
-    /// checker if known, a line each.
+    /// The check file's contents: the takes tried, the transcript, the checker
+    /// if known and the words heard with their times if known, a line each.
     fn to_saved(&self) -> String {
-        let Check { takes, transcript, checker } = self;
-        match checker {
-            Some(checker) => format!("{takes}\n{transcript}\n{checker}"),
-            None => format!("{takes}\n{transcript}"),
+        let Check { takes, transcript, checker, words } = self;
+        let mut saved = format!("{takes}\n{transcript}");
+        if let Some(checker) = checker {
+            saved.push('\n');
+            saved.push_str(checker);
+            if let Some(words) = words {
+                saved.push('\n');
+                saved.push_str(&words_to_saved(words));
+            }
         }
+        saved
     }
 
-    /// Reads what `to_saved` wrote: two lines, or three with the checker.
+    /// Reads what `to_saved` wrote: two lines, three with the checker, or four
+    /// with the words heard.
     fn from_saved(text: &str) -> Result<Check> {
-        let mut lines = text.splitn(3, '\n');
+        let mut lines = text.splitn(4, '\n');
         let (Some(takes), Some(transcript)) = (lines.next(), lines.next()) else {
             bail!("it has no transcript line after its count of takes");
         };
         let takes = takes.parse().map_err(|_| eyre!("it starts {takes:?}, which isn't a count of takes"))?;
-        Ok(Check { takes, transcript: transcript.to_string(), checker: lines.next().map(String::from) })
+        let checker = lines.next().map(String::from);
+        let words = lines.next().map(words_from_saved).transpose()?;
+        Ok(Check { takes, transcript: transcript.to_string(), checker, words })
     }
+}
+
+/// Words heard, as a check file saves them: `text@start-end` for each, in
+/// seconds, separated by spaces. Whitespace in a word's text is left out.
+fn words_to_saved(words: &[Word]) -> String {
+    let saved: Vec<String> = words
+        .iter()
+        .map(|word| {
+            let text: String = word.text.chars().filter(|c| !c.is_whitespace()).collect();
+            format!("{text}@{}-{}", word.start, word.end)
+        })
+        .collect();
+    saved.join(" ")
+}
+
+/// Reads what `words_to_saved` wrote.
+fn words_from_saved(line: &str) -> Result<Vec<Word>> {
+    line.split_whitespace()
+        .map(|saved| {
+            let word = saved.rsplit_once('@').and_then(|(text, times)| {
+                let (start, end) = times.split_once('-')?;
+                Some(Word { text: text.to_string(), start: start.parse().ok()?, end: end.parse().ok()? })
+            });
+            word.ok_or_else(|| eyre!("its words line has {saved:?}, which isn't a word heard with its times"))
+        })
+        .collect()
 }
 
 fn read_manifest(out: &Path) -> Result<Option<Manifest>> {
@@ -210,6 +249,32 @@ impl KeepSetting for PitchRangeTarget {
     }
 }
 
+/// The pause limit: the shortest silence in the middle of a phrase that fails a
+/// take, in seconds, or off.
+pub struct PauseLimitSetting;
+
+impl KeepSetting for PauseLimitSetting {
+    type Value = PauseLimit;
+    type Rule = PauseLimit;
+    const KEY: &'static str = "pause_limit_s";
+    const DEFAULT: PauseLimit = PauseLimit::DEFAULT;
+    fn valid_range_text() -> String {
+        pause_limits_text()
+    }
+    fn from_saved(text: &str) -> Option<PauseLimit> {
+        valid_pause_limit(text)
+    }
+    fn to_saved(limit: PauseLimit) -> String {
+        limit.saved()
+    }
+    fn display(limit: PauseLimit) -> String {
+        limit.to_string()
+    }
+    fn using_note(displayed: &str) -> String {
+        format!("Pause limit: {displayed}")
+    }
+}
+
 /// The keep settings given on the command line, each `None` when not given, so
 /// the output directory's saved one is used. `settle` turns them into the
 /// `KeepRules` a run follows.
@@ -221,6 +286,8 @@ pub struct KeepSettings {
     pub takes: Option<TakePolicy>,
     /// See `PitchRangeTarget`.
     pub pitch_range_target: Option<f32>,
+    /// See `PauseLimitSetting`.
+    pub pause_limit: Option<PauseLimit>,
 }
 
 /// The keep settings a run follows, settled from those given and those saved,
@@ -234,6 +301,8 @@ pub struct KeepRules {
     /// The pitch range, in semitones, that takes which pass are ranked by
     /// nearness to, if any.
     pub pitch_range_target: Option<f32>,
+    /// The shortest silence in the middle of a phrase that fails a take, or off.
+    pub pause_limit: PauseLimit,
 }
 
 impl KeepRules {
@@ -244,6 +313,7 @@ impl KeepRules {
             noise_limit_db: parse_setting::<NoiseLimit>(line(NoiseLimit::KEY))?,
             takes: parse_setting::<TakePolicySetting>(line(TakePolicySetting::KEY))?,
             pitch_range_target: parse_setting::<PitchRangeTarget>(line(PitchRangeTarget::KEY))?,
+            pause_limit: parse_setting::<PauseLimitSetting>(line(PauseLimitSetting::KEY))?,
         })
     }
 
@@ -252,6 +322,7 @@ impl KeepRules {
         render_setting::<NoiseLimit>(self.noise_limit_db, text);
         render_setting::<TakePolicySetting>(self.takes, text);
         render_setting::<PitchRangeTarget>(self.pitch_range_target, text);
+        render_setting::<PauseLimitSetting>(self.pause_limit, text);
     }
 
     /// Settles each setting from the one given and the one `saved` in the
@@ -267,6 +338,11 @@ impl KeepRules {
             pitch_range_target: settled.setting::<PitchRangeTarget>(
                 saved.map(|saved| saved.pitch_range_target),
                 given.pitch_range_target,
+                path,
+            ),
+            pause_limit: settled.setting::<PauseLimitSetting>(
+                saved.map(|saved| saved.pause_limit),
+                given.pause_limit,
                 path,
             ),
         }
@@ -709,12 +785,14 @@ impl NarrationStore {
     }
 
     /// Saves a chunk's audio and check file, replacing the audio in one step. The
-    /// check file records `checker::MODEL` as the checker that heard `transcript`.
-    pub fn store(&self, chunk: &Chunk, audio: &AudioSamples, transcript: &str, takes: u64) -> Result<()> {
+    /// check file records `checker::MODEL` as the checker that heard `heard`,
+    /// and the words heard with their times.
+    pub fn store(&self, chunk: &Chunk, audio: &AudioSamples, heard: &Transcript, takes: u64) -> Result<()> {
         self.save_manifest()?;
         let path = self.audio_path(chunk);
-        let transcript = transcript.replace(['\n', '\t'], " ");
-        let check = Check { takes, transcript, checker: Some(checker::MODEL.to_string()) };
+        let transcript = heard.text.replace(['\n', '\t'], " ");
+        let check =
+            Check { takes, transcript, checker: Some(checker::MODEL.to_string()), words: Some(heard.words.clone()) };
         fs::write(path.with_extension("check"), check.to_saved())?;
         let temporary = path.with_extension("tmp");
         audio.save_wav(&temporary).wrap_err_with(|| format!("couldn't save {}", temporary.display()))?;
@@ -741,11 +819,11 @@ impl NarrationStore {
 
     /// Saves a new take of a chunk as `store` does, first moving the take it has,
     /// if any, and its check file to `replaced/`.
-    pub fn replace(&self, chunk: &Chunk, audio: &AudioSamples, transcript: &str, takes: u64) -> Result<()> {
+    pub fn replace(&self, chunk: &Chunk, audio: &AudioSamples, heard: &Transcript, takes: u64) -> Result<()> {
         if self.has_audio(chunk) {
             self.retire(chunk)?;
         }
-        self.store(chunk, audio, transcript, takes)
+        self.store(chunk, audio, heard, takes)
     }
 
     /// Moves a chunk's audio and check file to `replaced/`, ready for a new take.
@@ -855,12 +933,12 @@ mod tests {
     /// Opens a folder and stores a take, which is when it saves its settings.
     fn render_as(dir: &TempDir, title: &str, voice: u64, precision: &str) {
         let store = open_as(dir, title, voice, precision).unwrap();
-        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("a"), 1).unwrap();
     }
 
     fn render_at(dir: &TempDir, speed: Option<f64>) {
         let store = open_at(dir, speed).unwrap();
-        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("a"), 1).unwrap();
     }
 
     #[test]
@@ -886,8 +964,8 @@ mod tests {
     fn partly_rendered_chapters_are_named_and_missing_ones_counted() {
         let dir = TempDir::new("store-partial");
         let store = open(&dir, &[&["a", "b"], &["c"], &[], &["d"], &["e"]]);
-        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
-        store.store(&store.chunks()[3], &tone(), "d", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("a"), 1).unwrap();
+        store.store(&store.chunks()[3], &tone(), &heard("d"), 1).unwrap();
         assert_eq!(store.partly_rendered_chapters(), [0]);
         assert_eq!(store.incomplete_chapter_count(), 3);
     }
@@ -914,7 +992,7 @@ mod tests {
     fn selecting_never_adds_chunks_that_were_not_named() {
         let dir = TempDir::new("store-select-only");
         let store = open(&dir, &[&["one"], &["two"], &["three"]]);
-        store.store(&store.chunks()[0], &tone(), "one", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("one"), 1).unwrap();
         assert_eq!(numbers(&store.select(&["1.1"]).unwrap()), ["1.1"]);
     }
 
@@ -932,7 +1010,7 @@ mod tests {
     fn words_select_only_chunks_with_audio() {
         let dir = TempDir::new("store-select-words");
         let store = open(&dir, &[&["the white rabbit"], &["a white hat"]]);
-        store.store(&store.chunks()[0], &tone(), "x", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("x"), 1).unwrap();
         let selected = store.select(&["white"]).unwrap();
         assert_eq!(numbers(&selected), ["1.1"]);
         assert_eq!(selected[0].phrases, ["white"]);
@@ -958,7 +1036,7 @@ mod tests {
     fn shared_audio_is_selected_once_with_every_number() {
         let dir = TempDir::new("store-select-shared");
         let store = open(&dir, &[&["same line", "other"], &["same line"]]);
-        store.store(&store.chunks()[0], &tone(), "same line", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("same line"), 1).unwrap();
         let selected = store.select(&["same line", "2.1"]).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].numbers, ["1.1", "2.1"]);
@@ -1118,7 +1196,7 @@ mod tests {
     /// Opens `dir` with `given` and stores a take, which saves the keep settings.
     fn render_keeping(dir: &TempDir, given: KeepSettings) {
         let store = open_keeping(dir, given);
-        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("a"), 1).unwrap();
     }
 
     /// The rules a run in `dir` given `given` follows, which settling alone decides.
@@ -1132,6 +1210,7 @@ mod tests {
             noise_limit_db: Some(rules.noise_limit_db),
             takes: Some(rules.takes),
             pitch_range_target: rules.pitch_range_target,
+            pause_limit: Some(rules.pause_limit),
         }
     }
 
@@ -1146,14 +1225,27 @@ mod tests {
         fs::read_to_string(dir.join(MANIFEST)).unwrap().lines().skip(5).map(str::to_string).collect()
     }
 
-    const DEFAULT_RULES: KeepRules =
-        KeepRules { noise_limit_db: DEFAULT_NOISE_LIMIT_DB, takes: TakePolicy::FirstPassing, pitch_range_target: None };
-    const FIRST: KeepRules =
-        KeepRules { noise_limit_db: -50.0, takes: TakePolicy::BestOf(4), pitch_range_target: Some(12.4) };
-    const FIRST_LINES: [&str; 3] = ["noise_limit_db=-50", "takes=best-of-4", "pitch_range_st=12.4"];
-    const SECOND: KeepRules =
-        KeepRules { noise_limit_db: -48.5, takes: TakePolicy::BestOf(2), pitch_range_target: Some(10.0) };
-    const SECOND_LINES: [&str; 3] = ["noise_limit_db=-48.5", "takes=best-of-2", "pitch_range_st=10"];
+    const DEFAULT_RULES: KeepRules = KeepRules {
+        noise_limit_db: DEFAULT_NOISE_LIMIT_DB,
+        takes: TakePolicy::FirstPassing,
+        pitch_range_target: None,
+        pause_limit: PauseLimit::DEFAULT,
+    };
+    const FIRST: KeepRules = KeepRules {
+        noise_limit_db: -50.0,
+        takes: TakePolicy::BestOf(4),
+        pitch_range_target: Some(12.4),
+        pause_limit: PauseLimit::Seconds(0.8),
+    };
+    const FIRST_LINES: [&str; 4] =
+        ["noise_limit_db=-50", "takes=best-of-4", "pitch_range_st=12.4", "pause_limit_s=0.8"];
+    const SECOND: KeepRules = KeepRules {
+        noise_limit_db: -48.5,
+        takes: TakePolicy::BestOf(2),
+        pitch_range_target: Some(10.0),
+        pause_limit: PauseLimit::Off,
+    };
+    const SECOND_LINES: [&str; 4] = ["noise_limit_db=-48.5", "takes=best-of-2", "pitch_range_st=10", "pause_limit_s=off"];
 
     #[test]
     fn a_given_setting_wins_then_the_saved_one_then_the_default() {
@@ -1173,7 +1265,7 @@ mod tests {
         let dir = TempDir::new("store-keep-first");
         let store = open_keeping(&dir, given(FIRST));
         assert!(!dir.join(MANIFEST).exists());
-        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("a"), 1).unwrap();
         assert_eq!(saved_lines(&dir), FIRST_LINES);
     }
 
@@ -1181,7 +1273,7 @@ mod tests {
     fn the_defaults_are_saved_when_none_are_given_and_no_pitch_range_target() {
         let dir = TempDir::new("store-keep-default");
         render_keeping(&dir, KeepSettings::default());
-        assert_eq!(saved_lines(&dir), ["noise_limit_db=-55", "takes=first-passing"]);
+        assert_eq!(saved_lines(&dir), ["noise_limit_db=-55", "takes=first-passing", "pause_limit_s=0.6"]);
         assert_eq!(rules(&dir, KeepSettings::default()), DEFAULT_RULES);
     }
 
@@ -1191,6 +1283,7 @@ mod tests {
             KeepRules { noise_limit_db: SECOND.noise_limit_db, ..FIRST },
             KeepRules { takes: SECOND.takes, ..FIRST },
             KeepRules { pitch_range_target: SECOND.pitch_range_target, ..FIRST },
+            KeepRules { pause_limit: SECOND.pause_limit, ..FIRST },
         ];
         for (index, changed) in changes.into_iter().enumerate() {
             let dir = TempDir::new(&format!("store-keep-changed-{index}"));
@@ -1228,9 +1321,10 @@ mod tests {
 
     #[test]
     fn a_manifest_is_saved_as_it_was_read() {
-        let text = format!("{OLDER_MANIFEST}noise_limit_db=-50\ntakes=best-of-3\n");
+        let text = format!("{OLDER_MANIFEST}noise_limit_db=-50\ntakes=best-of-3\npause_limit_s=off\n");
         let manifest = Manifest::parse(&text).unwrap();
-        assert_eq!(manifest.keep, KeepRules { takes: TakePolicy::BestOf(3), pitch_range_target: None, ..FIRST });
+        let wanted = KeepRules { takes: TakePolicy::BestOf(3), pitch_range_target: None, pause_limit: PauseLimit::Off, ..FIRST };
+        assert_eq!(manifest.keep, wanted);
         assert_eq!(manifest.render(), text);
     }
 
@@ -1278,6 +1372,14 @@ mod tests {
             (said("Pitch range: aiming for 10 semitones"), false)
         );
         assert_eq!(note::<PitchRangeTarget>(unset, None), (None, false));
+
+        let (default, off) = (Some(PauseLimit::DEFAULT), Some(PauseLimit::Off));
+        assert_eq!(note::<PauseLimitSetting>(default, None), (None, false));
+        assert_eq!(
+            note::<PauseLimitSetting>(default, off),
+            (said("Pause limit: off, replacing 0.6 s in out/narration.txt"), true)
+        );
+        assert_eq!(note::<PauseLimitSetting>(off, None), (said("Pause limit: off"), false));
     }
 
     #[test]
@@ -1286,6 +1388,7 @@ mod tests {
             ("noise_limit_db=loud", "a level from -100 to 0 dB"),
             ("takes=best-of-50", "first-passing or best-of-1 to best-of-10"),
             ("pitch_range_st=40", "a range from 2 to 30 semitones"),
+            ("pause_limit_s=0.1", "off or a length from 0.3 to 5 seconds"),
         ];
         for (line, valid) in bad {
             let dir = folder_without_saved_settings("keep-bad");
@@ -1320,12 +1423,66 @@ mod tests {
     fn giving_one_setting_to_a_folder_without_saved_settings_saves_the_default_noise_limit() {
         let dir = folder_without_saved_settings("keep-older-one");
         open_keeping(&dir, KeepSettings { takes: Some(TakePolicy::BestOf(3)), ..KeepSettings::default() });
-        assert_eq!(saved_lines(&dir), ["noise_limit_db=-55", "takes=best-of-3"]);
+        assert_eq!(saved_lines(&dir), ["noise_limit_db=-55", "takes=best-of-3", "pause_limit_s=0.6"]);
     }
 
-    /// A check saying `takes` and `transcript`, heard by `checker::MODEL`.
+    /// `text` heard, with no words timed.
+    fn heard(text: &str) -> Transcript {
+        Transcript { text: text.into(), words: Vec::new() }
+    }
+
+    /// A check saying `takes` and `transcript`, heard by `checker::MODEL`, with
+    /// no words timed.
     fn checked(takes: u64, transcript: &str) -> Check {
-        Check { takes, transcript: transcript.into(), checker: Some(checker::MODEL.into()) }
+        Check { takes, transcript: transcript.into(), checker: Some(checker::MODEL.into()), words: Some(Vec::new()) }
+    }
+
+    fn timed() -> Vec<Word> {
+        let word = |text: &str, start, end| Word { text: text.into(), start, end };
+        vec![word("Chapter", 0.08, 0.56), word("wasn't", 0.64, 0.96), word("3,000@", 1.1, 1.75)]
+    }
+
+    #[test]
+    fn a_stored_take_keeps_the_words_heard_with_their_times() {
+        let dir = TempDir::new("store-words");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        let transcript = Transcript { text: "Chapter, wasn't 3,000@".into(), words: timed() };
+        store.store(chunk, &tone(), &transcript, 2).unwrap();
+        let saved = fs::read_to_string(store.audio_path(chunk).with_extension("check")).unwrap();
+        assert_eq!(
+            saved,
+            format!("2\nChapter, wasn't 3,000@\n{}\nChapter@0.08-0.56 wasn't@0.64-0.96 3,000@@1.1-1.75", checker::MODEL)
+        );
+        assert_eq!(store.check(chunk).unwrap().words, Some(timed()));
+        store.record_tried(chunk, 4).unwrap();
+        assert_eq!(store.check(chunk).unwrap().words, Some(timed()));
+    }
+
+    #[test]
+    fn a_three_line_check_file_reads_with_no_words_timed() {
+        let dir = TempDir::new("store-no-words");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        store.store(chunk, &tone(), &heard("heard"), 1).unwrap();
+        let path = store.audio_path(chunk).with_extension("check");
+        let three_lines = format!("4\nheard before timings\n{}", checker::MODEL);
+        fs::write(&path, &three_lines).unwrap();
+        assert_eq!(store.check(chunk).unwrap(), Check { words: None, ..checked(4, "heard before timings") });
+        store.record_tried(chunk, 9).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), three_lines.replacen('4', "9", 1));
+    }
+
+    #[test]
+    fn a_bad_words_line_is_an_error() {
+        let dir = TempDir::new("store-bad-words");
+        let store = open(&dir, &[&["a"]]);
+        let chunk = &store.chunks()[0];
+        store.store(chunk, &tone(), &heard("heard"), 1).unwrap();
+        let path = store.audio_path(chunk).with_extension("check");
+        fs::write(&path, format!("1\nheard\n{}\nheard@soon", checker::MODEL)).unwrap();
+        let error = format!("{:#}", store.check(chunk).unwrap_err());
+        assert!(error.contains("its words line has \"heard@soon\""), "{error}");
     }
 
     #[test]
@@ -1334,7 +1491,7 @@ mod tests {
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         assert!(!store.has_audio(chunk));
-        store.store(chunk, &tone(), "heard\tthis\nline", 2).unwrap();
+        store.store(chunk, &tone(), &heard("heard\tthis\nline"), 2).unwrap();
         assert!(store.has_audio(chunk));
         assert_eq!(store.check(chunk).unwrap(), checked(2, "heard this line"));
     }
@@ -1344,10 +1501,10 @@ mod tests {
         let dir = TempDir::new("store-old-check");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
-        store.store(chunk, &tone(), "heard", 1).unwrap();
+        store.store(chunk, &tone(), &heard("heard"), 1).unwrap();
         fs::write(store.audio_path(chunk).with_extension("check"), "4\nheard by Whisper").unwrap();
         let check = store.check(chunk).unwrap();
-        assert_eq!(check, Check { takes: 4, transcript: "heard by Whisper".into(), checker: None });
+        assert_eq!(check, Check { takes: 4, transcript: "heard by Whisper".into(), checker: None, words: None });
     }
 
     #[test]
@@ -1373,7 +1530,7 @@ mod tests {
         let dir = TempDir::new("store-malformed");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
-        store.store(chunk, &tone(), "heard", 1).unwrap();
+        store.store(chunk, &tone(), &heard("heard"), 1).unwrap();
         let path = store.audio_path(chunk).with_extension("check");
         for (contents, wanted) in [
             ("no newline", "has no transcript line after its count of takes"),
@@ -1391,7 +1548,7 @@ mod tests {
         let dir = TempDir::new("store-tried");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
-        store.store(chunk, &tone(), "heard", 1).unwrap();
+        store.store(chunk, &tone(), &heard("heard"), 1).unwrap();
         store.record_tried(chunk, 7).unwrap();
         assert_eq!(store.check(chunk).unwrap(), checked(7, "heard"));
     }
@@ -1401,7 +1558,7 @@ mod tests {
         let dir = TempDir::new("store-tried-old");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
-        store.store(chunk, &tone(), "heard", 1).unwrap();
+        store.store(chunk, &tone(), &heard("heard"), 1).unwrap();
         let path = store.audio_path(chunk).with_extension("check");
         fs::write(&path, "4\nheard by Whisper").unwrap();
         store.record_tried(chunk, 9).unwrap();
@@ -1413,15 +1570,15 @@ mod tests {
         let dir = TempDir::new("store-retire");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
-        store.store(chunk, &tone(), "heard", 3).unwrap();
-        store.replace(chunk, &AudioSamples::new(vec![0.2; 480], 24_000), "new", 5).unwrap();
+        store.store(chunk, &tone(), &heard("heard"), 3).unwrap();
+        store.replace(chunk, &AudioSamples::new(vec![0.2; 480], 24_000), &heard("new"), 5).unwrap();
         assert_eq!(store.check(chunk).unwrap(), checked(5, "new"));
         assert_eq!(AudioSamples::from_wav_file(store.audio_path(chunk)).unwrap().samples.len(), 480);
         let name = store.audio_path(chunk).file_stem().unwrap().to_str().unwrap().to_string();
         let old = dir.join("replaced").join(format!("{name}-3.wav"));
         assert_eq!(AudioSamples::from_wav_file(&old).unwrap().samples.len(), 240);
         let old_check = fs::read_to_string(old.with_extension("check")).unwrap();
-        assert_eq!(old_check, format!("3\nheard\n{}", checker::MODEL));
+        assert_eq!(old_check, format!("3\nheard\n{}\n", checker::MODEL));
     }
 
     #[test]
@@ -1429,7 +1586,7 @@ mod tests {
         let dir = TempDir::new("store-replace-new");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
-        store.replace(chunk, &tone(), "heard", 2).unwrap();
+        store.replace(chunk, &tone(), &heard("heard"), 2).unwrap();
         assert_eq!(store.check(chunk).unwrap(), checked(2, "heard"));
         assert!(!dir.join("replaced").exists());
     }
@@ -1438,7 +1595,7 @@ mod tests {
     fn pending_lists_only_the_chapters_asked_for_and_shared_audio_once() {
         let dir = TempDir::new("store-pending");
         let store = open(&dir, &[&["a", "b", "a"], &["c"]]);
-        store.store(&store.chunks()[1], &tone(), "b", 1).unwrap();
+        store.store(&store.chunks()[1], &tone(), &heard("b"), 1).unwrap();
         let numbers: Vec<String> = store.pending(&[0]).iter().map(|chunk| chunk.number()).collect();
         assert_eq!(numbers, ["1.1"]);
     }
@@ -1447,8 +1604,8 @@ mod tests {
     fn only_chapters_with_all_their_audio_are_complete() {
         let dir = TempDir::new("store-complete");
         let store = open(&dir, &[&["a", "b"], &["c"], &[], &["d"]]);
-        store.store(&store.chunks()[0], &tone(), "a", 1).unwrap();
-        store.store(&store.chunks()[3], &tone(), "d", 1).unwrap();
+        store.store(&store.chunks()[0], &tone(), &heard("a"), 1).unwrap();
+        store.store(&store.chunks()[3], &tone(), &heard("d"), 1).unwrap();
         assert_eq!(store.complete_chapters(), [3]);
         assert_eq!(store.missing_count(), 2);
     }

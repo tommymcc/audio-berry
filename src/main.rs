@@ -13,6 +13,7 @@ mod files;
 mod mishearings;
 mod narrator;
 mod numbers;
+mod pauses;
 mod pitch;
 mod progress;
 mod quality;
@@ -194,12 +195,30 @@ struct Takes {
     /// 2 to 30 semitones, such as 12.4 for a lively voice; saved in the output directory
     #[arg(long = "pitch-range", value_name = "semitones", value_parser = pitch::parse_pitch_range)]
     pitch_range: Option<f32>,
+    #[arg(
+        long = "pause-limit",
+        value_name = "seconds",
+        value_parser = pauses::parse_pause_limit,
+        help = format!(
+            "Fails a take with a silence this long or longer between two words the text doesn't \
+             punctuate, from {} to {} seconds, or off [default: {}]; saved in the output directory",
+            pauses::PAUSE_LIMITS.start(),
+            pauses::PAUSE_LIMITS.end(),
+            pauses::DEFAULT_PAUSE_LIMIT_SECONDS,
+        ),
+    )]
+    pause_limit: Option<pauses::PauseLimit>,
 }
 
 impl Takes {
     /// What decides which take is kept, with the noise limit given.
     fn keep(&self, noise_limit_db: Option<f32>) -> store::KeepSettings {
-        store::KeepSettings { noise_limit_db, takes: self.policy, pitch_range_target: self.pitch_range }
+        store::KeepSettings {
+            noise_limit_db,
+            takes: self.policy,
+            pitch_range_target: self.pitch_range,
+            pause_limit: self.pause_limit,
+        }
     }
 }
 
@@ -538,6 +557,21 @@ mod tests {
             assert!(error.contains("must be a range from 2 to 30 semitones"), "{error}");
         }
         assert!(parse(&["speak", "v", "t", "o", "--pitch-range", "12"]).is_err());
+    }
+
+    #[test]
+    fn a_pause_limit_is_for_book_and_retake_and_off_or_from_0_3_to_5() {
+        let Ok(Command::Book { takes, model, .. }) = parse(&["book", "v", "b", "o", "--pause-limit", "0.8"]) else { panic!() };
+        assert_eq!(takes.keep(model.noise_limit).pause_limit, Some(pauses::PauseLimit::Seconds(0.8)));
+        let Ok(Command::Retake { takes, .. }) = parse(&["retake", "v", "b", "o", "3.12", "--pause-limit", "off"]) else { panic!() };
+        assert_eq!(takes.pause_limit, Some(pauses::PauseLimit::Off));
+        let Ok(Command::Book { takes, .. }) = parse(&["book", "v", "b", "o"]) else { panic!() };
+        assert_eq!(takes.pause_limit, None);
+        for bad in ["0.1", "6", "never"] {
+            let error = parse(&["book", "v", "b", "o", "--pause-limit", bad]).err().unwrap().to_string();
+            assert!(error.contains("must be off or a length from 0.3 to 5 seconds"), "{error}");
+        }
+        assert!(parse(&["speak", "v", "t", "o", "--pause-limit", "0.6"]).is_err());
     }
 
     #[test]

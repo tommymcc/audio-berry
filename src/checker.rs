@@ -34,7 +34,6 @@ pub struct Transcript {
 /// one word's end to the next one's start is shorter than the pause between them,
 /// and isn't a measure of its length.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code, reason = "nothing reads the timings yet")]
 pub struct Word {
     pub text: String,
     pub start: f32,

@@ -3,11 +3,12 @@
 
 use crate::accuracy::{Accuracy, Allowances};
 use crate::assemble::assemble;
-use crate::checker::Checker;
+use crate::checker::{Checker, Transcript};
 use crate::checks::{Goal, Standard, Verdict};
 use crate::epub::{Book, read_book};
 use crate::estimate::{Pace, split_above_seconds, warn_if_split};
 use crate::narrator::Narrator;
+use crate::pauses::PauseLimit;
 use crate::progress::Progress;
 use crate::store::{self, Chunk, KeepSettings, NarrationStore, RenderSettings, fnv};
 use crate::takes::{Kept, TakePolicy};
@@ -81,6 +82,22 @@ fn moved_suffix(accuracy: &Accuracy) -> String {
     if accuracy.in_order() { String::new() } else { format!(", moved {}", accuracy.moved_list()) }
 }
 
+/// The pauses in the middle of a phrase, for the progress output.
+fn pauses_suffix(verdict: &Verdict) -> String {
+    if verdict.evenly_paced() { String::new() } else { format!(", paused {}", verdict.pause_list()) }
+}
+
+/// The pauses in the middle of a phrase, as `report.tsv` shows them: empty with
+/// the pause limit off or none found, and `unmeasured` for a take whose check
+/// file has no word timings to place silences by.
+fn pauses_column(limit: PauseLimit, verdict: &Verdict) -> String {
+    match (limit, &verdict.pauses) {
+        (PauseLimit::Off, _) => String::new(),
+        (PauseLimit::Seconds(_), None) => "unmeasured".into(),
+        (PauseLimit::Seconds(_), Some(_)) => verdict.pause_list(),
+    }
+}
+
 /// Prints each chapter's number, title and size.
 pub fn list_chapters(path: &Path) -> Result<()> {
     let book = read_book(path)?;
@@ -93,6 +110,7 @@ pub fn list_chapters(path: &Path) -> Result<()> {
 
 struct Take {
     audio: AudioSamples,
+    heard: Transcript,
     verdict: Verdict,
 }
 
@@ -120,9 +138,9 @@ impl<'a> Recorder<'a> {
     fn take(&mut self, item: &Chunk, goal: &Goal, take: u64) -> Result<Take> {
         let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
         let audio = self.narrator.say(self.voice, &item.text, self.speed, Some(base_seed + take))?;
-        let transcript = self.checker.transcribe(&audio)?;
-        let verdict = self.standard.judge(goal, &item.text, &audio, &transcript.text);
-        Ok(Take { audio, verdict })
+        let heard = self.checker.transcribe(&audio)?;
+        let verdict = self.standard.judge(goal, &item.text, &audio, &heard.text, Some(&heard.words));
+        Ok(Take { audio, heard, verdict })
     }
 
     /// Renders takes from `first` on as `policy` says, for `goal`, and keeps the
@@ -142,22 +160,24 @@ impl<'a> Recorder<'a> {
             let Verdict { quality, accuracy, .. } = &current.verdict;
             match goal {
                 Goal::Book if !current.verdict.good_enough() => progress.line(&format!(
-                    "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}{}",
+                    "  take {} rejected: floor {:.0} dB, {:.1}s, recall {:.2}, extra {:.2}{}{}",
                     take + 1,
                     quality.floor_db,
                     quality.seconds,
                     accuracy.recall,
                     accuracy.extra,
                     moved_suffix(accuracy),
+                    pauses_suffix(&current.verdict),
                 ))?,
                 Goal::Book => {}
                 Goal::Retake { .. } => {
                     progress.line(&format!(
-                        "  take {}: recall {:.2}, extra {:.2}{}, phrase heard {}, floor {:.0} dB{}",
+                        "  take {}: recall {:.2}, extra {:.2}{}{}, phrase heard {}, floor {:.0} dB{}",
                         take + 1,
                         accuracy.recall,
                         accuracy.extra,
                         moved_suffix(accuracy),
+                        pauses_suffix(&current.verdict),
                         current.verdict.heard(),
                         quality.floor_db,
                         pitch_range_note(standard, &current.verdict),
@@ -177,21 +197,21 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
     // New columns go last, so anything reading columns by position still works.
     let mut report = String::from(
         "chapter\tchunk\tfile\ttakes\tfloor_db\tspeech_db\tseconds\tchars_per_s\trecall\textra\tflag\ttext\ttranscript\t\
-         pitch_range_st\tchecker\tmoved\n",
+         pitch_range_st\tchecker\tmoved\tpauses\n",
     );
     let mut flagged = 0;
     for item in store.chunks().iter().filter(|item| store.has_audio(item)) {
         let path = store.audio_path(item);
         let audio = AudioSamples::from_wav_file(&path)?;
         let check = store.check(item)?;
-        let verdict = standard.judge(&Goal::Book, &item.text, &audio, &check.transcript);
+        let verdict = standard.judge(&Goal::Book, &item.text, &audio, &check.transcript, check.words.as_deref());
         let pass = verdict.good_enough();
         let Verdict { quality, accuracy, .. } = &verdict;
         let characters = item.text.chars().count();
         flagged += usize::from(!pass);
         writeln!(
             report,
-            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             book.chapters[item.chapter].title,
             item.number(),
             path.file_name().unwrap_or_default().to_string_lossy(),
@@ -208,6 +228,7 @@ fn write_report(book: &Book, store: &NarrationStore, standard: &Standard, out: &
             verdict.pitch_range.map(|range| format!("{range:.1}")).unwrap_or_default(),
             check.checker.as_deref().unwrap_or_default(),
             accuracy.moved_list(),
+            pauses_column(standard.pause_limit(), &verdict),
         )?;
     }
     fs::write(out.join("report.tsv"), report)?;
@@ -262,7 +283,7 @@ pub fn narrate(
         for item in &pending {
             let kept = recorder.best(item, &Goal::Book, 0, *takes, &mut progress)?;
             let take = &kept.take;
-            store.store(item, &take.audio, &take.verdict.accuracy.transcript, kept.tried())?;
+            store.store(item, &take.audio, &take.heard, kept.tried())?;
             progress.chunk_done(&format!(
                 "{:.0}s of audio, {}, recall {:.2}{}",
                 take.audio.duration_secs(),
@@ -337,7 +358,8 @@ pub fn retake(
         let (first_take, current) = if store.has_audio(item) {
             let check = store.check(item)?;
             let audio = AudioSamples::from_wav_file(&path)?;
-            (check.takes, Some(standard.judge(&goal, &item.text, &audio, &check.transcript).judged()))
+            let verdict = standard.judge(&goal, &item.text, &audio, &check.transcript, check.words.as_deref());
+            (check.takes, Some(verdict.judged()))
         } else {
             (0, None)
         };
@@ -352,8 +374,8 @@ pub fn retake(
         let kept = recorder.best(item, &goal, first_take, *takes, &mut progress)?;
         let better = current.is_none_or(|current| kept.take.verdict.judged() > current);
         let outcome = if better {
-            let transcript = &kept.take.verdict.accuracy.transcript;
-            store.replace(item, &kept.take.audio, transcript, kept.tried())?;
+            let transcript = &kept.take.heard.text;
+            store.replace(item, &kept.take.audio, &kept.take.heard, kept.tried())?;
             let pitch_range = pitch_range_note(standard, &kept.take.verdict);
             progress.line(&format!("  replaced with {}{pitch_range}: {transcript}", takes.describe(&kept)))?;
             "replaced"
