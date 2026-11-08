@@ -197,7 +197,7 @@ struct Takes {
     pitch_range: Option<f32>,
     #[arg(
         long = "pause-limit",
-        value_name = "seconds",
+        value_name = "seconds|off",
         value_parser = pauses::parse_pause_limit,
         help = format!(
             "Fails a take with a silence this long or longer between two words the text doesn't \
