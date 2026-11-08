@@ -4,6 +4,7 @@
 
 use crate::numbers;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 /// Passages the user approved by ear scored 0.98-1.00 recall with 0.00-0.02 extra.
 const MIN_RECALL: f32 = 0.92;
@@ -128,19 +129,57 @@ impl Allowances {
     }
 }
 
+/// A word as compared, and the bytes of the text it came from. A number spelled
+/// out gives several words with the same bytes, and words joined into one have
+/// the bytes from the first to the last.
+#[derive(Clone, Debug, PartialEq)]
+struct Spanned {
+    word: String,
+    bytes: Range<usize>,
+}
+
 /// Lowercases into words, with commas between thousands dropped and numbers
 /// under 100 spelled out, as `numbers` writes them.
 fn words(text: &str) -> Vec<String> {
-    let cleaned: String = numbers::join_thousands(&text.to_lowercase())
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' })
-        .collect();
+    plain(spanned_words(text))
+}
+
+fn plain(words: Vec<Spanned>) -> Vec<String> {
+    words.into_iter().map(|spanned| spanned.word).collect()
+}
+
+/// The words of `text` as `words` gives them, each with its bytes in `text`.
+fn spanned_words(text: &str) -> Vec<Spanned> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let dropped = numbers::thousands_separators(&chars.iter().map(|&(_, c)| c).collect::<Vec<_>>());
+    // Runs of letters, digits and apostrophes, lowercased.
+    let mut runs: Vec<Spanned> = Vec::new();
+    let mut current: Option<Spanned> = None;
+    for (&(byte, c), dropped) in chars.iter().zip(dropped) {
+        if dropped {
+            continue;
+        }
+        if c.is_alphanumeric() || c == '\'' {
+            let end = byte + c.len_utf8();
+            match &mut current {
+                Some(run) => {
+                    run.word.extend(c.to_lowercase());
+                    run.bytes.end = end;
+                }
+                None => current = Some(Spanned { word: c.to_lowercase().collect(), bytes: byte..end }),
+            }
+        } else {
+            runs.extend(current.take());
+        }
+    }
+    runs.extend(current);
     let mut out = Vec::new();
-    for word in cleaned.split_whitespace() {
-        let word = word.trim_matches('\'');
+    for run in runs {
+        let word = run.word.trim_matches('\'');
+        let at = |word: &str| Spanned { word: word.to_string(), bytes: run.bytes.clone() };
         match numbers::spell_under_100(word) {
-            Some(spelled) => out.extend(spelled.into_iter().map(String::from)),
-            None if !word.is_empty() => out.push(word.to_string()),
+            Some(spelled) => out.extend(spelled.into_iter().map(at)),
+            None if !word.is_empty() => out.push(at(word)),
             None => {}
         }
     }
@@ -150,20 +189,41 @@ fn words(text: &str) -> Vec<String> {
 /// The words of two texts, with each number of 100 or more that one spells out
 /// and the other has in digits put in digits.
 fn words_of_both(first: &str, second: &str) -> (Vec<String>, Vec<String>) {
-    let (first, second) = (words(first), words(second));
-    (numbers::match_digits(&first, &second), numbers::match_digits(&second, &first))
+    let (first, second) = spanned_words_of_both(first, second);
+    (plain(first), plain(second))
+}
+
+/// `words_of_both`, with each word's bytes in its text.
+fn spanned_words_of_both(first: &str, second: &str) -> (Vec<Spanned>, Vec<Spanned>) {
+    let (first, second) = (spanned_words(first), spanned_words(second));
+    (in_digits(&first, &second), in_digits(&second, &first))
+}
+
+/// `words` with each number spelled out there, of 100 or more, that `other` has
+/// in digits, put in digits.
+fn in_digits(words: &[Spanned], other: &[Spanned]) -> Vec<Spanned> {
+    let plain = |words: &[Spanned]| words.iter().map(|spanned| spanned.word.clone()).collect::<Vec<_>>();
+    let mut index = 0;
+    numbers::match_digits(&plain(words), &plain(other))
+        .into_iter()
+        .map(|(word, count)| {
+            let bytes = words[index].bytes.start..words[index + count - 1].bytes.end;
+            index += count;
+            Spanned { word, bytes }
+        })
+        .collect()
 }
 
 /// Joins neighbouring words where `other` has them as one word, so "quarter
 /// deck" matches "quarterdeck" and "e book" matches "ebook".
-fn join_split_words(words: &[String], other: &[String]) -> Vec<String> {
+fn join_split_words(words: &[Spanned], other: &[Spanned]) -> Vec<Spanned> {
     let mut out = Vec::with_capacity(words.len());
     let mut index = 0;
     while index < words.len() {
         if let Some(next) = words.get(index + 1) {
-            let joined = format!("{}{next}", words[index]);
-            if other.contains(&joined) {
-                out.push(joined);
+            let joined = format!("{}{}", words[index].word, next.word);
+            if other.iter().any(|spanned| spanned.word == joined) {
+                out.push(Spanned { word: joined, bytes: words[index].bytes.start..next.bytes.end });
                 index += 2;
                 continue;
             }
@@ -175,8 +235,8 @@ fn join_split_words(words: &[String], other: &[String]) -> Vec<String> {
 }
 
 /// The words of a text and of its transcript, ready to line up.
-fn aligned_words(text: &str, transcript: &str) -> (Vec<String>, Vec<String>) {
-    let (expected, heard) = words_of_both(text, transcript);
+fn aligned_words(text: &str, transcript: &str) -> (Vec<Spanned>, Vec<Spanned>) {
+    let (expected, heard) = spanned_words_of_both(text, transcript);
     let expected = join_split_words(&expected, &heard);
     let heard = join_split_words(&heard, &expected);
     (expected, heard)
@@ -188,6 +248,10 @@ fn aligned_words(text: &str, transcript: &str) -> (Vec<String>, Vec<String>) {
 struct Alignment<'a> {
     expected: Vec<String>,
     heard: Vec<String>,
+    /// The bytes of the text each of `expected` came from.
+    expected_bytes: Vec<Range<usize>>,
+    /// The bytes of the transcript each of `heard` came from.
+    heard_bytes: Vec<Range<usize>>,
     allowances: &'a Allowances,
     /// How many words, in order, `expected[i..]` and `heard[j..]` have in
     /// common, as `table[i][j]`.
@@ -215,7 +279,11 @@ struct Run {
 
 impl<'a> Alignment<'a> {
     fn new(text: &str, transcript: &str, allowances: &'a Allowances) -> Alignment<'a> {
+        let split = |words: Vec<Spanned>| -> (Vec<String>, Vec<Range<usize>>) {
+            words.into_iter().map(|spanned| (spanned.word, spanned.bytes)).unzip()
+        };
         let (expected, heard) = aligned_words(text, transcript);
+        let ((expected, expected_bytes), (heard, heard_bytes)) = (split(expected), split(heard));
         let mut table = vec![vec![0usize; heard.len() + 1]; expected.len() + 1];
         for i in (0..expected.len()).rev() {
             for j in (0..heard.len()).rev() {
@@ -226,7 +294,7 @@ impl<'a> Alignment<'a> {
                 };
             }
         }
-        Alignment { expected, heard, allowances, table }
+        Alignment { expected, heard, expected_bytes, heard_bytes, allowances, table }
     }
 
     /// How many words of the text were heard in order.
@@ -391,6 +459,31 @@ pub fn compare(text: &str, transcript: &str, allowances: &Allowances) -> Accurac
     }
 }
 
+/// A word of a text lined up with the word heard for it, as the bytes of the
+/// text and of the transcript each came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pair {
+    pub written: Range<usize>,
+    pub heard: Range<usize>,
+}
+
+/// The words of `text` heard in `transcript`, lined up as `compare` lines them
+/// up, in order.
+pub fn pairs(text: &str, transcript: &str, allowances: &Allowances) -> Vec<Pair> {
+    let alignment = Alignment::new(text, transcript, allowances);
+    alignment
+        .steps()
+        .into_iter()
+        .filter_map(|step| match step {
+            Step::Paired(i, j) => Some(Pair {
+                written: alignment.expected_bytes[i].clone(),
+                heard: alignment.heard_bytes[j].clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Where one word of a text was heard as one other word.
 pub struct Substitutions {
     /// The text's words as they were compared, with any split words joined.
@@ -487,6 +580,36 @@ mod tests {
             let accuracy = compare(text, heard, &none());
             assert_eq!((accuracy.recall, accuracy.extra), (1.0, 0.0), "{text} / {heard}");
         }
+    }
+
+    /// The text and transcript words that `pairs` lines up, as written.
+    fn paired<'a>(text: &'a str, transcript: &'a str, allowances: &Allowances) -> Vec<(&'a str, &'a str)> {
+        let lined_up = super::pairs(text, transcript, allowances);
+        lined_up.into_iter().map(|pair| (&text[pair.written], &transcript[pair.heard])).collect()
+    }
+
+    #[test]
+    fn pairs_give_each_word_as_written_on_both_sides() {
+        assert_eq!(
+            paired("The 'Rabbit' sat, quietly.", "the rabbit sat quite", &none()),
+            [("The", "the"), ("'Rabbit'", "rabbit"), ("sat", "sat")]
+        );
+        assert_eq!(
+            paired("In 1066 he paid 3,000 pounds", "In ten sixty six he paid 3 ,000 pounds", &none()),
+            [("In", "In"), ("1066", "ten sixty six"), ("he", "he"), ("paid", "paid"), ("3,000", "3 ,000"), ("pounds", "pounds")]
+        );
+        assert_eq!(
+            paired("21 guns on the quarter-deck", "twenty-one guns on the quarterdeck", &none()),
+            [
+                ("21", "twenty"),
+                ("21", "one"),
+                ("guns", "guns"),
+                ("on", "on"),
+                ("the", "the"),
+                ("quarter-deck", "quarterdeck")
+            ]
+        );
+        assert_eq!(paired("sat in the boat", "sat and the boat", &allow("in = and"))[1], ("in", "and"));
     }
 
     #[test]

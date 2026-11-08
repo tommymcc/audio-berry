@@ -25,22 +25,28 @@ const ORDINAL_TENS: [&str; 8] =
 /// five hundred and forty one".
 const LONGEST_NUMBER: usize = 8;
 
-/// `text` without the commas between thousands, so "3,000" is one number, as
-/// is "3 ,000", as Parakeet sometimes writes it.
-pub fn join_thousands(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
+/// Which of `chars` to drop so that numbers with commas between thousands
+/// read as one number: each such comma, and any spaces before it, so "3,000" is
+/// one number, as is "3 ,000", as Parakeet sometimes writes it.
+pub fn thousands_separators(chars: &[char]) -> Vec<bool> {
+    let mut dropped = vec![false; chars.len()];
     for (index, &c) in chars.iter().enumerate() {
-        let after_digit = out.trim_end().ends_with(|c: char| c.is_ascii_digit());
+        if c != ',' {
+            continue;
+        }
+        // The spaces kept just before the comma, and the character before them.
+        let mut before = index;
+        while before > 0 && (dropped[before - 1] || chars[before - 1].is_whitespace()) {
+            before -= 1;
+        }
+        let after_digit = before > 0 && chars[before - 1].is_ascii_digit();
         let three_digits_after = chars.get(index + 1..index + 4).is_some_and(|next| next.iter().all(char::is_ascii_digit))
             && !chars.get(index + 4).is_some_and(char::is_ascii_digit);
-        if c == ',' && after_digit && three_digits_after {
-            out.truncate(out.trim_end().len());
-        } else {
-            out.push(c);
+        if after_digit && three_digits_after {
+            dropped[before..=index].fill(true);
         }
     }
-    out
+    dropped
 }
 
 /// A lowercase word that is a number under 100, in digits and maybe an ordinal,
@@ -61,9 +67,9 @@ pub fn spell_under_100(word: &str) -> Option<Vec<&'static str>> {
 }
 
 /// `words` with each number spelled out there, of 100 or more, that `other`
-/// has in digits, put in digits. Both are lowercase words, with numbers under
-/// 100 already spelled out.
-pub fn match_digits(words: &[String], other: &[String]) -> Vec<String> {
+/// has in digits, put in digits, each with how many of `words` it stands for.
+/// Both are lowercase words, with numbers under 100 already spelled out.
+pub fn match_digits(words: &[String], other: &[String]) -> Vec<(String, usize)> {
     let wanted: HashSet<u64> = other.iter().filter_map(|word| word.parse().ok()).filter(|&number| number >= 100).collect();
     let mut out = Vec::with_capacity(words.len());
     let mut index = 0;
@@ -75,11 +81,11 @@ pub fn match_digits(words: &[String], other: &[String]) -> Vec<String> {
         });
         match found {
             Some((number, length)) => {
-                out.push(number.to_string());
+                out.push((number.to_string(), length));
                 index += length;
             }
             None => {
-                out.push(words[index].clone());
+                out.push((words[index].clone(), 1));
                 index += 1;
             }
         }
@@ -168,7 +174,22 @@ mod tests {
 
     /// `heard` with its numbers matched to `written`'s digits.
     fn matched(heard: &str, written: &str) -> String {
-        match_digits(&words(heard), &words(written)).join(" ")
+        let matched: Vec<String> = match_digits(&words(heard), &words(written)).into_iter().map(|(word, _)| word).collect();
+        matched.join(" ")
+    }
+
+    /// `text` without the characters `thousands_separators` drops.
+    fn join_thousands(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let dropped = thousands_separators(&chars);
+        chars.iter().zip(dropped).filter(|(_, dropped)| !dropped).map(|(c, _)| c).collect()
+    }
+
+    #[test]
+    fn each_number_put_in_digits_says_how_many_words_it_stands_for() {
+        let groups = match_digits(&words("paid two hundred and fifty pounds"), &words("paid 250 pounds"));
+        let wanted = [("paid", 1), ("250", 4), ("pounds", 1)].map(|(word, count)| (word.to_string(), count));
+        assert_eq!(groups, wanted);
     }
 
     #[test]
