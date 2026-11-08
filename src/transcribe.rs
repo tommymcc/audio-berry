@@ -17,6 +17,9 @@ use fs_err as fs;
 use std::io::Write;
 use tokenizers::Tokenizer;
 
+/// Fast enough to find the phrases of a recording for `sections`, at the cost
+/// of some misheard words.
+pub const SECTIONS_MODEL: &str = "base.en";
 /// A voice's transcript is only written once and every take depends on it.
 pub const VOICE_TRANSCRIPTION_MODEL: &str = "medium.en";
 
