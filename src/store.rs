@@ -80,8 +80,8 @@ pub struct Check {
     /// Seeds tried so far, so the next retake tries new ones.
     pub takes: u64,
     pub transcript: String,
-    /// The model that heard the transcript, or `None` for a check file written
-    /// before it was recorded, when Whisper heard every take.
+    /// The checker that heard the transcript, or `None` for a check file with
+    /// only two lines, whose transcript Whisper heard.
     pub checker: Option<String>,
 }
 
@@ -96,14 +96,14 @@ impl Check {
         }
     }
 
-    /// Reads what `to_saved` wrote, or a check file from before the checker was
-    /// recorded, which has only the first two lines.
+    /// Reads what `to_saved` wrote: two lines, or three with the checker.
     fn from_saved(text: &str) -> Result<Check> {
         let mut lines = text.splitn(3, '\n');
         let (Some(takes), Some(transcript)) = (lines.next(), lines.next()) else {
-            bail!("malformed chunk check file");
+            bail!("it has no transcript line after its count of takes");
         };
-        Ok(Check { takes: takes.parse()?, transcript: transcript.to_string(), checker: lines.next().map(String::from) })
+        let takes = takes.parse().map_err(|_| eyre!("it starts {takes:?}, which isn't a count of takes"))?;
+        Ok(Check { takes, transcript: transcript.to_string(), checker: lines.next().map(String::from) })
     }
 }
 
@@ -709,7 +709,7 @@ impl NarrationStore {
     }
 
     /// Saves a chunk's audio and check file, replacing the audio in one step. The
-    /// check file records the checker in use, which heard `transcript`.
+    /// check file records `checker::MODEL` as the checker that heard `transcript`.
     pub fn store(&self, chunk: &Chunk, audio: &AudioSamples, transcript: &str, takes: u64) -> Result<()> {
         self.save_manifest()?;
         let path = self.audio_path(chunk);
@@ -724,7 +724,8 @@ impl NarrationStore {
 
     /// Reads the stored check for a chunk that has audio.
     pub fn check(&self, chunk: &Chunk) -> Result<Check> {
-        Check::from_saved(&fs::read_to_string(self.audio_path(chunk).with_extension("check"))?)
+        let path = self.audio_path(chunk).with_extension("check");
+        Check::from_saved(&fs::read_to_string(&path)?).wrap_err_with(|| format!("couldn't read {}", path.display()))
     }
 
     /// Records more tried seeds without changing the audio, its transcript or
@@ -1322,7 +1323,7 @@ mod tests {
         assert_eq!(saved_lines(&dir), ["noise_limit_db=-55", "takes=best-of-3"]);
     }
 
-    /// A check saying `takes` and `transcript`, heard by the checker in use now.
+    /// A check saying `takes` and `transcript`, heard by `checker::MODEL`.
     fn checked(takes: u64, transcript: &str) -> Check {
         Check { takes, transcript: transcript.into(), checker: Some(checker::MODEL.into()) }
     }
@@ -1339,14 +1340,14 @@ mod tests {
     }
 
     #[test]
-    fn a_check_file_from_before_checkers_were_recorded_reads_with_none() {
+    fn a_two_line_check_file_reads_with_no_checker() {
         let dir = TempDir::new("store-old-check");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), "heard", 1).unwrap();
-        fs::write(store.audio_path(chunk).with_extension("check"), "4\nheard by whisper").unwrap();
+        fs::write(store.audio_path(chunk).with_extension("check"), "4\nheard by Whisper").unwrap();
         let check = store.check(chunk).unwrap();
-        assert_eq!(check, Check { takes: 4, transcript: "heard by whisper".into(), checker: None });
+        assert_eq!(check, Check { takes: 4, transcript: "heard by Whisper".into(), checker: None });
     }
 
     #[test]
@@ -1373,8 +1374,16 @@ mod tests {
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), "heard", 1).unwrap();
-        fs::write(store.audio_path(chunk).with_extension("check"), "no newline").unwrap();
-        assert!(store.check(chunk).is_err());
+        let path = store.audio_path(chunk).with_extension("check");
+        for (contents, wanted) in [
+            ("no newline", "has no transcript line after its count of takes"),
+            ("two\nheard", "starts \"two\", which isn't a count of takes"),
+        ] {
+            fs::write(&path, contents).unwrap();
+            let error = format!("{:#}", store.check(chunk).unwrap_err());
+            assert!(error.contains(&format!("couldn't read {}", path.display())), "{error}");
+            assert!(error.contains(wanted), "{error}");
+        }
     }
 
     #[test]
@@ -1388,15 +1397,15 @@ mod tests {
     }
 
     #[test]
-    fn recording_tried_seeds_keeps_an_old_check_files_unrecorded_checker() {
+    fn recording_tried_seeds_keeps_a_two_line_check_file_two_lines() {
         let dir = TempDir::new("store-tried-old");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
         store.store(chunk, &tone(), "heard", 1).unwrap();
         let path = store.audio_path(chunk).with_extension("check");
-        fs::write(&path, "4\nheard by whisper").unwrap();
+        fs::write(&path, "4\nheard by Whisper").unwrap();
         store.record_tried(chunk, 9).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "9\nheard by whisper");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "9\nheard by Whisper");
     }
 
     #[test]
