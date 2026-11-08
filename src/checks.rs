@@ -116,14 +116,14 @@ impl Standard {
 
 impl Verdict {
     /// How the take compares with others of its chunk, for its goal. For `book`
-    /// it passes if it's a plausible length, clean and heard well enough. For
-    /// `retake` it passes if it's a plausible length, clean and its phrases were
-    /// heard, which its rank already puts first, so between new takes and the
-    /// current one the rank alone decides, as it always has; accuracy only ranks.
+    /// it passes if it's a plausible length, clean and heard well enough, with
+    /// no phrase in the wrong place. For `retake` it passes if it's a plausible
+    /// length, clean, its phrases were heard and no phrase was heard in the wrong
+    /// place; otherwise how well it was heard only ranks it.
     pub fn judged(&self) -> Judged<Rank> {
         let passes = match self.aim {
             Aim::Book => self.passes(),
-            Aim::Retake { heard } => self.plausible && self.clean && heard,
+            Aim::Retake { heard } => self.plausible && self.clean && heard && self.accuracy.in_order(),
         };
         Judged { passes, rank: self.rank() }
     }
@@ -147,7 +147,8 @@ impl Verdict {
         }
     }
 
-    /// Whether the take is a plausible length, clean and heard well enough.
+    /// Whether the take is a plausible length, clean and heard well enough, with
+    /// no phrase in the wrong place.
     fn passes(&self) -> bool {
         self.plausible && self.clean && self.accuracy.acceptable()
     }
@@ -247,7 +248,7 @@ mod tests {
     /// A take of a plausible length, heard with this recall and extra words.
     fn verdict(clean: bool, recall: f32, extra: f32) -> Verdict {
         let quality = Quality { floor_db: -60.0, speech_db: -20.0, peak_db: -2.0, seconds: 8.0 };
-        let accuracy = Accuracy { recall, extra, transcript: String::new() };
+        let accuracy = Accuracy { recall, extra, moved: Vec::new(), transcript: String::new() };
         Verdict { quality, accuracy, pitch_range: None, nearness: 0.0, plausible: true, clean, aim: Aim::Book }
     }
 
@@ -414,6 +415,41 @@ mod tests {
         assert!(!unheard.good_enough());
         let no_phrases = standard.judge(&Goal::Retake { phrases: &[] }, TEXT, &silence(4.0), TEXT);
         assert!(no_phrases.heard() && no_phrases.good_enough());
+    }
+
+    /// 38 words, and heard with "across the water" moved, which leaves recall
+    /// 0.92 and extra 0.08, acceptable on their own.
+    const LONG_TEXT: &str = "The boy ran down to the shore at dawn, and he looked out across the water for a long \
+        while, waiting for the boat that his father had promised would come back before the end of the summer.";
+    const MOVED: &str = "The boy ran down to the shore at dawn, and he looked out for a long while across the water, \
+        waiting for the boat that his father had promised would come back before the end of the summer.";
+
+    #[test]
+    fn a_book_take_with_a_moved_phrase_fails_below_one_that_passes() {
+        let standard = standard(1.0);
+        let moved = standard.judge(&Goal::Book, LONG_TEXT, &silence(10.0), MOVED);
+        assert!(moved.accuracy.recall >= 0.92 && moved.accuracy.extra <= 0.12);
+        assert!(!moved.passes() && !moved.good_enough());
+        // Three words missed and four added, but in order: it passes, with a lower score.
+        let missed = LONG_TEXT
+            .replacen("the shore", "a beach", 1)
+            .replacen("the boat", "a boat", 1)
+            .replacen("dawn", "dawn today", 1);
+        let in_order = standard.judge(&Goal::Book, LONG_TEXT, &silence(10.0), &missed);
+        assert!(in_order.passes() && in_order.accuracy.score() < moved.accuracy.score());
+        assert!(in_order.judged() > moved.judged());
+    }
+
+    #[test]
+    fn a_retake_with_a_moved_phrase_does_not_pass() {
+        let standard = standard(1.0);
+        let goal = Goal::Retake { phrases: &[] };
+        let moved = standard.judge(&goal, LONG_TEXT, &silence(10.0), MOVED);
+        assert!(!moved.judged().passes && !moved.good_enough());
+        let missed = LONG_TEXT.replacen("the shore", "a beach", 1);
+        let in_order = standard.judge(&goal, LONG_TEXT, &silence(10.0), &missed);
+        assert!(in_order.judged().passes);
+        assert!(in_order.judged() > moved.judged());
     }
 
     #[test]
