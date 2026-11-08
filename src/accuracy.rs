@@ -102,29 +102,159 @@ impl Allowances {
     }
 }
 
-/// Lowercases into words, spelling out small numbers so "1" matches "one".
+/// Lowercases into words, so that a number matches however it's written:
+/// numbers under 100 are spelled out, so "21" and "21st" match "twenty-one" and
+/// "twenty-first", and numbers spelled out from 100 up are put in digits, so
+/// "two hundred and fifty" matches "250" and "ten sixty-six" matches "1066".
 fn words(text: &str) -> Vec<String> {
-    let cleaned: String = text
-        .to_lowercase()
+    let cleaned: String = join_thousands(&text.to_lowercase())
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' })
         .collect();
     let mut out = Vec::new();
     for word in cleaned.split_whitespace() {
         let word = word.trim_matches('\'');
-        match word.parse::<usize>() {
-            Ok(number) if number < 20 => out.push(ONES[number].to_string()),
-            Ok(number) if number < 100 => {
-                out.push(TENS[number / 10 - 2].to_string());
-                if number % 10 != 0 {
-                    out.push(ONES[number % 10].to_string());
-                }
-            }
+        let (digits, suffix) = word.split_at(word.find(|c: char| !c.is_ascii_digit()).unwrap_or(word.len()));
+        let ordinal = matches!(suffix, "st" | "nd" | "rd" | "th");
+        match digits.parse::<usize>() {
+            Ok(number) if number < 100 && (suffix.is_empty() || ordinal) => spell(number, ordinal, &mut out),
             _ if !word.is_empty() => out.push(word.to_string()),
             _ => {}
         }
     }
+    numbers_in_digits(out)
+}
+
+/// Removes the commas between thousands, so "3,000" is one number, as is
+/// "3 ,000", as Parakeet sometimes writes it.
+fn join_thousands(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (index, &c) in chars.iter().enumerate() {
+        let after_digit = out.trim_end().ends_with(|c: char| c.is_ascii_digit());
+        let digits_after = chars.get(index + 1..index + 4).is_some_and(|next| next.iter().all(char::is_ascii_digit))
+            && !chars.get(index + 4).is_some_and(char::is_ascii_digit);
+        if c == ',' && after_digit && digits_after {
+            out.truncate(out.trim_end().len());
+        } else {
+            out.push(c);
+        }
+    }
     out
+}
+
+/// Spells out a number under 100, as an ordinal if `ordinal`.
+fn spell(number: usize, ordinal: bool, out: &mut Vec<String>) {
+    let ones = |number: usize| if ordinal { ORDINAL_ONES[number] } else { ONES[number] };
+    if number < 20 {
+        out.push(ones(number).to_string());
+    } else if number % 10 == 0 {
+        let tens = number / 10 - 2;
+        out.push(if ordinal { ORDINAL_TENS[tens] } else { TENS[tens] }.to_string());
+    } else {
+        out.push(TENS[number / 10 - 2].to_string());
+        out.push(ones(number % 10).to_string());
+    }
+}
+
+const ORDINAL_ONES: [&str; 20] = [
+    "zeroth", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+    "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth",
+    "nineteenth",
+];
+const ORDINAL_TENS: [&str; 8] =
+    ["twentieth", "thirtieth", "fortieth", "fiftieth", "sixtieth", "seventieth", "eightieth", "ninetieth"];
+
+/// Replaces each number spelled out in `words` that comes to 100 or more with its
+/// digits. Smaller ones stay spelled out, as `words` spells them.
+fn numbers_in_digits(words: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while index < words.len() {
+        match spelled_number(&words[index..]) {
+            Some((value, length)) if value >= 100 => {
+                out.push(value.to_string());
+                index += length;
+            }
+            _ => {
+                out.push(words[index].clone());
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The value of a number under 100 spelled out at the start of `words`, such as
+/// "forty five", and how many words it takes.
+fn spelled_under_100(words: &[String]) -> Option<(u64, usize)> {
+    let position = |list: &[&str], word: &String| list.iter().position(|item| item == word);
+    let first = words.first()?;
+    if let Some(tens) = position(&TENS, first) {
+        let tens = 10 * (tens as u64 + 2);
+        return match words.get(1).and_then(|word| position(&ONES, word)) {
+            Some(ones @ 1..=9) => Some((tens + ones as u64, 2)),
+            _ => Some((tens, 1)),
+        };
+    }
+    position(&ONES, first).map(|number| (number as u64, 1))
+}
+
+/// The value of a number spelled out at the start of `words`, and how many words
+/// it takes: a cardinal such as "two thousand five hundred and one", or a year
+/// such as "eighteen twenty" or "nineteen oh five".
+fn spelled_number(words: &[String]) -> Option<(u64, usize)> {
+    let (mut total, mut current) = (0, 0);
+    let mut index = 0;
+    // Whether `current` has a number under 100 since the last hundred or thousand.
+    let mut small_since_scale = false;
+    while index < words.len() {
+        let word = words[index].as_str();
+        match word {
+            // "hundred" on its own counts as "a hundred".
+            "hundred" if current < 100 => {
+                current = current.max(1) * 100;
+                small_since_scale = false;
+            }
+            "thousand" if total == 0 => {
+                total = current.max(1) * 1000;
+                current = 0;
+                small_since_scale = false;
+            }
+            "and" if index > 0 && !small_since_scale && current + total >= 100 => {
+                match spelled_under_100(&words[index + 1..]) {
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            _ => match spelled_under_100(&words[index..]) {
+                Some((value, length)) if !small_since_scale => {
+                    current += value;
+                    small_since_scale = true;
+                    index += length;
+                    continue;
+                }
+                _ => break,
+            },
+        }
+        index += 1;
+    }
+    if index == 0 {
+        return None;
+    }
+    let value = total + current;
+    // A year said as two pairs of digits, after a first pair with nothing else.
+    if total == 0 && (10..100).contains(&current) && small_since_scale {
+        let rest = &words[index..];
+        let second = match rest.first().map(String::as_str) {
+            Some("oh") => spelled_under_100(&rest[1..]).filter(|(ones, length)| *ones < 10 && *length == 1).map(|(ones, _)| (ones, 2)),
+            _ => spelled_under_100(rest).filter(|(pair, _)| *pair >= 10),
+        };
+        if let Some((pair, length)) = second {
+            return Some((current * 100 + pair, index + length));
+        }
+    }
+    Some((value, index))
 }
 
 /// How many words, in order, `expected[i..]` and `heard[j..]` have in common, as
@@ -266,6 +396,36 @@ mod tests {
         assert_eq!(accuracy.recall, 1.0);
         assert_eq!(accuracy.extra, 0.0);
         assert!(accuracy.acceptable());
+    }
+
+    #[test]
+    fn numbers_match_whether_written_in_digits_or_words() {
+        // As Parakeet heard numbers written in digits, sometimes in words and
+        // sometimes in digits, with its own spacing.
+        for (text, heard) in [
+            ("Chapter 12.", "Chapter twelve."),
+            ("In 1066 he paid 45 pounds for 250 sheep.", "In ten sixty-six he paid forty-five pounds for two hundred and fifty sheep."),
+            ("In 1820 there were 3,000 barrels.", "In eighteen twenty there were three thousand barrels."),
+            ("There were 3,000 barrels.", "There were 3 ,000 barrels."),
+            ("There were 3,000 barrels.", "There were 3000 barrels."),
+            ("It was 1905.", "It was nineteen oh five."),
+            ("It was 1800.", "It was eighteen hundred."),
+            ("He had 2,500 men and 101 guns.", "He had two thousand five hundred men and one hundred and one guns."),
+            ("the 2nd time, the 21st man, the 3rd of May", "the second time, the twenty-first man, the third of May"),
+            ("A hundred and fifty men.", "A 150 men."),
+        ] {
+            let accuracy = compare(text, heard, &none());
+            assert_eq!((accuracy.recall, accuracy.extra), (1.0, 0.0), "{text} / {heard}");
+        }
+    }
+
+    #[test]
+    fn small_numbers_in_a_row_stay_apart() {
+        // Counting isn't a number of its own, and twenty-one isn't a year.
+        assert_eq!(words("one, two, three"), ["one", "two", "three"]);
+        assert_eq!(words("twenty-one guns"), ["twenty", "one", "guns"]);
+        assert_eq!(words("21 guns"), ["twenty", "one", "guns"]);
+        assert!(compare("one hundred", "one two", &none()).recall < 1.0);
     }
 
     #[test]
