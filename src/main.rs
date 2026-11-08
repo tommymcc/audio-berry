@@ -12,6 +12,7 @@ mod estimate;
 mod files;
 mod mishearings;
 mod narrator;
+mod numbers;
 mod pitch;
 mod progress;
 mod quality;
