@@ -36,7 +36,9 @@
 
 **Voice sample:** the recording a narration's voice is cloned from, such as `voices/me.wav`, with what's said in it in a `.txt` file beside it. `clean` makes one from a noisy recording.
 
-**Checker:** the model that hears what's said in each take, so it can be compared with the text: Parakeet TDT 0.6b v3. Whisper `base.en` was the checker before it, and transcripts it heard in older output directories are kept. Each chunk's check file records its checker, except those from before checkers were recorded, which were all heard by Whisper. Whisper still transcribes voice samples and recordings for `sections`.
+**Checker:** the model that transcribes each take, so it can be compared with the text: Parakeet TDT 0.6b v3. Each chunk's check file records the checker that heard its transcript. A check file with no checker recorded holds a transcript heard by Whisper, which transcribes voice samples and the recordings `sections` looks through.
+
+**Transcript:** what a model heard said in some audio, as text. A take's transcript is the checker's, kept in the chunk's check file and shown in `report.tsv`; the checker also gives when each word was said.
 
 **Section:** a stretch of a recording, from one pause to another, that `sections` suggests making into a voice sample.
 

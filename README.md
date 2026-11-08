@@ -76,11 +76,16 @@ chapters 1 to 13, since chapter 14 is Project Gutenberg's license.
 - An NVIDIA GPU, with `nvidia-smi` working. A 25-second clip peaked at about
   2.9 GB of VRAM on an 8 GB card. The CUDA build fails without a GPU. Build with
   `--no-default-features` for CPU only, which hasn't been tested with OmniVoice.
-- For the CUDA build, the CUDA 13 runtime, cuBLAS 13 and cuDNN 9 for CUDA 13,
-  which the checker needs to run on the GPU through ONNX Runtime. On Ubuntu,
-  from NVIDIA's CUDA repository, these are the `cuda-cudart-13-1`,
-  `libcublas-13-1` and `libcudnn9-cuda-13` packages. `book` and `retake` stop
-  with an error naming any that are missing, rather than check takes on the CPU.
+- For the CUDA build, the CUDA 13 runtime, cuBLAS 13, cuRAND 10 and cuDNN 9
+  for CUDA 13, which the checker needs to run on the GPU through ONNX Runtime.
+  On Ubuntu these are the `cuda-cudart-13-1`, `libcublas-13-1` and
+  `libcudnn9-cuda-13` packages from NVIDIA's CUDA repository, and Ubuntu's
+  `libcurand10` or NVIDIA's `libcurand-13-1`. On Linux, `book` and `retake`
+  stop with an error naming any that are missing, rather than check takes on
+  the CPU. Elsewhere they stop with ONNX Runtime's error. OmniVoice's CUDA
+  build links `libcudart.so.12`, `libcublas.so.12` and `libcurand.so.10` itself,
+  so without those the binary doesn't start, and the system's loader names the
+  missing one.
   The build puts ONNX Runtime's CUDA provider, `libonnxruntime_providers_cuda.so`,
   beside the binary in `target/release`, and it has to stay there.
 
@@ -96,7 +101,7 @@ Metal has been tested on one Mac with 32 GB of memory, narrating 62 seconds of
 audio from Alice. All 7 chunks passed their checks on the first take, and it took
 230 s including loading the model. Its peak memory footprint was 7.4 GB. A full
 chapter, retrying a failed take, `retake` and `play` haven't been tried on a Mac.
-That test ran before Parakeet checked takes, when Whisper `base.en` did.
+In that test, Whisper `base.en` checked takes.
 
 On a Mac, the checker runs on ONNX Runtime's CoreML provider, and stops with an
 error if that can't start rather than running on the CPU. This hasn't been built
@@ -348,15 +353,18 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
   reason to listen, not as proof of a mistake. If it mishears a speaker's
   accent the same way again and again, see [Allowances](#allowances).
 
-  Numbers match however they're written, so the book's "1066" matches
-  "ten sixty-six" and "250" matches "two hundred and fifty", since Parakeet
-  writes some numbers in words and some in digits.
+  Numbers match however they're written, since Parakeet writes some in words
+  and some in digits. Numbers under 100 are compared spelled out, so "21st"
+  matches "twenty-first". A larger number spelled out on one side is put in
+  digits where the other side has it in digits, so the book's "1066" matches
+  "ten sixty-six", "250" matches "two hundred and fifty" and "100" matches "a
+  hundred", while "ten twenty men" against the same words stays as it is.
 
-  Until Parakeet, Whisper `base.en` checked takes. Its transcripts in an older
-  output directory are kept, and `report.tsv` judges them as before, so nothing
-  is rendered again. Each chunk's check file records the checker that heard it,
-  shown in the `checker` column of `report.tsv`, which is empty for a take
-  heard by Whisper.
+  A chunk's check file records the checker that heard its transcript, shown in
+  the `checker` column of `report.tsv`. A check file with no checker recorded
+  holds a transcript Whisper heard. `book` and `retake` read both kinds, and
+  `report.tsv` judges each transcript by the same rules, so no audio is
+  rendered again.
 
 If no take passes, the best one is kept and marked `CHECK` in `report.tsv`, with
 its text, transcript and chunk file so you can listen to it. Finished chunks are
@@ -507,7 +515,7 @@ at = had
 
 Each line pairs a word from the book with the word heard instead. `#` starts a
 comment. Words are compared as the check compares them, ignoring case and
-punctuation, with small numbers spelled out, and each side must be one word. A
+punctuation, with numbers under 100 spelled out, and each side must be one word. A
 bad line stops `book` or `retake` with the file and line number. Only those
 commands, which judge takes, read the file, so `speak` and `audition` ignore it.
 When a voice has allowances, `book` and `retake` say so:
@@ -554,9 +562,8 @@ Moby-Dick render, most lines were names and old or British spellings, which
 aren't the speaker's own. Copy only what is, such as a word other voices are
 heard saying correctly.
 
-The Moby-Dick list above came from Whisper `base.en`, which checked takes before
-Parakeet. Another model mishears differently, so an allowance written for
-Whisper may no longer be needed. `mishearings` counts every kept take's
+The Moby-Dick list above came from takes Whisper `base.en` heard. Parakeet
+mishears differently, so an allowance written for Whisper may not be needed. `mishearings` counts every kept take's
 transcript, whichever checker heard it; the `checker` column of `report.tsv`
 says which one did.
 
@@ -609,7 +616,7 @@ the text as it was sent to the model in `text/`, and its saved settings in
 Narrating chapter 3 of `aliceDynamic.epub` (30 chunks, 536.8 s of audio) in a new
 output directory, on an RTX 3070 Laptop GPU and a Ryzen 9 5900HS. Each build ran 3
 times, taking turns. The times cover the whole command, including loading the model,
-checking every take with Whisper `base.en`, the checker then, and building the M4B.
+checking every take with Whisper `base.en` and building the M4B.
 
 | Build | Median | Range | Realtime |
 |---|---|---|---|
