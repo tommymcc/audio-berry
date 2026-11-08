@@ -115,8 +115,8 @@ impl<'a> Recorder<'a> {
     fn take(&mut self, item: &Chunk, goal: &Goal, take: u64) -> Result<Take> {
         let base_seed = fnv(item.text.as_bytes(), 1) >> 1;
         let audio = self.narrator.say(self.voice, &item.text, self.speed, Some(base_seed + take))?;
-        let heard = self.checker.hear(&audio)?;
-        let verdict = self.standard.judge(goal, &item.text, &audio, &heard.text);
+        let transcript = self.checker.transcribe(&audio)?;
+        let verdict = self.standard.judge(goal, &item.text, &audio, &transcript.text);
         Ok(Take { audio, verdict })
     }
 

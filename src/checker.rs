@@ -1,7 +1,7 @@
-//! Hears what's said in a take with NVIDIA's Parakeet TDT 0.6b v3, run on ONNX
+//! Transcribes each take with NVIDIA's Parakeet TDT 0.6b v3, run on ONNX
 //! Runtime, so the take can be checked against its text, because OmniVoice
 //! sometimes produces fluent nonsense that sounds clean and runs to a plausible
-//! length. It gives each word's timing as well as the words.
+//! length. The transcript gives each word's timing as well as the words.
 
 use crate::audio::resample_as_saved;
 use any_tts::AudioSamples;
@@ -20,9 +20,9 @@ const FILES: [&str; 4] = ["vocab.txt", "encoder-model.onnx", "encoder-model.onnx
 /// The sample rate Parakeet hears at.
 const SAMPLE_RATE: u32 = 16_000;
 
-/// What was heard in a take.
+/// What the checker heard in a take.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Heard {
+pub struct Transcript {
     /// The words heard, with Parakeet's capitals and punctuation.
     pub text: String,
     pub words: Vec<Word>,
@@ -41,16 +41,16 @@ pub struct Word {
     pub end: f32,
 }
 
-impl Heard {
+impl Transcript {
     /// Parakeet's words, leaving out the punctuation it gives as words of their own.
-    fn from_result(result: TranscriptionResult) -> Heard {
+    fn from_result(result: TranscriptionResult) -> Transcript {
         let words = result
             .tokens
             .into_iter()
             .filter(|token| token.text.chars().any(char::is_alphanumeric))
             .map(|token| Word { text: token.text, start: token.start, end: token.end })
             .collect();
-        Heard { text: result.text.split_whitespace().collect::<Vec<_>>().join(" "), words }
+        Transcript { text: result.text.split_whitespace().collect::<Vec<_>>().join(" "), words }
     }
 }
 
@@ -61,10 +61,10 @@ pub struct Checker {
 
 impl Checker {
     /// Downloads the model on first use, and loads it on the GPU the build is for:
-    /// CUDA with the `cuda` feature, CoreML with `metal`, else the CPU. It never
-    /// falls back to the CPU from the GPU, which would be many times slower.
+    /// CUDA with the `cuda` feature, CoreML with `metal`, else the CPU. It stops
+    /// with an error if that GPU's provider can't start, rather than run on the CPU.
     pub fn start() -> Result<Checker> {
-        let directory = download()?;
+        let directory = download_model()?;
         let environment = parakeet_rs::ort::init().build().wrap_err("couldn't start ONNX Runtime")?;
         let provider = provider(&environment)?;
         let config = ExecutionConfig::new().with_environment(environment).with_execution_provider(provider);
@@ -75,19 +75,19 @@ impl Checker {
     }
 
     /// What's said in `audio`, heard as it would be once saved as a WAV file.
-    pub fn hear(&mut self, audio: &AudioSamples) -> Result<Heard> {
+    pub fn transcribe(&mut self, audio: &AudioSamples) -> Result<Transcript> {
         let samples = resample_as_saved(audio, SAMPLE_RATE)?;
         let result = self
             .model
             .transcribe_samples(samples, SAMPLE_RATE, 1, Some(TimestampMode::Words))
             .map_err(|error| eyre!("{error}"))
             .wrap_err_with(|| format!("{MODEL} couldn't transcribe a take"))?;
-        Ok(Heard::from_result(result))
+        Ok(Transcript::from_result(result))
     }
 }
 
 /// The folder of the model's files, downloading any not yet cached.
-fn download() -> Result<PathBuf> {
+fn download_model() -> Result<PathBuf> {
     let mut directory = None;
     for file in FILES {
         let path = download_file(REPO, &format!("{MODEL}/{file}"))
@@ -97,24 +97,23 @@ fn download() -> Result<PathBuf> {
     directory.ok_or_else(|| eyre!("{MODEL} has no files"))
 }
 
-/// The libraries ONNX Runtime's CUDA provider loads, and what provides them.
-#[cfg(any(feature = "cuda", test))]
-const CUDA_LIBRARIES: [(&str, &str); 4] = [
-    ("libcudart.so.13", "the CUDA 13 runtime"),
-    ("libcublas.so.13", "cuBLAS 13"),
-    ("libcublasLt.so.13", "cuBLAS 13"),
-    ("libcudnn.so.9", "cuDNN 9 for CUDA 13"),
-];
-
-/// The CUDA provider, once it's certain to run.
+/// The CUDA provider, once it's certain to run. On Linux, the libraries it needs
+/// are loaded first, so a missing one is named.
 #[cfg(feature = "cuda")]
 fn provider(environment: &Environment) -> Result<ExecutionProvider> {
-    let missing = missing_libraries(&CUDA_LIBRARIES, loads);
-    if !missing.is_empty() {
-        return Err(eyre!(missing_libraries_message(&missing)));
+    #[cfg(target_os = "linux")]
+    {
+        let missing = missing_libraries(&CUDA_LIBRARIES, can_load);
+        if !missing.is_empty() {
+            return Err(eyre!(missing_libraries_message(&missing, false)));
+        }
     }
-    register(environment, parakeet_rs::ort::ep::CUDA::default().build())
-        .wrap_err("couldn't start ONNX Runtime's CUDA provider to check takes on the GPU")?;
+    register(environment, parakeet_rs::ort::ep::CUDA::default().build()).wrap_err_with(|| {
+        format!(
+            "couldn't start ONNX Runtime's CUDA provider to check takes on the GPU. Or {}",
+            other_builds(cfg!(target_os = "macos"))
+        )
+    })?;
     Ok(ExecutionProvider::Cuda)
 }
 
@@ -126,9 +125,14 @@ fn provider(environment: &Environment) -> Result<ExecutionProvider> {
     Ok(ExecutionProvider::CoreML)
 }
 
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
+fn provider(_: &Environment) -> Result<ExecutionProvider> {
+    Ok(ExecutionProvider::Cpu)
+}
+
 /// Registers `provider` on a session that's then dropped, failing if it can't
 /// be registered. When a provider can't be, ONNX Runtime runs on the CPU
-/// instead without saying so, which for CUDA was 13 times slower.
+/// instead without saying so.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn register(environment: &Environment, provider: parakeet_rs::ort::ep::ExecutionProviderDispatch) -> Result<()> {
     parakeet_rs::ort::session::Session::builder(environment)
@@ -137,41 +141,78 @@ fn register(environment: &Environment, provider: parakeet_rs::ort::ep::Execution
         .map_err(|error| eyre!("{error}"))
 }
 
-#[cfg(not(any(feature = "cuda", feature = "metal")))]
-fn provider(_: &Environment) -> Result<ExecutionProvider> {
-    Ok(ExecutionProvider::Cpu)
-}
-
-/// The libraries of `libraries` that `loads` can't load.
+/// The builds that check takes without CUDA, for a CUDA build's errors: on a
+/// Mac, `metal` as well as the CPU.
 #[cfg(any(feature = "cuda", test))]
-fn missing_libraries<'a>(
-    libraries: &[(&'a str, &'a str)],
-    loads: impl Fn(&str) -> bool,
-) -> Vec<(&'a str, &'a str)> {
-    libraries.iter().copied().filter(|(library, _)| !loads(library)).collect()
-}
-
-/// Says the CUDA build needs `missing`, naming each library and what provides it.
-#[cfg(any(feature = "cuda", test))]
-fn missing_libraries_message(missing: &[(&str, &str)]) -> String {
-    let mut providers: Vec<&str> = Vec::new();
-    for (_, provider) in missing {
-        if !providers.contains(provider) {
-            providers.push(provider);
-        }
+fn other_builds(macos: bool) -> &'static str {
+    if macos {
+        "build with --no-default-features --features metal to check takes on a Mac's GPU, or with \
+         --no-default-features to check them on the CPU"
+    } else {
+        "build with --no-default-features to check takes on the CPU"
     }
-    let libraries: Vec<&str> = missing.iter().map(|(library, _)| *library).collect();
+}
+
+/// A shared library ONNX Runtime's CUDA provider loads, by the name it's loaded by.
+#[cfg(any(all(feature = "cuda", target_os = "linux"), test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Library {
+    file: &'static str,
+    /// What the library is part of.
+    provided_by: &'static str,
+    /// The Ubuntu packages that install it.
+    packages: &'static str,
+}
+
+/// The libraries `libonnxruntime_providers_cuda.so` needs, other than the C and
+/// C++ runtimes.
+#[cfg(any(all(feature = "cuda", target_os = "linux"), test))]
+const CUDA_LIBRARIES: [Library; 6] = [
+    Library { file: "libcuda.so.1", provided_by: "the NVIDIA driver", packages: "an NVIDIA driver" },
+    Library { file: "libcudart.so.13", provided_by: "the CUDA 13 runtime", packages: "cuda-cudart-13-1" },
+    Library { file: "libcublas.so.13", provided_by: "cuBLAS 13", packages: "libcublas-13-1" },
+    Library { file: "libcublasLt.so.13", provided_by: "cuBLAS 13", packages: "libcublas-13-1" },
+    Library {
+        file: "libcurand.so.10",
+        provided_by: "cuRAND 10",
+        packages: "libcurand10 (Ubuntu's) or libcurand-13-1 (NVIDIA's)",
+    },
+    Library { file: "libcudnn.so.9", provided_by: "cuDNN 9 for CUDA 13", packages: "libcudnn9-cuda-13" },
+];
+
+/// The libraries of `libraries` that `can_load` can't load.
+#[cfg(any(all(feature = "cuda", target_os = "linux"), test))]
+fn missing_libraries(libraries: &[Library], can_load: impl Fn(&str) -> bool) -> Vec<Library> {
+    libraries.iter().copied().filter(|library| !can_load(library.file)).collect()
+}
+
+/// Says the CUDA build needs `missing`, naming each library, what it's part of
+/// and the packages that install it, and the other builds, as on a Mac if `macos`.
+#[cfg(any(all(feature = "cuda", target_os = "linux"), test))]
+fn missing_libraries_message(missing: &[Library], macos: bool) -> String {
+    let distinct = |field: fn(&Library) -> &'static str| {
+        let mut values: Vec<&str> = Vec::new();
+        for library in missing {
+            if !values.contains(&field(library)) {
+                values.push(field(library));
+            }
+        }
+        values
+    };
+    let files: Vec<&str> = missing.iter().map(|library| library.file).collect();
     format!(
-        "{MODEL} checks takes on the GPU with ONNX Runtime's CUDA provider, which needs {}: {} couldn't be loaded. \
-         Install them, or build with --no-default-features to check takes on the CPU",
-        list(&providers),
-        list(&libraries),
+        "{MODEL} checks takes on the GPU with ONNX Runtime's CUDA provider, which needs {}: {} couldn't be \
+         loaded. On Ubuntu, install {}, or {}",
+        joined_with_and(&distinct(|library| library.provided_by)),
+        joined_with_and(&files),
+        joined_with_and(&distinct(|library| library.packages)),
+        other_builds(macos),
     )
 }
 
 /// Names joined with commas and a final "and".
-#[cfg(any(feature = "cuda", test))]
-fn list(names: &[&str]) -> String {
+#[cfg(any(all(feature = "cuda", target_os = "linux"), test))]
+fn joined_with_and(names: &[&str]) -> String {
     match names {
         [] => String::new(),
         [one] => one.to_string(),
@@ -180,8 +221,8 @@ fn list(names: &[&str]) -> String {
 }
 
 /// Whether the dynamic loader can load `library`, by the name ONNX Runtime uses.
-#[cfg(all(unix, any(feature = "cuda", test)))]
-fn loads(library: &str) -> bool {
+#[cfg(all(target_os = "linux", any(feature = "cuda", test)))]
+fn can_load(library: &str) -> bool {
     let Ok(name) = std::ffi::CString::new(library) else {
         return false;
     };
@@ -206,8 +247,12 @@ mod tests {
         TimedToken { text: text.into(), start, end }
     }
 
+    fn files(libraries: &[Library]) -> Vec<&str> {
+        libraries.iter().map(|library| library.file).collect()
+    }
+
     #[test]
-    fn heard_words_leave_out_punctuation_and_keep_their_times() {
+    fn transcript_words_leave_out_punctuation_and_keep_their_times() {
         let result = TranscriptionResult {
             text: "Chapter one.  Roving,  wasn't it?".into(),
             tokens: vec![
@@ -221,10 +266,10 @@ mod tests {
                 token("?", 2.72, 3.0),
             ],
         };
-        let heard = Heard::from_result(result);
-        assert_eq!(heard.text, "Chapter one. Roving, wasn't it?");
+        let transcript = Transcript::from_result(result);
+        assert_eq!(transcript.text, "Chapter one. Roving, wasn't it?");
         let words: Vec<(&str, f32, f32)> =
-            heard.words.iter().map(|word| (word.text.as_str(), word.start, word.end)).collect();
+            transcript.words.iter().map(|word| (word.text.as_str(), word.start, word.end)).collect();
         assert_eq!(
             words,
             [("Chapter", 0.08, 0.56), ("one", 0.64, 0.96), ("Roving", 1.6, 2.08), ("wasn't", 2.24, 2.56), ("it", 2.56, 2.72)]
@@ -233,39 +278,75 @@ mod tests {
 
     #[test]
     fn nothing_heard_is_no_words() {
-        let heard = Heard::from_result(TranscriptionResult { text: String::new(), tokens: Vec::new() });
-        assert_eq!(heard, Heard { text: String::new(), words: Vec::new() });
+        let transcript = Transcript::from_result(TranscriptionResult { text: String::new(), tokens: Vec::new() });
+        assert_eq!(transcript, Transcript { text: String::new(), words: Vec::new() });
     }
 
     #[test]
-    fn missing_cuda_libraries_are_named_with_what_provides_them() {
-        let missing = missing_libraries(&CUDA_LIBRARIES, |library| !library.starts_with("libcublas"));
-        assert_eq!(missing, [("libcublas.so.13", "cuBLAS 13"), ("libcublasLt.so.13", "cuBLAS 13")]);
+    fn every_library_the_cuda_provider_needs_is_checked() {
+        // The NEEDED entries of libonnxruntime_providers_cuda.so, other than the
+        // C and C++ runtimes.
+        let mut needed = files(&CUDA_LIBRARIES);
+        needed.sort_unstable();
         assert_eq!(
-            missing_libraries_message(&missing),
+            needed,
+            ["libcublas.so.13", "libcublasLt.so.13", "libcuda.so.1", "libcudart.so.13", "libcudnn.so.9", "libcurand.so.10"]
+        );
+    }
+
+    #[test]
+    fn missing_cuda_libraries_are_named_with_what_provides_them_and_their_packages() {
+        let missing = missing_libraries(&CUDA_LIBRARIES, |library| !library.starts_with("libcublas"));
+        assert_eq!(files(&missing), ["libcublas.so.13", "libcublasLt.so.13"]);
+        assert_eq!(
+            missing_libraries_message(&missing, false),
             "parakeet-tdt-0.6b-v3 checks takes on the GPU with ONNX Runtime's CUDA provider, which needs cuBLAS 13: \
-             libcublas.so.13 and libcublasLt.so.13 couldn't be loaded. Install them, or build with \
-             --no-default-features to check takes on the CPU"
+             libcublas.so.13 and libcublasLt.so.13 couldn't be loaded. On Ubuntu, install libcublas-13-1, or build \
+             with --no-default-features to check takes on the CPU"
         );
         assert!(missing_libraries(&CUDA_LIBRARIES, |_| true).is_empty());
     }
 
     #[test]
-    fn every_cuda_library_is_named_when_all_are_missing() {
-        let message = missing_libraries_message(&missing_libraries(&CUDA_LIBRARIES, |_| false));
+    fn a_missing_curand_names_both_packages() {
+        let missing = missing_libraries(&CUDA_LIBRARIES, |library| library != "libcurand.so.10");
+        let message = missing_libraries_message(&missing, false);
         assert!(
             message.contains(
-                "needs the CUDA 13 runtime, cuBLAS 13 and cuDNN 9 for CUDA 13: libcudart.so.13, libcublas.so.13, \
-                 libcublasLt.so.13 and libcudnn.so.9 couldn't be loaded"
+                "which needs cuRAND 10: libcurand.so.10 couldn't be loaded. On Ubuntu, install libcurand10 \
+                 (Ubuntu's) or libcurand-13-1 (NVIDIA's)"
             ),
             "{message}"
         );
     }
 
+    #[test]
+    fn every_cuda_library_is_named_when_all_are_missing() {
+        let message = missing_libraries_message(&missing_libraries(&CUDA_LIBRARIES, |_| false), false);
+        assert!(
+            message.contains(
+                "needs the NVIDIA driver, the CUDA 13 runtime, cuBLAS 13, cuRAND 10 and cuDNN 9 for CUDA 13: \
+                 libcuda.so.1, libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libcurand.so.10 and \
+                 libcudnn.so.9 couldn't be loaded"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn on_a_mac_a_cuda_build_points_to_the_metal_build() {
+        assert_eq!(
+            other_builds(true),
+            "build with --no-default-features --features metal to check takes on a Mac's GPU, or with \
+             --no-default-features to check them on the CPU"
+        );
+        assert_eq!(other_builds(false), "build with --no-default-features to check takes on the CPU");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_library_that_isnt_installed_doesnt_load_and_libc_does() {
-        assert!(!loads("libaudio-berry-not-a-library.so.0"));
-        assert!(loads("libc.so.6"));
+    fn a_library_that_isnt_installed_cant_be_loaded_and_libc_can() {
+        assert!(!can_load("libaudio-berry-not-a-library.so.0"));
+        assert!(can_load("libc.so.6"));
     }
 }
