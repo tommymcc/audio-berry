@@ -3,10 +3,10 @@
 //! floor once cleaned. Finding them by ear is the slow part of adding a voice.
 
 use crate::audio::decode_audio_up_to;
+use crate::checker::{self, Checker, Word};
 use crate::clean::{self, CLEANING_RATE, DEFAULT_REDUCTION_DB};
 use crate::quality::{self, FRAME_SECONDS};
 use crate::shell;
-use crate::transcribe::{Phrase, SECTIONS_MODEL, Transcriber};
 use crate::voice::SAMPLE_RATE;
 use any_tts::AudioSamples;
 use color_eyre::eyre::{Result, bail};
@@ -15,13 +15,6 @@ use std::time::Instant;
 
 /// How many sections to suggest unless told otherwise.
 pub const DEFAULT_COUNT: usize = 3;
-
-/// Hears where the phrases are, and what's said in the sections suggested. On a
-/// 34 second recording on the CPU, base.en found the phrases in 10 seconds with
-/// a peak of 0.7 GB of memory, and medium.en in 97 seconds with 5.4 GB, with
-/// timestamps as rough. Its words are only shown: a voice sample's first use
-/// transcribes it with medium.en.
-const MODEL: &str = SECTIONS_MODEL;
 
 /// The longest recording looked through. Memory grows with length, since the
 /// whole recording is cleaned at once: on the CPU, 10 minutes took 3.5 minutes
@@ -35,18 +28,22 @@ const MAX_SECONDS: f64 = 15.0;
 
 /// The silence kept before the first word and after the last, at most.
 const MARGIN_SECONDS: f64 = 0.2;
-/// The shortest silence a section may start or end in where Whisper heard a
-/// break between phrases.
+/// The shortest silence a section may start or end in where the checker heard
+/// a break between phrases.
 const MIN_CUT_PAUSE_SECONDS: f64 = 0.15;
 /// Elsewhere, a gap between words must be this long, so it's not the silence
 /// inside a word, such as before a "p".
 const MIN_WORD_GAP_SECONDS: f64 = 0.25;
-/// Whisper's timestamps are rough, so a pause this close to where Whisper put
-/// a break between phrases counts as that break.
+/// The checker's word end times run 0.4 to 0.6 seconds on into the pause after
+/// a word, so a pause this close to where it heard a break between phrases
+/// counts as that break.
 const TIMESTAMP_SLACK_SECONDS: f64 = 0.5;
 /// A pause this long is where a speaker breaks between phrases, so it's a
-/// good place to cut even where Whisper heard no break.
+/// good place to cut even where the checker heard no break.
 const PHRASE_PAUSE_SECONDS: f64 = 0.6;
+/// The punctuation the checker ends a phrase with. It ends a sentence with
+/// `.`, `!` or `?`.
+const PHRASE_ENDS: [char; 6] = ['.', '!', '?', ',', ';', ':'];
 
 /// A frame is speech when it's this far from the recording's floor to its
 /// loudest speech. Cleaned outdoor recordings keep a floor of about -45 dB, so
@@ -54,11 +51,14 @@ const PHRASE_PAUSE_SECONDS: f64 = 0.6;
 const SPEECH_FRACTION_OF_RANGE: f32 = 0.3;
 /// The loudest speech, as the level this fraction of frames are quieter than.
 const LOUD_FRACTION: f32 = 0.95;
+/// A frame this close to a word heard counts as heard with it. Parakeet leaves
+/// a frame or two, of 0.08 seconds, between words it hears run together: on
+/// the 34 second recording the weights were tuned on, 81 to 89% of the speech
+/// in its best sections fell during words, and all of it within 0.1 seconds of
+/// one.
+const HEARD_NEAR_SECONDS: f64 = 0.1;
 /// A frame whose raw peak reaches this is probably clipped.
 const CLIPPED_PEAK: f32 = 0.99;
-/// Whisper's confidence, as an average log probability, counted for time in a
-/// section where it heard no words, such as music or other noise.
-const UNHEARD_LOGPROB: f64 = -2.0;
 
 /// Frames are counted exactly, since `FRAME_SECONDS` as an `f32` isn't quite
 /// 0.05, and times are rounded to tenths.
@@ -98,11 +98,12 @@ const CLIPPED_FRAME_POINTS: f64 = 0.1;
 const STEADY_SPREAD_DB: f32 = 6.0;
 /// Lost per dB of spread beyond that, for a voice that comes and goes.
 const SPREAD_POINTS_PER_DB: f64 = 0.5;
-/// Whisper's average log probability for clear speech is about -0.1 to -0.3.
-const CLEAR_LOGPROB: f64 = -0.3;
-/// Lost per unit of log probability below that, for speech that's hard to
-/// make out, or isn't speech.
-const UNCLEAR_POINTS: f64 = 5.0;
+/// Lost for a section where no word was heard in any of its speech, such as
+/// music or other noise, and in proportion for part of it. Whisper scored a
+/// section by how sure it was of the words, losing 5 points per unit of
+/// average log probability below -0.3, and counted time with no words heard at
+/// -2, so a section with none heard lost 8.5 points, as it does here.
+const UNHEARD_POINTS: f64 = 8.5;
 /// The length aimed for, near the 11.4 seconds tested for narration.
 const IDEAL_SECONDS: f64 = 11.0;
 /// Lost per second away from it.
@@ -118,7 +119,7 @@ pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Res
     if length > MAX_RECORDING_SECONDS {
         bail!(too_long(recording));
     }
-    println!("Cleaning {length:.1}s of {}, then finding its phrases with Whisper {MODEL}", recording.display());
+    println!("Cleaning {length:.1}s of {}, then finding its phrases with {}", recording.display(), checker::MODEL);
     let cleaned = clean::clean_samples(&noisy, reduction_db.unwrap_or(DEFAULT_REDUCTION_DB))?;
     let frames = Frames::measure(&noisy, &cleaned);
     // The raw recording is the largest thing held, and isn't needed again.
@@ -127,10 +128,10 @@ pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Res
 
     let started = Instant::now();
     let audio = AudioSamples::new(cleaned, SAMPLE_RATE);
-    let mut transcriber = Transcriber::start(MODEL)?;
-    let phrases = transcriber.transcribe_phrases(&audio)?;
+    let mut checker = Checker::start()?;
+    let tokens = checker.transcribe(&audio)?.tokens;
     let cleaned = audio.samples;
-    println!("Found {} phrases in {:.1}s", phrases.len(), started.elapsed().as_secs_f32());
+    println!("Found {} phrases in {:.1}s", phrases(&tokens).len(), started.elapsed().as_secs_f32());
 
     let samples_between = |start: f64, end: f64| {
         let index = |seconds: f64| ((seconds * f64::from(SAMPLE_RATE)).round() as usize).min(cleaned.len());
@@ -138,7 +139,7 @@ pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Res
     };
     let floor_of = |start: f64, end: f64| quality::measure(samples_between(start, end), SAMPLE_RATE).floor_db;
     let length = cleaned.len() as f64 / f64::from(SAMPLE_RATE);
-    let sections = best_sections(&phrases, &frames, length, count, floor_of);
+    let sections = best_sections(&tokens, &frames, length, count, floor_of);
     if sections.is_empty() {
         bail!(
             "found no stretch of {MIN_SECONDS:.0} to {MAX_SECONDS:.0} seconds of speech in {} that starts and \
@@ -147,15 +148,15 @@ pub fn suggest(recording: &Path, count: usize, reduction_db: Option<f32>) -> Res
         );
     }
 
-    // Heard again, section by section, because Whisper's phrases cross the
-    // cuts: joining them would show words from outside a section, or miss
-    // some. This takes a few seconds, and gives the words the sample holds.
+    // Heard again, section by section, because the checker's word times run
+    // past the cuts: taking the words between them would show words from
+    // outside a section, or miss some. This gives the words the sample holds.
     let started = Instant::now();
     let mut heard = Vec::new();
     for section in &sections {
         // Clamped as clean saves it, so this is heard as the voice sample will be.
         let samples = samples_between(section.start, section.end).iter().map(|s| s.clamp(-1.0, 1.0)).collect();
-        heard.push(transcriber.transcribe(&AudioSamples::new(samples, SAMPLE_RATE))?);
+        heard.push(checker.transcribe(&AudioSamples::new(samples, SAMPLE_RATE))?.text);
     }
     println!("Transcribed them in {:.1}s", started.elapsed().as_secs_f32());
 
@@ -276,10 +277,63 @@ fn pauses(speaking: &[bool]) -> Vec<Pause> {
     pauses
 }
 
+/// A stretch of speech the checker heard as one: a sentence, or a clause,
+/// ending with the punctuation it heard there, if any.
+#[derive(Clone, Debug, PartialEq)]
+struct Phrase {
+    /// From the start of its first word to the end of its last, in seconds
+    /// from the start of the recording.
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+/// The phrases in what the checker heard, its words and punctuation in order:
+/// each runs from one of `PHRASE_ENDS` to the next.
+fn phrases(tokens: &[Word]) -> Vec<Phrase> {
+    let mut phrases: Vec<Phrase> = Vec::new();
+    let mut open = false;
+    for token in tokens {
+        let word = token.text.chars().any(char::is_alphanumeric);
+        match phrases.last_mut() {
+            Some(phrase) if open => {
+                if word {
+                    phrase.text.push(' ');
+                    phrase.end = f64::from(token.end);
+                }
+                phrase.text.push_str(&token.text);
+            }
+            _ if word => {
+                let (start, end) = (f64::from(token.start), f64::from(token.end));
+                phrases.push(Phrase { start, end, text: token.text.clone() });
+                open = true;
+            }
+            // Punctuation before any word of a phrase.
+            _ => continue,
+        }
+        if !word && token.text.ends_with(PHRASE_ENDS) {
+            open = false;
+        }
+    }
+    phrases
+}
+
+/// Which frames, of `count`, fall while a word of `tokens` was heard, or within
+/// `HEARD_NEAR_SECONDS` of one.
+fn heard_frames(tokens: &[Word], count: usize) -> Vec<bool> {
+    let mut heard = vec![false; count];
+    for word in tokens.iter().filter(|token| token.text.chars().any(char::is_alphanumeric)) {
+        let start = frame_at(f64::from(word.start) - HEARD_NEAR_SECONDS).min(count);
+        let end = frame_at(f64::from(word.end) + HEARD_NEAR_SECONDS).clamp(start, count);
+        heard[start..end].fill(true);
+    }
+    heard
+}
+
 /// How well a section starting or ending in a pause keeps to the speaker's phrasing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Break {
-    /// Between sentences, as Whisper heard them.
+    /// Between sentences, as the checker heard them.
     Sentence,
     /// Between phrases that aren't whole sentences, or a long pause.
     Phrase,
@@ -318,15 +372,15 @@ impl Cut {
 }
 
 /// The pauses a section could start or end in, and what each breaks. A pause
-/// near where Whisper heard one phrase end and the next begin breaks between
-/// them, judged by their punctuation. Other pauses break only between words,
-/// unless they're long.
+/// near where the checker heard one phrase end and the next begin breaks
+/// between them, judged by their punctuation. Other pauses break only between
+/// words, unless they're long.
 fn cuts(phrases: &[Phrase], speaking: &[bool]) -> Vec<Cut> {
     let ends_sentence = |phrase: &Phrase| phrase.text.trim_end().ends_with(['.', '!', '?']);
     let starts_sentence = |phrase: &Phrase| phrase.text.starts_with(char::is_uppercase);
-    // Where Whisper heard a break, give or take its slack, and whether it's
-    // between sentences. Silence before the first phrase and after the last
-    // counts too.
+    // Where the checker heard a break, give or take its slack, and whether
+    // it's between sentences. Silence before the first phrase and after the
+    // last counts too.
     let breaks: Vec<(f64, f64, bool)> = (0..=phrases.len())
         .map(|index| {
             let before = index.checked_sub(1).map(|before| &phrases[before]);
@@ -370,19 +424,29 @@ struct Section {
     /// How much the speech's level varies, as the standard deviation in dB.
     level_spread_db: f32,
     clipped_frames: usize,
-    /// Whisper's average log probability for the words of the phrases it
-    /// overlaps, weighted by how much of each it holds, with `UNHEARD_LOGPROB`
-    /// for the rest.
-    logprob: f64,
+    /// The fraction of its speech frames that fall while the checker heard a
+    /// word. Sound as loud as speech with no words heard is music, noise or
+    /// speech too unclear to make out.
+    heard: f64,
     floor_db: f32,
 }
 
 impl Section {
-    /// Measures the section from `start` to `end`, between `from` and `to`.
-    fn measure(phrases: &[Phrase], speaking: &[bool], frames: &Frames, (start, end): (f64, f64), (from, to): (Break, Break), floor_db: f32) -> Section {
+    /// Measures the section from `start` to `end`, between `from` and `to`,
+    /// given which frames are speech and which fall while a word was heard.
+    fn measure(
+        (speaking, heard): (&[bool], &[bool]),
+        frames: &Frames,
+        (start, end): (f64, f64),
+        (from, to): (Break, Break),
+        floor_db: f32,
+    ) -> Section {
         let span = frame_at(start).min(speaking.len())..frame_at(end).min(speaking.len());
         let inside = &speaking[span.clone()];
-        let speech = inside.iter().filter(|speaking| **speaking).count() as f64 / inside.len().max(1) as f64;
+        let spoken = inside.iter().filter(|speaking| **speaking).count();
+        let speech = spoken as f64 / inside.len().max(1) as f64;
+        let spoken_and_heard = span.clone().filter(|&frame| speaking[frame] && heard[frame]).count();
+        let heard = if spoken == 0 { 1.0 } else { spoken_and_heard as f64 / spoken as f64 };
         let excess_pause = pauses(inside).iter().map(|pause| (pause.seconds() - NATURAL_PAUSE_SECONDS).max(0.0)).sum();
 
         let levels: Vec<f32> = span.clone().filter(|&frame| speaking[frame]).map(|frame| frames.levels_db[frame]).collect();
@@ -390,13 +454,6 @@ impl Section {
         let mean = levels.iter().sum::<f32>() / count;
         let variance = levels.iter().map(|level| (level - mean).powi(2)).sum::<f32>() / count;
         let clipped_frames = span.filter(|&frame| frames.clipped.get(frame).copied().unwrap_or(false)).count();
-
-        let overlap = |phrase: &Phrase| (phrase.end.min(end) - phrase.start.max(start)).max(0.0);
-        let heard: f64 = phrases.iter().map(overlap).sum();
-        let unheard = (end - start - heard).max(0.0);
-        let logprob = (phrases.iter().map(|phrase| phrase.average_logprob * overlap(phrase)).sum::<f64>()
-            + UNHEARD_LOGPROB * unheard)
-            / (heard + unheard).max(TIME_EPSILON);
         Section {
             start,
             end,
@@ -406,7 +463,7 @@ impl Section {
             excess_pause,
             level_spread_db: variance.sqrt(),
             clipped_frames,
-            logprob,
+            heard,
             floor_db,
         }
     }
@@ -426,7 +483,7 @@ impl Section {
             frames => CLIPPING_POINTS + CLIPPED_FRAME_POINTS * frames as f64,
         };
         let spread = SPREAD_POINTS_PER_DB * f64::from((self.level_spread_db - STEADY_SPREAD_DB).max(0.0));
-        let unclear = UNCLEAR_POINTS * (CLEAR_LOGPROB - self.logprob).max(0.0);
+        let unclear = UNHEARD_POINTS * (1.0 - self.heard);
         let length = LENGTH_POINTS_PER_SECOND * (self.seconds() - IDEAL_SECONDS).abs();
         speech + whole - pauses - floor - clipping - spread - unclear - length
     }
@@ -445,11 +502,13 @@ impl Section {
 }
 
 /// Every section from one cut to another lasting `MIN_SECONDS` to
-/// `MAX_SECONDS`, in a recording `length` seconds long, measured, with its
-/// floor from `floor_of`, given a start and end in seconds.
-fn sections(phrases: &[Phrase], frames: &Frames, length: f64, floor_of: impl Fn(f64, f64) -> f32) -> Vec<Section> {
+/// `MAX_SECONDS`, in a recording `length` seconds long in which the checker
+/// heard `tokens`, measured, with its floor from `floor_of`, given a start and
+/// end in seconds.
+fn sections(tokens: &[Word], frames: &Frames, length: f64, floor_of: impl Fn(f64, f64) -> f32) -> Vec<Section> {
     let speaking = frames.speaking();
-    let cuts = cuts(phrases, &speaking);
+    let heard = heard_frames(tokens, speaking.len());
+    let cuts = cuts(&phrases(tokens), &speaking);
     // clean refuses an end past the recording's, so the last pause ends here.
     let last = tenth_before(length);
     let mut sections = Vec::new();
@@ -465,7 +524,7 @@ fn sections(phrases: &[Phrase], frames: &Frames, length: f64, floor_of: impl Fn(
                 continue;
             }
             let floor_db = floor_of(start, end);
-            sections.push(Section::measure(phrases, &speaking, frames, (start, end), (from.at, to.at), floor_db));
+            sections.push(Section::measure((&speaking, &heard), frames, (start, end), (from.at, to.at), floor_db));
         }
     }
     sections
@@ -473,13 +532,13 @@ fn sections(phrases: &[Phrase], frames: &Frames, length: f64, floor_of: impl Fn(
 
 /// The best `count` sections that don't overlap, best first.
 fn best_sections(
-    phrases: &[Phrase],
+    tokens: &[Word],
     frames: &Frames,
     length: f64,
     count: usize,
     floor_of: impl Fn(f64, f64) -> f32,
 ) -> Vec<Section> {
-    let mut candidates = sections(phrases, frames, length, floor_of);
+    let mut candidates = sections(tokens, frames, length, floor_of);
     candidates.sort_by(|a, b| b.score().total_cmp(&a.score()));
     let mut chosen: Vec<Section> = Vec::new();
     for candidate in candidates {
@@ -501,11 +560,33 @@ mod tests {
     const PAUSE_DB: f32 = -50.0;
 
     /// A recording with speech at the given times in seconds and silence
-    /// between, and Whisper's phrases for it.
+    /// between, and the words and punctuation the checker heard in it.
     struct Recording {
-        phrases: Vec<Phrase>,
+        tokens: Vec<Word>,
         frames: Frames,
         length: f64,
+    }
+
+    fn token(text: &str, start: f64, end: f64) -> Word {
+        Word { text: text.into(), start: start as f32, end: end as f32 }
+    }
+
+    /// The tokens of a phrase heard from `start` to `end`: its words, spread
+    /// evenly over that time, and any punctuation after them, as the checker
+    /// gives it, as tokens of their own.
+    fn heard(start: f64, end: f64, text: &str) -> Vec<Word> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let each = (end - start) / words.len() as f64;
+        let mut tokens = Vec::new();
+        for (index, word) in words.iter().enumerate() {
+            let bare = word.trim_end_matches(PHRASE_ENDS);
+            let at = start + index as f64 * each;
+            tokens.push(token(bare, at, at + each));
+            if bare.len() < word.len() {
+                tokens.push(token(&word[bare.len()..], at + each, at + each));
+            }
+        }
+        tokens
     }
 
     fn recording(length: f64, spoken: &[(f64, f64)], phrases: &[(f64, f64, &str)]) -> Recording {
@@ -515,30 +596,65 @@ mod tests {
             levels_db[frame_at(start)..frame_at(end)].fill(SPEECH_DB);
         }
         Recording {
-            phrases: phrases.iter().map(|&(start, end, text)| phrase(start, end, text)).collect(),
+            tokens: phrases.iter().flat_map(|&(start, end, text)| heard(start, end, text)).collect(),
             frames: Frames { levels_db, clipped: vec![false; frames] },
             length,
         }
     }
 
-    /// Phrases that are each a sentence, spoken exactly when Whisper says.
+    /// Phrases that are each a sentence, heard exactly when spoken.
     fn sentences(length: f64, spoken: &[(f64, f64)]) -> Recording {
         let phrases: Vec<(f64, f64, &str)> = spoken.iter().map(|&(start, end)| (start, end, "A sentence.")).collect();
         recording(length, spoken, &phrases)
     }
 
-    fn phrase(start: f64, end: f64, text: &str) -> Phrase {
-        Phrase { start, end, text: text.to_string(), average_logprob: -0.2 }
-    }
-
     impl Recording {
         fn best(&self, count: usize) -> Vec<Section> {
-            best_sections(&self.phrases, &self.frames, self.length, count, |_, _| -50.0)
+            best_sections(&self.tokens, &self.frames, self.length, count, |_, _| -50.0)
         }
 
         fn cuts(&self) -> Vec<Cut> {
-            cuts(&self.phrases, &self.frames.speaking())
+            cuts(&phrases(&self.tokens), &self.frames.speaking())
         }
+    }
+
+    #[test]
+    fn phrases_end_at_punctuation_and_keep_it() {
+        let tokens = [
+            token("Well", 0.1, 0.4),
+            token(",", 0.4, 0.5),
+            token("we", 0.9, 1.0),
+            token("went", 1.0, 1.6),
+            token(".", 1.6, 2.0),
+            token("\"", 2.0, 2.0),
+            token("Did", 2.5, 2.7),
+            token("you", 2.7, 2.9),
+            token("?", 2.9, 3.2),
+            token("!", 3.2, 3.3),
+            token("No", 3.5, 4.0),
+        ];
+        let found: Vec<(f64, f64, String)> = phrases(&tokens)
+            .into_iter()
+            .map(|phrase| ((phrase.start * 10.0).round() / 10.0, (phrase.end * 10.0).round() / 10.0, phrase.text))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (0.1, 0.4, "Well,".to_string()),
+                (0.9, 1.6, "we went.".to_string()),
+                (2.5, 2.9, "Did you?".to_string()),
+                (3.5, 4.0, "No".to_string()),
+            ]
+        );
+        assert!(phrases(&[]).is_empty());
+    }
+
+    #[test]
+    fn frames_near_a_word_are_heard_but_not_near_punctuation() {
+        let tokens = [token("One", 0.2, 0.3), token(".", 0.3, 0.9), token("Two", 0.8, 0.85), token("three", 1.4, 9.0)];
+        let heard = heard_frames(&tokens, 40);
+        let frames: Vec<usize> = (0..40).filter(|&frame| heard[frame]).collect();
+        assert_eq!(frames, [2, 3, 4, 5, 6, 7, 14, 15, 16, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]);
     }
 
     #[test]
@@ -550,8 +666,8 @@ mod tests {
     }
 
     #[test]
-    fn a_break_is_found_near_where_whisper_put_it() {
-        // Whisper puts the break at 2.0-2.1, but the silence is 2.2-2.6.
+    fn a_break_is_found_near_where_the_checker_heard_it() {
+        // The checker hears the break at 2.0-2.1, but the silence is 2.2-2.6.
         let recording = recording(6.0, &[(0.0, 2.2), (2.6, 6.0)], &[(0.0, 2.0, "One."), (2.1, 6.0, "Two.")]);
         assert_eq!(recording.cuts(), [Cut { pause: Pause { start: 44, end: 52 }, at: Break::Sentence }]);
     }
@@ -563,7 +679,7 @@ mod tests {
             // A gap between words inside the first phrase, a long one inside
             // the second, and one too short to cut in inside the third.
             &[(0.5, 2.0), (2.3, 4.0), (4.4, 5.0), (6.0, 8.0), (8.4, 9.0), (9.1, 11.5)],
-            &[(0.5, 4.0, "A clause,"), (4.4, 8.0, "and then more"), (8.4, 11.5, "Of it.")],
+            &[(0.5, 4.0, "A clause,"), (4.4, 8.0, "and then more;"), (8.4, 11.5, "Of it.")],
         );
         let at: Vec<(f64, Break)> = recording.cuts().iter().map(|cut| (seconds_at(cut.pause.start), cut.at)).collect();
         assert_eq!(
@@ -611,7 +727,7 @@ mod tests {
     fn whole_sentences_clear_speech_and_a_quiet_floor_score_higher() {
         let base = sentences(14.0, &[(0.5, 6.0), (6.4, 11.0)]).best(1)[0].clone();
         let mid_sentence = Section { from: Break::Word, to: Break::Word, ..base.clone() };
-        let unclear = Section { logprob: -0.9, ..base.clone() };
+        let unclear = Section { heard: 0.7, ..base.clone() };
         let noisy = Section { floor_db: -35.0, ..base.clone() };
         let clipped = Section { clipped_frames: 2, ..base.clone() };
         let uneven = Section { level_spread_db: 10.0, ..base.clone() };
@@ -646,7 +762,8 @@ mod tests {
         let spoken = [(0.5, 6.0), (6.4, 11.0)];
         let music = recording(14.0, &spoken, &[(0.5, 6.0, "A sentence.")]).best(1)[0].clone();
         let speech = sentences(14.0, &spoken).best(1)[0].clone();
-        assert!(music.logprob < -0.9, "{music:?}");
+        assert!(music.heard < 0.6, "{music:?}");
+        assert_eq!(speech.heard, 1.0, "{speech:?}");
         assert!(speech.score() > music.score() + 3.0);
     }
 
