@@ -24,7 +24,7 @@ const FILES: [&str; 4] = ["vocab.txt", "encoder-model.onnx", "encoder-model.onnx
 const SAMPLE_RATE: u32 = 16_000;
 
 /// The longest stretch of audio Parakeet hears at once. Longer audio is heard
-/// in windows, since on a 65 second recording Parakeet left out a whole phrase
+/// in windows of about equal length, since on a 65 second recording Parakeet left out a whole phrase
 /// that it heard in a clip cut from it. Heard whole, a 102 second interview
 /// lost "I was a young lad of seventeen, my eldest brother", and in windows of
 /// up to 45 seconds it lost "I was a young lad of seventeen". Windows of 30 or
@@ -33,9 +33,12 @@ const SAMPLE_RATE: u32 = 16_000;
 /// one, and windows of 20 seconds cut twice as often as 30 for no fewer
 /// mishearings. On the GPU, the 102 seconds took 0.8 seconds in any windows.
 const MAX_WINDOW_SECONDS: usize = 30;
-/// A window ends in the quietest stretch of its last this many seconds, so it
-/// isn't cut in the middle of a word.
-const CUT_SEARCH_SECONDS: usize = 10;
+/// A window ends in the quietest stretch within this many seconds of where
+/// equal windows would end, so it isn't cut in the middle of a word. So no
+/// window is shorter than about 10 seconds: in a quarter of a second of digital
+/// silence or faint noise Parakeet heard nothing or "Okay.", in half a second
+/// of silence "Yeah.", and one sample was an error.
+const CUT_SEARCH_SECONDS: usize = 5;
 /// Loudness is measured in frames of a tenth of a second at Parakeet's sample
 /// rate.
 const CUT_FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 10;
@@ -53,11 +56,27 @@ pub struct Transcript {
     pub words: Vec<Word>,
     /// The words heard and, between them, the punctuation Parakeet gives as
     /// tokens of its own, such as "." and ",", in the order heard.
-    pub tokens: Vec<Word>,
+    pub tokens: Vec<Token>,
 }
 
-/// A word heard, or a punctuation mark, with when it was said, in seconds from
-/// the start of the audio.
+/// A word or punctuation mark heard, as Parakeet gives it, with when it was
+/// said, in seconds from the start of the audio.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Token {
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+}
+
+impl Token {
+    /// Whether it's a word rather than punctuation: whether it has a letter or
+    /// a digit.
+    pub fn is_word(&self) -> bool {
+        self.text.chars().any(char::is_alphanumeric)
+    }
+}
+
+/// A word heard, with when it was said, in seconds from the start of the audio.
 ///
 /// Parakeet's end times run on into the silence after a word, so the time from
 /// one word's end to the next one's start is shorter than the pause between them,
@@ -87,12 +106,16 @@ impl Transcript {
     /// Parakeet's words, with the punctuation it gives as words of their own
     /// kept apart from them, heard in audio starting `offset` seconds in.
     fn from_result(result: TranscriptionResult, offset: f32) -> Transcript {
-        let tokens: Vec<Word> = result
+        let tokens: Vec<Token> = result
             .tokens
             .into_iter()
-            .map(|token| Word { text: token.text, start: offset + token.start, end: offset + token.end })
+            .map(|token| Token { text: token.text, start: offset + token.start, end: offset + token.end })
             .collect();
-        let words = tokens.iter().filter(|token| token.text.chars().any(char::is_alphanumeric)).cloned().collect();
+        let words = tokens
+            .iter()
+            .filter(|token| token.is_word())
+            .map(|token| Word { text: token.text.clone(), start: token.start, end: token.end })
+            .collect();
         Transcript { text: result.text.split_whitespace().collect::<Vec<_>>().join(" "), words, tokens }
     }
 
@@ -149,7 +172,8 @@ impl Checker {
 
 /// The windows `samples`, at Parakeet's sample rate, are heard in, from start
 /// to end: each at most `MAX_WINDOW_SECONDS` long, and cut at the quietest
-/// half second in its last `CUT_SEARCH_SECONDS`.
+/// half second within `CUT_SEARCH_SECONDS` of where windows of equal length
+/// would end.
 fn windows(samples: &[f32]) -> Vec<Range<usize>> {
     let max = MAX_WINDOW_SECONDS * SAMPLE_RATE as usize;
     let search = CUT_SEARCH_SECONDS * SAMPLE_RATE as usize;
@@ -158,14 +182,22 @@ fn windows(samples: &[f32]) -> Vec<Range<usize>> {
     let mut start = 0;
     while start < samples.len() {
         let mut end = samples.len();
-        if end - start > max {
-            let from = start + max - search;
-            let frames: Vec<f32> = samples[from..start + max].chunks_exact(CUT_FRAME_SAMPLES).map(loudness).collect();
+        let left = end - start;
+        if left > max {
+            // Over 30 seconds left, so equal windows are 15 to 30 seconds long.
+            let equal = left / left.div_ceil(max);
+            let (from, to) = (start + equal - search, (start + equal + search).min(start + max));
+            let frames: Vec<f32> = samples[from..to].chunks_exact(CUT_FRAME_SAMPLES).map(loudness).collect();
+            // Of stretches as quiet, the one nearest where equal windows end.
+            let aim = (start + equal - from) / CUT_FRAME_SAMPLES;
             let quietest = frames
                 .windows(QUIET_FRAMES)
                 .map(|stretch| stretch.iter().sum::<f32>())
                 .enumerate()
-                .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                .min_by(|(i, a), (j, b)| {
+                    let off = |index: usize| (index + QUIET_FRAMES / 2).abs_diff(aim);
+                    a.total_cmp(b).then(off(*i).cmp(&off(*j)))
+                })
                 .map_or(0, |(index, _)| index);
             let middle = quietest + QUIET_FRAMES / 2;
             end = from + middle * CUT_FRAME_SAMPLES + CUT_FRAME_SAMPLES / 2;
@@ -424,15 +456,35 @@ mod tests {
 
     #[test]
     fn a_window_ends_in_a_long_pause_rather_than_a_short_silent_gap() {
-        // A silent gap of a fifth of a second at 22 seconds, and a pause of
-        // over half a second at 27 with a little noise in it.
-        let mut audio = loud(22.0);
+        // A silent gap of a fifth of a second at 20 seconds, and a pause of
+        // over half a second at 25 with a little noise in it.
+        let mut audio = loud(20.0);
         audio.extend(vec![0.0; SAMPLE_RATE as usize / 5]);
         audio.extend(loud(4.8));
         audio.extend(vec![0.01; SAMPLE_RATE as usize * 6 / 10]);
-        audio.extend(loud(10.0));
+        audio.extend(loud(20.0));
         let end = seconds(&windows(&audio))[0].1;
-        assert!((27.0..27.6).contains(&end), "{end}");
+        assert!((25.0..25.6).contains(&end), "{end}");
+    }
+
+    #[test]
+    fn no_window_is_short_even_with_a_silence_near_the_longest_window() {
+        // Just over the longest window, with its only pause right at the end,
+        // where a cut would leave a few tenths of a second to hear on its own.
+        let mut audio = loud(29.8);
+        audio.extend(vec![0.0; SAMPLE_RATE as usize / 2]);
+        let found = seconds(&windows(&audio));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|(start, end)| end - start >= 10.0), "{found:?}");
+    }
+
+    #[test]
+    fn windows_are_about_equal_and_never_over_the_longest() {
+        let audio = loud(101.8);
+        let found = seconds(&windows(&audio));
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert!(found.iter().all(|(start, end)| (15.0..=MAX_WINDOW_SECONDS as f32).contains(&(end - start))), "{found:?}");
+        assert_eq!(windows(&audio).last().unwrap().end, audio.len());
     }
 
     #[test]
