@@ -141,7 +141,7 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ```
 
    It cleans the whole recording as `clean` does, then hears what's said in it
-   with the checker, Parakeet, 30 seconds at a time, and scores each 8 to 15
+   with the checker, Parakeet, in windows of up to 30 seconds, and scores each 8 to 15
    second stretch that starts and ends in a pause. Mostly speech, whole
    sentences, and speech heard as words all through score higher. Long pauses,
    clipping, a noisy floor and an uneven level score lower, but don't rule a
@@ -352,7 +352,8 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
   downloads on first use from the `parakeet-tdt-0.6b-v3` folder of
   [`altunenes/parakeet-rs`](https://huggingface.co/altunenes/parakeet-rs)
   (2.6 GB). It also transcribes voice samples and the recordings `sections`
-  looks through, hearing anything over 30 seconds in windows cut in pauses.
+  looks through, hearing anything over 30 seconds in windows of about equal
+  length, cut in pauses.
   The checker mishears some correct speech, so treat a flag as a
   reason to listen, not as proof of a mistake. If it mishears a speaker's
   accent the same way again and again, see [Allowances](#allowances).
