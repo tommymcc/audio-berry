@@ -6,7 +6,7 @@ use crate::estimate::Pace;
 use crate::files::read_if_present;
 use crate::sample_check::SampleCheck;
 use crate::store::fnv;
-use crate::transcribe::{Transcriber, VOICE_TRANSCRIPTION_MODEL};
+use crate::checker::Checker;
 use any_tts::models::omnivoice::trim_long_audio;
 use any_tts::{AudioSamples, ReferenceAudio};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
@@ -68,7 +68,7 @@ impl Voice {
         }
 
         let heard = AudioSamples::new(samples, SAMPLE_RATE);
-        let transcript = Transcriber::start(VOICE_TRANSCRIPTION_MODEL)?.transcribe(&heard)?;
+        let transcript = Checker::start()?.transcribe(&heard)?.text;
         let samples = heard.samples;
         if transcript.is_empty() {
             bail!("heard no speech in {}", path.display());
