@@ -51,11 +51,10 @@ const PHRASE_ENDS: [char; 6] = ['.', '!', '?', ',', ';', ':'];
 const SPEECH_FRACTION_OF_RANGE: f32 = 0.3;
 /// The loudest speech, as the level this fraction of frames are quieter than.
 const LOUD_FRACTION: f32 = 0.95;
-/// A frame this close to a word heard counts as heard with it. Parakeet leaves
-/// a frame or two, of 0.08 seconds, between words it hears run together: on
-/// the 34 second recording the weights were tuned on, 81 to 89% of the speech
-/// in its best sections fell during words, and all of it within 0.1 seconds of
-/// one.
+/// A frame this close to a word heard counts as heard with it. The checker's
+/// word times leave short gaps between words said run together: on the 34
+/// second recording the weights were tuned on, 81 to 89% of the speech in its
+/// best sections fell during words, and all of it within 0.1 seconds of one.
 const HEARD_NEAR_SECONDS: f64 = 0.1;
 /// A frame whose raw peak reaches this is probably clipped.
 const CLIPPED_PEAK: f32 = 0.99;
