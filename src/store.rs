@@ -1483,7 +1483,7 @@ mod tests {
 
     /// `text` heard, with no words timed.
     fn heard(text: &str) -> Transcript {
-        Transcript { text: text.into(), words: Vec::new() }
+        Transcript { text: text.into(), ..Transcript::default() }
     }
 
     /// A check saying `takes` and `transcript`, heard by `checker::MODEL`, with
@@ -1507,7 +1507,7 @@ mod tests {
         let dir = TempDir::new("store-words");
         let store = open(&dir, &[&["a"]]);
         let chunk = &store.chunks()[0];
-        let transcript = Transcript { text: "Chapter, wasn't 3,000@".into(), words: timed() };
+        let transcript = Transcript { text: "Chapter, wasn't 3,000@".into(), words: timed(), tokens: timed() };
         store.store(chunk, &tone(), &transcript, 2).unwrap();
         let saved = fs::read_to_string(store.audio_path(chunk).with_extension("check")).unwrap();
         assert_eq!(
