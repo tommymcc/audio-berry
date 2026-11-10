@@ -71,7 +71,12 @@ impl Voice {
         let transcript = Checker::start()?.transcribe(&heard)?.text;
         let samples = heard.samples;
         if transcript.is_empty() {
-            bail!("heard no speech in {}", path.display());
+            bail!(
+                "heard no speech in {}. A sample that starts partway through a word can be heard as none: \
+                 cut it to start in a pause, or write what's said in it to {}",
+                path.display(),
+                transcript_path.display()
+            );
         }
         fs::write(&transcript_path, format!("{transcript}\n"))?;
         println!("Heard in the voice sample: {transcript}");
