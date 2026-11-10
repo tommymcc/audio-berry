@@ -3,9 +3,9 @@
 Narrates text in a cloned voice, entirely on your own machine, and plays the
 result on a Cast speaker. Speech runs on OmniVoice through a fork of
 [`any-tts`](https://github.com/tommymcc/any-tts). The only network access is
-downloading the models once (about 3.3 GB for speech, 2.6 GB of Parakeet for
-checking takes, and the Whisper models for voice samples) and talking to
-speakers on your LAN.
+downloading the models once (about 3.3 GB for speech, and 2.6 GB of Parakeet
+for hearing what's said in takes, voice samples and recordings) and talking
+to speakers on your LAN.
 
 ## Make an audiobook
 
@@ -35,7 +35,7 @@ from Project Gutenberg.
    [Adding a voice](#adding-a-voice) for `clean`, and for `sections`, which
    suggests the best stretches to cut.
 
-3. **Test the voice.** The first run downloads the models (about 6.3 GB) and
+3. **Test the voice.** The first run downloads the models (about 5.9 GB) and
    writes down what's said in the sample as `voices/me.txt`. Correct any wrong
    words in that file, then listen to `output/test.wav`:
 
@@ -135,17 +135,19 @@ Only clone your own voice, or the voice of someone who has agreed to it.
    ```
 
    ```text
-   1. 20.1-30.7 (10.6s), floor -45.2 dB, 70% speech
-      Roughly: "Used to work on the reverse sail most times. Very late times. ..."
-      audio-berry clean recording.mp3 20.1 30.7 voices/recording-20.1s.wav
+   1. 5.2-14.1 (8.9s), floor -44.3 dB, 70% speech
+      Roughly: "Now we had most of our needs, so we grew on the land. ..."
+      audio-berry clean recording.mp3 5.2 14.1 voices/recording-5.2s.wav
    ```
 
-   It cleans the whole recording as `clean` does, then scores each 8 to 15
+   It cleans the whole recording as `clean` does, then hears what's said in it
+   with the checker, Parakeet, 30 seconds at a time, and scores each 8 to 15
    second stretch that starts and ends in a pause. Mostly speech, whole
-   sentences and clear words score higher. Long pauses, clipping, a noisy floor
-   and an uneven level score lower, but don't rule a stretch out, so check the
-   floor and any `clipped` mark. The words are only a rough guide: the sample's
-   first use transcribes it properly. It can't tell voices apart, so with more
+   sentences, and speech heard as words all through score higher. Long pauses,
+   clipping, a noisy floor and an uneven level score lower, but don't rule a
+   stretch out, so check the floor and any `clipped` mark. The words are what
+   the checker hears in that stretch, much as the sample's first use will, so
+   expect the same mistakes there. It can't tell voices apart, so with more
    than one speaker, check each suggestion is the right one. It looks through
    at most 30 minutes, so cut a longer recording first.
 
@@ -192,9 +194,11 @@ Only clone your own voice, or the voice of someone who has agreed to it.
 
 5. **Check its words.** OmniVoice also needs the words spoken in the sample. The
    first command to use it, such as `audition` in the next step, transcribes it
-   locally and saves the text beside it, as `voices/me.txt`. Read that file and
-   correct any mistakes, since a wrong word no longer matches the audio. You can
-   also write the file yourself before the first run.
+   locally with the checker and saves the text beside it, as `voices/me.txt`.
+   Read that file and correct any mistakes, since a wrong word no longer matches
+   the audio. You can also write the file yourself before the first run. A
+   sample that starts partway through a word can be heard as no speech at all:
+   cut it to start in a pause, or write the file yourself.
 
    Every run also prints the sample's [floor](#noise-limit), since takes copy it:
 
@@ -347,9 +351,9 @@ nonsense, so every take is checked and retried up to 5 times with a new seed:
   Runtime, transcribes the take locally and compares it with the text. It
   downloads on first use from the `parakeet-tdt-0.6b-v3` folder of
   [`altunenes/parakeet-rs`](https://huggingface.co/altunenes/parakeet-rs)
-  (2.6 GB). Voice samples are still transcribed by Whisper `medium.en` (3 GB),
-  running on candle like OmniVoice, and `sections` uses Whisper `base.en`
-  (290 MB). The checker mishears some correct speech, so treat a flag as a
+  (2.6 GB). It also transcribes voice samples and the recordings `sections`
+  looks through, hearing anything over 30 seconds in windows cut in pauses.
+  The checker mishears some correct speech, so treat a flag as a
   reason to listen, not as proof of a mistake. If it mishears a speaker's
   accent the same way again and again, see [Allowances](#allowances).
 
