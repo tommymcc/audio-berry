@@ -12,15 +12,11 @@ metal = ["any-tts/metal", "parakeet-rs/coreml"]
 [dependencies]
 # The integration branch of the fork, which has native OmniVoice voice cloning.
 any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "f485382b79b4b10632c685bdacf038388dbfe83a", default-features = false, features = ["omnivoice", "download"] }
-candle-core = "0.10.2"
-candle-nn = "0.10.2"
-candle-transformers = "0.10.2"
 clap = { version = "4.6", features = ["derive", "env"] }
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
 # Noise cleaning for voice samples: DeepFilterNet 3, built in, run on the CPU with tract.
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"] }
 epub = "2"
-flate2 = "1"
 fs-err = "3.3.2"
 indicatif = "0.18"
 mdns-sd = "0.21"
@@ -34,7 +30,6 @@ rust_cast = "0.21"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 scraper = "0.29.0"
 serde_json = "1"
-tokenizers = "0.22.2"
 # The version any-tts uses, for estimating audio length as it does.
 unicode-general-category = "1"
 

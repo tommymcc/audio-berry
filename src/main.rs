@@ -25,7 +25,6 @@ mod takes;
 #[cfg(test)]
 mod test_dir;
 mod text;
-mod transcribe;
 mod voice;
 
 use clap::{Parser, Subcommand};

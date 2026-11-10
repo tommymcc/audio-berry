@@ -163,14 +163,10 @@ name = "audio-berry"
 version = "0.1.0"
 dependencies = [
  "any-tts",
- "candle-core",
- "candle-nn",
- "candle-transformers",
  "clap",
  "color-eyre",
  "deep_filter",
  "epub",
- "flate2",
  "fs-err",
  "indicatif",
  "libc",
@@ -182,7 +178,6 @@ dependencies = [
  "rustls",
  "scraper",
  "serde_json",
- "tokenizers 0.22.2",
  "unicode-general-category",
 ]
 
