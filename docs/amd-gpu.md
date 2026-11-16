@@ -21,7 +21,7 @@ when upstream changes.
 | default (`cuda`) | NVIDIA only | ONNX Runtime, CUDA |
 | `--no-default-features` | CPU, candle | ONNX Runtime, CPU: **crashes on CPUs without AVX2** ([1](#1-onnx-runtime-needs-avx2)) |
 | `--no-default-features --features vulkan` | CPU, candle | burn on Vulkan (any GPU) |
-| `--no-default-features --features rocm` | transformer backbone and audio decoder on the GPU with burn ROCm; voice preparation, embeddings and sampling on the CPU with candle | burn on ROCm |
+| `--no-default-features --features rocm` | transformer backbone and audio decoder on the GPU with burn ROCm; voice preparation, text embeddings (once per chunk) and sampling with a temperature on the CPU with candle | burn on ROCm |
 
 ## Setup
 
@@ -484,10 +484,24 @@ The GPU time (`rocprofv3`) now splits as: projections 74%, attention matmuls
 softmax, the row max is the largest part (1.3 ms per 981-token layer, a
 reduction over 62 workgroups).
 
-What's left on the CPU per step is building the embeddings in candle (0.11 s a
-step, 10% of a chunk). The text part doesn't change between steps, and the
-audio embedding tables are 33 MB, so it could move to the GPU; the 620 MB text
-table can't, for VRAM.
+### Embeddings on the GPU
+
+After that, the largest CPU cost per step was building each pass's input in
+candle: looking up and summing the text and eight audio-codebook embeddings
+(0.11 s a step, 10% of a chunk). any-tts `61b1caf` splits it:
+
+- **The text part** doesn't change between steps (only audio positions get new
+  tokens), so it's looked up once per chunk on the CPU, zeroed at audio
+  positions, and copied to the GPU once. The 620 MB text table stays in system
+  memory, as VRAM has about 0.5 GB to spare.
+- **The audio part** changes every step. The audio embedding tables (8 × 1025
+  rows, 33 MB) now live on the GPU next to the backbone; each step uploads only
+  the token ids (offset per codebook on the CPU), gathers the rows with
+  `select`, sums over codebooks and masks them.
+
+Same 21 s chunk, kernels cached: generate 35.9 s → **31.7 s**, tokens
+identical with `OMNIVOICE_SEED=7`. Almost all of generation is now the
+backbone's matmuls on the GPU.
 
 **Correction:** earlier spike runs reported 0.375 s per pass at 1024 tokens on
 ROCm and 1.89 s on Vulkan, timed with the pitfall above. The ROCm figure was
@@ -530,7 +544,7 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 | What | Where |
 |---|---|
 | audio-berry changes | branch `amd-burn-checker` |
-| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (f85b678), pinned in `Cargo.toml` |
+| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (61b1caf), pinned in `Cargo.toml` |
 | Matmul benchmark and blueprint sweep (f32 and f16) | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`); against the next cubek: `omnivoice-burn-spike/matmul-next` |
 | Spike, feasibility test, bindgen tool | `~/workspace/omnivoice-burn-spike` (local git repo) |
 | Fork clones | `~/workspace/forks/{gemm,pliron,cubecl-hip}` |
