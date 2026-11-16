@@ -11,10 +11,14 @@ metal = ["any-tts/metal", "parakeet-rs/coreml"]
 # The checker on any GPU through Vulkan, with burn instead of ONNX Runtime.
 # Speech still runs on the CPU.
 vulkan = ["parakeet-rs/vulkan"]
+# AMD GPUs through ROCm, with burn: OmniVoice's backbone (the rest of OmniVoice
+# runs on the CPU) and the checker. See docs/amd-gpu.md.
+rocm = ["any-tts/rocm", "parakeet-rs/burn-rocm"]
 
 [dependencies]
-# The integration branch of the fork, which has native OmniVoice voice cloning.
-any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "f485382b79b4b10632c685bdacf038388dbfe83a", default-features = false, features = ["omnivoice", "download"] }
+# The fork's rocm-burn branch: the integration branch, which has native OmniVoice
+# voice cloning, plus the `rocm` feature.
+any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "cc2105b8c47a7300920979c85c5a3be6c39f09cf", default-features = false, features = ["omnivoice", "download"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
 # Noise cleaning for voice samples: DeepFilterNet 3, built in, run on the CPU with tract.
@@ -48,3 +52,6 @@ gemm-f16 = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1
 # pliron 0.19 (under burn's cubecl, for `vulkan`) asks for any hashbrown 0.x, gets
 # 0.11, and fails to build. 0.20 fixed it, but cubecl 0.11 needs 0.19.
 pliron = { git = "https://github.com/tommymcc/pliron", rev = "ac2cc0c820907013df7d955be7da370a7b8b2c2f" }
+# cubecl-hip-sys (under burn's ROCm backend, for `rocm`) has no bindings for
+# Ubuntu 26.04's own HIP, 7.1.52801, so it builds with none and cubecl-hip fails.
+cubecl-hip-sys = { git = "https://github.com/tommymcc/cubecl-hip-sys", rev = "26e8dea1b9ae2a362f28ed2aadf67f25d2022acb" }

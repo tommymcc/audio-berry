@@ -47,11 +47,11 @@ impl RenderSettings {
     }
 
     /// Mirrors the model, which ignores values it doesn't recognise and can't run
-    /// BF16 on the CPU or Metal.
+    /// BF16 on the CPU, Metal or ROCm.
     fn from_dtype(value: Option<&str>, runtime: OmniVoiceRuntimeChoice) -> Self {
         let value = value.unwrap_or_default().trim().to_ascii_lowercase();
         let precision = match (value.as_str(), runtime.device) {
-            ("bf16", DeviceSelection::Cpu | DeviceSelection::Metal(_)) => "f32".into(),
+            ("bf16", DeviceSelection::Cpu | DeviceSelection::Metal(_) | DeviceSelection::Rocm(_)) => "f32".into(),
             ("f32" | "f16" | "bf16", _) => value,
             _ => runtime.dtype_label().into(),
         };
