@@ -99,8 +99,8 @@ chapters 1 to 13, since chapter 14 is Project Gutenberg's license.
 - Or, for checking takes only, any GPU with Vulkan, built with
   `--no-default-features --features vulkan`. Speech still runs on the CPU.
 - Or an AMD GPU with ROCm, built with `--no-default-features --features rocm`:
-  OmniVoice's transformer and the checker on the GPU, the rest of OmniVoice on the
-  CPU. See [docs/amd-gpu.md](docs/amd-gpu.md) for setup, measurements, and the
+  OmniVoice's transformer and audio decoder and the checker on the GPU, and
+  OmniVoice's voice preparation on the CPU. See [docs/amd-gpu.md](docs/amd-gpu.md) for setup, measurements, and the
   forks and patches it needs.
 
 ### Apple Silicon

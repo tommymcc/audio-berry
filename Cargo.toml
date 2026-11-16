@@ -11,14 +11,14 @@ metal = ["any-tts/metal", "parakeet-rs/coreml"]
 # The checker on any GPU through Vulkan, with burn instead of ONNX Runtime.
 # Speech still runs on the CPU.
 vulkan = ["parakeet-rs/vulkan"]
-# AMD GPUs through ROCm, with burn: OmniVoice's backbone (the rest of OmniVoice
-# runs on the CPU) and the checker. See docs/amd-gpu.md.
+# AMD GPUs through ROCm, with burn: OmniVoice's backbone and audio decoder (the
+# rest of OmniVoice runs on the CPU) and the checker. See docs/amd-gpu.md.
 rocm = ["any-tts/rocm", "parakeet-rs/burn-rocm"]
 
 [dependencies]
 # The fork's rocm-burn branch: the integration branch, which has native OmniVoice
 # voice cloning, plus the `rocm` feature.
-any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "ad03f0a70a44294571d419e0707d41ba2b2bec27", default-features = false, features = ["omnivoice", "download"] }
+any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "f59fd94297e7bd83cdb38dec43756fc2934e9159", default-features = false, features = ["omnivoice", "download"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
 # Noise cleaning for voice samples: DeepFilterNet 3, built in, run on the CPU with tract.

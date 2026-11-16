@@ -21,7 +21,7 @@ when upstream changes.
 | default (`cuda`) | NVIDIA only | ONNX Runtime, CUDA |
 | `--no-default-features` | CPU, candle | ONNX Runtime, CPU: **crashes on CPUs without AVX2** ([1](#1-onnx-runtime-needs-avx2)) |
 | `--no-default-features --features vulkan` | CPU, candle | burn on Vulkan (any GPU) |
-| `--no-default-features --features rocm` | transformer backbone on the GPU with burn ROCm; voice preparation, embeddings, sampling and audio decoding on the CPU with candle | burn on ROCm |
+| `--no-default-features --features rocm` | transformer backbone and audio decoder on the GPU with burn ROCm; voice preparation, embeddings and sampling on the CPU with candle | burn on ROCm |
 
 ## Setup
 
@@ -233,6 +233,52 @@ from autotune elsewhere (convolutions), and the fix above doesn't depend on it.
 This matters to anything else run through burn's `attention` on RDNA2 with long
 sequences; the checker's Parakeet encoder may be one, which hasn't been checked.
 
+### 9. burn's convolutions are slow on RDNA2, so the audio decoder doesn't use them
+
+OmniVoice's audio decoder (codes to waveform: codebook lookups, `fc2`, then a
+DAC decoder of five upsampling blocks, each a transposed conv and three dilated
+kernel-7 residual convs) ran on candle's CPU device at about 1.3 s per second
+of audio. It is now in any-tts on burn (`burn_audio_decoder.rs`, `rocm`
+feature), used instead of candle's whenever the backbone runs on ROCm.
+
+burn's conv ops were the obvious way to write it, and they're slow on this GPU.
+On a GPU without matrix cores burn-cubecl runs a direct convolution kernel
+(its implicit-GEMM kernels need CMMA), with or without autotune. Decoding 3 s of
+audio (75 frames), after kernels are compiled:
+
+| How the convolutions run | Time |
+|---|---|
+| candle, CPU (before) | 4.2 s |
+| burn `conv1d` / `conv_transpose1d`, no `autotune` | 0.52 s |
+| burn `conv1d` / `conv_transpose1d`, `autotune` (as audio-berry builds burn) | 0.37 to 0.62 s |
+| **as matmuls (what's used)** | **0.037 s** |
+
+So the convolutions are written as matmuls, which run on cubek's matmul at its
+measured rate:
+
+- **conv1d** (stride 1, "same" padding): the kernel's k shifted views of the
+  zero-padded input are stacked along the channels, (batch, k × in, len), and
+  multiplied by the weight laid out as (out, k × in). This costs a copy of the
+  input k times over (about 320 MB at the last block for a 15 s chunk), which the
+  8 GB card has room for.
+- **conv_transpose1d** (DAC's kernels are twice the stride s): one matmul gives
+  each input frame's 2s output samples; output frame n is the first half of
+  input frame n's plus the second half of frame n − 1's (overlap-add), and the
+  padding crops the ends.
+
+Tests check both against burn's conv ops at DAC's settings, and an ignored test
+checks the whole decoder against candle's with the real weights (max difference
+3e-6 for 3 s, 7e-6 for 15 s; `cargo test --release --features rocm --lib
+decoder_matches_candle -- --include-ignored --nocapture`, with
+`OMNIVOICE_DECODER_TEST_FRAMES` for other lengths). `OMNIVOICE_BURN_CONV=burn`
+switches the decoder to burn's conv ops, for comparison. any-tts commit
+`f59fd94`.
+
+Longer chunks: 15 s of audio decodes in 0.21 s (candle: 22.9 s). The first
+decode at a new length can take from 0.3 s to 34 s while kernels compile and
+matmul autotune runs for the new shapes; both are cached on disk
+(`~/.cache/cubecl`), so a book run pays this only for lengths it hasn't seen.
+
 ## Why burn, and the alternatives considered
 
 The question was how to run OmniVoice, written for candle, on an AMD GPU in a way
@@ -265,17 +311,19 @@ that stays maintainable.
 
 ### OmniVoice, end to end (`speak`, 3.3 s of audio, 14.3 s voice sample)
 
-| Phase | CPU build | `rocm`, first run | `rocm`, kernels cached | `rocm`, attention written out ([8](#8-burns-attention-autotune-picks-a-slow-kernel-on-rdna2)) |
-|---|---|---|---|---|
-| Load model | 62 s | 6 s | 5 s | 5 s |
-| Prepare voice (CPU in both) | | 35.7 s | 35.5 s | 35.5 s |
-| Generate tokens, 32 steps | | 38.4 s | 18.8 s | 12.5 s |
-| …of which the backbone | | 37.3 s | 17.6 s | 11.4 s |
-| Decode audio (CPU in both) | | 4.2 s | 4.6 s | 4.4 s |
-| **Total** | **691 s** | **78 s** | **59 s** | **53 s** |
+| Phase | CPU build | `rocm`, first run | `rocm`, kernels cached | `rocm`, attention written out ([8](#8-burns-attention-autotune-picks-a-slow-kernel-on-rdna2)) | `rocm`, audio decoder on the GPU ([9](#9-burns-convolutions-are-slow-on-rdna2-so-the-audio-decoder-doesnt-use-them)) |
+|---|---|---|---|---|---|
+| Load model | 62 s | 6 s | 5 s | 5 s | 5 s |
+| Prepare voice (CPU) | | 35.7 s | 35.5 s | 35.5 s | 35.6 s |
+| Generate tokens, 32 steps | | 38.4 s | 18.8 s | 12.5 s | 12.5 s |
+| …of which the backbone | | 37.3 s | 17.6 s | 11.4 s | 11.4 s |
+| Decode audio | | 4.2 s (CPU) | 4.6 s (CPU) | 4.4 s (CPU) | **0.11 s** (GPU) |
+| **Total** | **691 s** | **78 s** | **59 s** | **53 s** | **48 s** |
 
-In `book` the voice is prepared once per run, so most of the 35 s isn't paid per
-chunk. Per chunk, the GPU backbone and the CPU audio decoder are what's left.
+The last column is the second run of a new build: the first recompiles and
+autotunes (decode took 43.5 s, the backbone 19.5 s). Its output transcribes to
+the sentence. In `book` the voice is prepared once per run, so most of the 35 s
+isn't paid per chunk; per chunk, the GPU backbone is what's left.
 
 ### Backbone alone (`omnivoice-burn-spike`, 28 layers, F32)
 
@@ -331,6 +379,28 @@ sizes; 353 that ran, `src/bin/matmul_sweep.rs`) found at best 4 to 20% per shape
 that gap needs a different kernel, not tuning; forking cubek-matmul for the
 sweep's best blueprint isn't worth the upkeep for at most 20%.
 
+**F16 doesn't help either.** `matmul_bench --dtype f16` runs f16 inputs and
+output with an f32 accumulator, as burn launches f16 matmuls, and `--dtype
+f16acc` runs f16 throughout, the only way RDNA2's double-rate packed f16 FMA
+could be used. `matmul_sweep` takes the same choice (`MATMUL_SWEEP_DTYPE`, with
+`MATMUL_SWEEP_QUICK=1` for a handful of blueprints). At the q projection:
+
+| | M = 484 | M = 84 |
+|---|---|---|
+| f32, burn's default | 2.8 to 3.0 TFLOP/s | 1.3 |
+| f16, burn's default (`Auto`) | doesn't launch: "shared memory budget exceeded" | same |
+| f16, best routine `Auto` doesn't pick (`gemm`, double-buffered unit) | 0.9 | 0.8 |
+| f16, best forced `SimpleUnit` blueprint (8×8×8 tiles) | 2.65 | 1.35 |
+| f16 accumulator too | the same as f16 to within 1% | |
+
+f16's vector width is 8, so the unit kernel needs 8-wide tiles, and with burn's
+default partition and stage sizes those don't fit in 64 KB of shared memory. The
+best blueprint that does is at best as fast as f32 at M = 484, and 5 to 40%
+faster at M = 84 (a seventh of the work). Accumulating in f16 changes nothing,
+so the kernel doesn't get double-rate f16 math. f16 weights would also need
+burn's default blueprint replaced (a fork) and would lose precision, for
+little or nothing. Not pursued.
+
 **Correction:** earlier spike runs reported 0.375 s per pass at 1024 tokens on
 ROCm and 1.89 s on Vulkan, timed with the pitfall above. The ROCm figure was
 wrong by several times; the Vulkan figures were measured the same way and
@@ -350,15 +420,16 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 
 ## What's left
 
-- **Voice preparation and audio decoding run on the CPU** in candle with the
-  scalar gemm kernels: 35 s per voice and about 1.3 s per second of audio. Porting
-  OmniVoice's audio encoder and decoder to burn would move them to the GPU.
+- **Voice preparation runs on the CPU** in candle with the scalar gemm kernels:
+  35 s per voice (once per `book` run). Porting OmniVoice's audio encoder to
+  burn, as the decoder was ([9](#9-burns-convolutions-are-slow-on-rdna2-so-the-audio-decoder-doesnt-use-them)),
+  would move it to the GPU.
 - **burn's matmul reaches 2 to 3 TFLOP/s at 484 tokens and about 1 at 84**,
   against 7.9 for hipBLAS ([profile](#where-the-gpu-time-goes-rocprofv3)).
   Ideas not yet tried: run the conditional and unconditional passes' projections
   as one matmul (M = 568), since only attention needs them apart, which removes
-  the badly occupied M = 84 matmuls; F16 weights (RDNA2 has double-rate F16, if
-  cubek's unit kernel uses it).
+  the badly occupied M = 84 matmuls. F16 was tried and doesn't help
+  ([profile](#where-the-gpu-time-goes-rocprofv3)).
 - None of the forks has been offered upstream.
 
 ## Where things are
@@ -366,8 +437,8 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 | What | Where |
 |---|---|
 | audio-berry changes | branch `amd-burn-checker` |
-| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (ad03f0a), pinned in `Cargo.toml` |
-| Matmul benchmark and blueprint sweep | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`) |
+| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (f59fd94), pinned in `Cargo.toml` |
+| Matmul benchmark and blueprint sweep (f32 and f16) | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`) |
 | Spike, feasibility test, bindgen tool | `~/workspace/omnivoice-burn-spike` (local git repo) |
 | Fork clones | `~/workspace/forks/{gemm,pliron,cubecl-hip}` |
 | Test audio | `~/workspace/test-audio` (LibriVox, public domain) |
