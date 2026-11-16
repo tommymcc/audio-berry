@@ -204,7 +204,7 @@ dependencies = [
 [[package]]
 name = "any-tts"
 version = "0.2.0"
-source = "git+https://github.com/tommymcc/any-tts?rev=f59fd94297e7bd83cdb38dec43756fc2934e9159#f59fd94297e7bd83cdb38dec43756fc2934e9159"
+source = "git+https://github.com/tommymcc/any-tts?rev=f85b6786b03ee909500b8df8ffe2488a6b13d731#f85b6786b03ee909500b8df8ffe2488a6b13d731"
 dependencies = [
  "base64 0.22.1",
  "burn",
@@ -6562,7 +6562,7 @@ dependencies = [
  "rustc_apfloat",
  "slotmap",
  "smallvec",
- "spin 0.12.3",
+ "spin 0.9.9",
  "thiserror 2.0.21",
  "utf8-chars",
 ]

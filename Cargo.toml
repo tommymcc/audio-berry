@@ -18,7 +18,7 @@ rocm = ["any-tts/rocm", "parakeet-rs/burn-rocm"]
 [dependencies]
 # The fork's rocm-burn branch: the integration branch, which has native OmniVoice
 # voice cloning, plus the `rocm` feature.
-any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "f59fd94297e7bd83cdb38dec43756fc2934e9159", default-features = false, features = ["omnivoice", "download"] }
+any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "f85b6786b03ee909500b8df8ffe2488a6b13d731", default-features = false, features = ["omnivoice", "download"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
 # Noise cleaning for voice samples: DeepFilterNet 3, built in, run on the CPU with tract.

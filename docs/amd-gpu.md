@@ -429,6 +429,66 @@ so the kernel doesn't get double-rate f16 math. f16 weights would also need
 burn's default blueprint replaced (a fork) and would lose precision, for
 little or nothing. Not pursued.
 
+**The next cubek doesn't change f32 either.** burn 0.23.0-pre.2 builds cubecl
+0.12.0-pre.2 and cubek 0.4.0-pre.2. The same benchmark against them
+(`omnivoice-burn-spike/matmul-next`, its own crate, with the same
+cubecl-hip-sys fork) gives the same f32 speed at every shape, to within 3%: the
+register-tiled kernel RDNA2 gets hasn't changed. f16 is different there: `Auto`
+launches it, and it's faster than f32 at most shapes:
+
+| Projection | M = 484, f32 → f16 | M = 84, f32 → f16 |
+|---|---|---|
+| q | 2.76 → 3.00 TFLOP/s (+9%) | 1.27 → 1.29 (+2%) |
+| k, v | 2.24 → 2.33 (+4%) | 0.79 → 1.12 (+42%) |
+| o | 2.18 → 2.63 (+21%) | 0.85 → 1.27 (+49%) |
+| gate, up | 3.08 → 3.38 (+10%) | 1.81 → 1.19 (−34%) |
+| down | 2.37 → 2.68 (+13%) | 0.88 → 1.31 (+49%) |
+
+So f16 weights would be worth trying once audio-berry is on burn 0.23 (for
+about 10 to 15% of the matmul time, and half the backbone's VRAM), but not on
+0.22. audio-berry stays on 0.22 because parakeet-rs 0.4.4 pins it.
+
+### Per chunk, after the attention and sampling changes
+
+A 21 s chunk (981-token conditional and 521-token unconditional passes, 32
+steps), `speak`, kernels cached, any-tts `f85b678`:
+
+| Part | Runs on | Before | After |
+|---|---|---|---|
+| Backbone, 32 steps | burn, GPU | 40.6 s | 32.0 s |
+| …conditional pass | | 0.76 s | 0.63 s |
+| …unconditional pass | | 0.395 s | 0.369 s |
+| Picking tokens (log-softmax ×3, guidance, argmax) | candle, CPU → burn, GPU | 7.2 s | inside the backbone figure |
+| Embeddings before each pass | candle, CPU | | 3.6 s |
+| Generate tokens, in all | | 47.9 s | **35.9 s** |
+| Decode audio | burn, GPU | 0.28 s | 0.27 s |
+
+What changed (any-tts `1f2cf68`, `f85b678`):
+
+- **Attention's softmax.** At 981 tokens attention was 36% of a layer and the
+  softmax most of that: scale, max, exp, sum and divide, each a pass over 15.4M
+  scores, and element by element, as 981 isn't a multiple of 4. Q is now scaled
+  before Q Kᵀ; the keys are padded to a multiple of 8 by repeating the last key,
+  which can't change a row's max; and V gets a column of ones (zero in the
+  padded rows), so P V also gives each row's sum, replacing a reduction and a
+  full-size divide. The 981-token layer's attention went from 9.1 to 5.8 ms.
+- **Picking tokens on the GPU.** Each step brought both passes' logits back
+  (17 MB each) and ran three log-softmaxes, the guidance and an argmax in candle
+  on the CPU. With greedy sampling (the default) this now runs on burn, and only
+  the picks and their scores come back. With a fixed seed the 4168 tokens are
+  identical to the CPU path's. Sampling with a temperature, and the first-step
+  debug dump, still take the CPU path.
+
+The GPU time (`rocprofv3`) now splits as: projections 74%, attention matmuls
+13%, softmax 6.5%, norms, RoPE, SiLU and copies 6%, audio head 1%. Of the
+softmax, the row max is the largest part (1.3 ms per 981-token layer, a
+reduction over 62 workgroups).
+
+What's left on the CPU per step is building the embeddings in candle (0.11 s a
+step, 10% of a chunk). The text part doesn't change between steps, and the
+audio embedding tables are 33 MB, so it could move to the GPU; the 620 MB text
+table can't, for VRAM.
+
 **Correction:** earlier spike runs reported 0.375 s per pass at 1024 tokens on
 ROCm and 1.89 s on Vulkan, timed with the pitfall above. The ROCm figure was
 wrong by several times; the Vulkan figures were measured the same way and
@@ -456,8 +516,10 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
   against 7.9 for hipBLAS ([profile](#where-the-gpu-time-goes-rocprofv3)).
   Ideas not yet tried: run the conditional and unconditional passes' projections
   as one matmul (M = 568), since only attention needs them apart, which removes
-  the badly occupied M = 84 matmuls. F16 was tried and doesn't help
-  ([profile](#where-the-gpu-time-goes-rocprofv3)).
+  the badly occupied M = 84 matmuls. F16 doesn't help on burn 0.22 but gains
+  10 to 15% on 0.23's pre-release ([profile](#where-the-gpu-time-goes-rocprofv3)).
+- **Embeddings are built on the CPU every step**, 10% of a chunk
+  ([per chunk](#per-chunk-after-the-attention-and-sampling-changes)).
 - **VRAM headroom is about 0.5 GB** with both models loaded and 28 s chunks
   ([`book`](#book-one-chapter-metamorphosis-chapter-i)); longer chunks or a
   larger voice sample could run out on an 8 GB card.
@@ -468,8 +530,8 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 | What | Where |
 |---|---|
 | audio-berry changes | branch `amd-burn-checker` |
-| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (f59fd94), pinned in `Cargo.toml` |
-| Matmul benchmark and blueprint sweep (f32 and f16) | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`) |
+| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (f85b678), pinned in `Cargo.toml` |
+| Matmul benchmark and blueprint sweep (f32 and f16) | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`); against the next cubek: `omnivoice-burn-spike/matmul-next` |
 | Spike, feasibility test, bindgen tool | `~/workspace/omnivoice-burn-spike` (local git repo) |
 | Fork clones | `~/workspace/forks/{gemm,pliron,cubecl-hip}` |
 | Test audio | `~/workspace/test-audio` (LibriVox, public domain) |
