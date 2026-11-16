@@ -325,6 +325,34 @@ autotunes (decode took 43.5 s, the backbone 19.5 s). Its output transcribes to
 the sentence. In `book` the voice is prepared once per run, so most of the 35 s
 isn't paid per chunk; per chunk, the GPU backbone is what's left.
 
+### `book`, one chapter (*Metamorphosis*, chapter I)
+
+Chapter I of Kafka's *Metamorphosis* (the public-domain Jackson translation,
+38,001 characters; the copy in the `epub` crate's test files, as Project
+Gutenberg was down), narrated in the user's voice (`voices/me.wav`, 14.3 s used)
+with the `rocm` build at any-tts `f59fd94`, kernels cached:
+
+```sh
+cd ~/workspace/audio-samples
+audio-berry book voices/me.wav metamorphosis.epub out-metamorphosis 4
+```
+
+| | |
+|---|---|
+| Chunks | 110, 1.5 to 26 s (mean 20.5 s) |
+| Audio | 37.3 min (2237 s) |
+| Wall clock, including loading and the voice | 87.4 min: **0.43× real time**, 2.3 s per second of audio |
+| Takes | 110 of 110 passed on the first take; 0 marked `CHECK` |
+| Checker recall | mean 0.995, lowest 0.94 (one dropped "Just a moment."); extra words at most 0.05 |
+| VRAM (OmniVoice + Parakeet, sampled every 0.5 s) | 7.26 GB steady, one sample at 8.10 GB, of 8.57 GB |
+| RAM (peak RSS) | 3.7 GB |
+
+Per chunk, about 47 s for 20 s of audio: almost all of it the backbone (32
+steps at these longer sequences); decoding is about 0.2 s and the check well
+under a second. Faster narration now depends on the backbone's matmuls (see
+below). VRAM is the tighter limit: both models together leave about 0.5 GB of
+headroom on an 8 GB card at chunks of up to 28 s.
+
 ### Backbone alone (`omnivoice-burn-spike`, 28 layers, F32)
 
 Per generation step at the test sentence's shapes (a 484-token conditional pass
@@ -430,6 +458,9 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
   as one matmul (M = 568), since only attention needs them apart, which removes
   the badly occupied M = 84 matmuls. F16 was tried and doesn't help
   ([profile](#where-the-gpu-time-goes-rocprofv3)).
+- **VRAM headroom is about 0.5 GB** with both models loaded and 28 s chunks
+  ([`book`](#book-one-chapter-metamorphosis-chapter-i)); longer chunks or a
+  larger voice sample could run out on an 8 GB card.
 - None of the forks has been offered upstream.
 
 ## Where things are
