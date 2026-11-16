@@ -191,6 +191,48 @@ compiles every kernel again (a `speak` of the test sentence took 79 s rather tha
 **Tried first:** a `cubecl.toml` with `[compilation] cache = true` in the working
 directory, which proved the gain but only works when run from that directory.
 
+### 8. burn's attention autotune picks a slow kernel on RDNA2
+
+The backbone took about 0.55 s per generation step in audio-berry but 0.32 s in
+the spike, with the same layers. The difference is burn's `autotune` feature,
+which parakeet-rs turns on (it takes burn with its default features) and the
+spike didn't have. Building the spike with each of burn's defaults alone, batch
+1, 484 + 84 tokens:
+
+| burn features | Per step |
+|---|---|
+| `rocm` | 0.325 s |
+| `rocm`, `fusion` | 0.320 s |
+| `rocm`, `autotune` | 0.503 s |
+| `rocm`, `autotune`, `fusion` | 0.495 s |
+
+The autotune results in `~/.cache/cubecl/default.db` (SQLite, values in CBOR)
+show why. For matmul, autotune picks the same kernel burn uses without it. For
+attention at 512 tokens it picked the flash `unit` kernel at 7.9 ms per layer
+and **skipped** the fallback (Q Kᵀ matmul, softmax, matmul with V), which takes
+about 0.8 ms. This is by design in burn-cubecl 0.22.1
+(`kernel/attention/tune.rs`): the fallback materialises the whole score matrix,
+so it only competes when `seq_q <= head_dim` (128 here). Longer sequences get the
+flash kernels, and on a GPU without matrix cores only the `unit` one runs.
+Without `autotune`, burn always uses the fallback, which is why the spike was
+faster. No CubeCL runtime setting changes this: the autotune level scales how
+many candidates are timed, not which priority group is allowed.
+
+**Done:** any-tts's burn backbone no longer calls burn's `attention`. It computes
+softmax(Q Kᵀ / √d) V itself, as burn's fallback does, with the causal mask when
+asked for. The query heads that share a KV head are stacked along the rows (Q
+reshaped to (batch, kv_heads, group × seq, head_dim)), so K and V aren't copied
+for each query head as `repeat_interleave` did. A test checks it against
+burn's `attention`, causal and not (skipped without a ROCm device). Result in
+`speak`: backbone 17.6 s → 11.4 s for 32 steps (0.55 → 0.36 s per step); the
+generated audio transcribes to the same words. any-tts commit `ad03f0a`.
+
+**Not done:** turning burn's `autotune` off for audio-berry. It would need
+parakeet-rs forked to take burn without default features, the checker may gain
+from autotune elsewhere (convolutions), and the fix above doesn't depend on it.
+This matters to anything else run through burn's `attention` on RDNA2 with long
+sequences; the checker's Parakeet encoder may be one, which hasn't been checked.
+
 ## Why burn, and the alternatives considered
 
 The question was how to run OmniVoice, written for candle, on an AMD GPU in a way
@@ -223,14 +265,14 @@ that stays maintainable.
 
 ### OmniVoice, end to end (`speak`, 3.3 s of audio, 14.3 s voice sample)
 
-| Phase | CPU build | `rocm`, first run | `rocm`, kernels cached |
-|---|---|---|---|
-| Load model | 62 s | 6 s | 5 s |
-| Prepare voice (CPU in both) | | 35.7 s | 35.5 s |
-| Generate tokens, 32 steps | | 38.4 s | 18.8 s |
-| …of which the backbone | | 37.3 s | 17.6 s |
-| Decode audio (CPU in both) | | 4.2 s | 4.6 s |
-| **Total** | **691 s** | **78 s** | **59 s** |
+| Phase | CPU build | `rocm`, first run | `rocm`, kernels cached | `rocm`, attention written out ([8](#8-burns-attention-autotune-picks-a-slow-kernel-on-rdna2)) |
+|---|---|---|---|---|
+| Load model | 62 s | 6 s | 5 s | 5 s |
+| Prepare voice (CPU in both) | | 35.7 s | 35.5 s | 35.5 s |
+| Generate tokens, 32 steps | | 38.4 s | 18.8 s | 12.5 s |
+| …of which the backbone | | 37.3 s | 17.6 s | 11.4 s |
+| Decode audio (CPU in both) | | 4.2 s | 4.6 s | 4.4 s |
+| **Total** | **691 s** | **78 s** | **59 s** | **53 s** |
 
 In `book` the voice is prepared once per run, so most of the 35 s isn't paid per
 chunk. Per chunk, the GPU backbone and the CPU audio decoder are what's left.
@@ -238,19 +280,56 @@ chunk. Per chunk, the GPU backbone and the CPU audio decoder are what's left.
 ### Backbone alone (`omnivoice-burn-spike`, 28 layers, F32)
 
 Per generation step at the test sentence's shapes (a 484-token conditional pass
-and an 84-token unconditional pass), wall clock over 10 steps with one sync:
+and an 84-token unconditional pass, batch 1), wall clock over 10 steps with one
+sync: **0.32 s** with `rocm` alone, and with any burn features once attention is
+written out ([8](#8-burns-attention-autotune-picks-a-slow-kernel-on-rdna2)).
+That is about 1.7 TFLOP/s (about 555 GFLOP per step). audio-berry's backbone now
+takes 0.36 s per step. Layer 0 matches candle to within 2.4e-6 relative on
+burn's CPU, Vulkan and ROCm backends.
 
-| burn features | Per step |
+**Correction:** an earlier version of this section gave 0.65 s (`rocm`) and
+0.82 s (with burn's defaults). The spike read its batch size from `SPIKE_batch`,
+so the documented `SPIKE_BATCH=1` was ignored and those runs used batch 2. Fixed
+in the spike; batch 2 does take 0.65 s.
+
+### Where the GPU time goes (rocprofv3)
+
+`rocprofv3 --kernel-trace --stats` on the spike (`rocm` only), over all its
+passes:
+
+| Kernels | Share of GPU time |
 |---|---|
-| `rocm` only | 0.65 s |
-| `rocm` plus burn's defaults (fusion, autotune; what parakeet-rs brings in) | 0.82 s |
+| matmul (projections and attention) | 84% |
+| reductions (RMSNorm, softmax) | 6% |
+| element-wise, copies, slices | 10% |
 
-audio-berry's steady state, about 0.55 s per step, matches. Layer 0 matches
-candle to within 2.4e-6 relative on burn's CPU, Vulkan and ROCm backends.
+The GPU was busy for nearly all of the wall-clock time, so launch overhead isn't
+what's slow: the matmul kernel is. On a GPU without matrix cores burn runs
+cubek's register-tiled `SimpleUnit` matmul: each of 256 threads computes 8×8
+outputs, so a workgroup covers 128×128 of the output. At 484 tokens the k, v, o
+and down projections are 4 × 8 = 32 workgroups on 28 compute units (HIP reports
+14, counting WGPs), and the 84-token pass is 8 to 24 workgroups, so much of the
+GPU idles.
 
-This is about 1 TFLOP/s; hipBLAS reached 7.9 TFLOP/s in F32 on the same card. So
-burn's kernels, not the hardware, set the pace here, and there's a lot of
-headroom.
+Measured directly, without burn (`omnivoice-burn-spike/src/bin/matmul_bench.rs`,
+right-hand side column-major as the weights are):
+
+| Projection | M = 484 | M = 84 |
+|---|---|---|
+| q (1024 → 2048) | 3.15 TFLOP/s | 1.25 |
+| k, v (1024 → 1024) | 2.20 | 0.79 |
+| o (2048 → 1024) | 2.15 | 0.85 |
+| gate, up (1024 → 3072) | 3.25 | 1.72 |
+| down (3072 → 1024) | 2.41 | 0.88 |
+
+Every other routine cubek has for this GPU (double-buffered unit, min tile size,
+`gemm`, naive) was slower at every shape, which is why matmul autotune
+changes nothing. A sweep of `SimpleUnit` blueprints (tile, partition and stage
+sizes; 353 that ran, `src/bin/matmul_sweep.rs`) found at best 4 to 20% per shape
+(partition 4×1×4, stage 8×32). So cubek's register-tiled kernel tops out around
+2 to 3 TFLOP/s on RDNA2 whatever its tiling, against 7.9 for hipBLAS. Closing
+that gap needs a different kernel, not tuning; forking cubek-matmul for the
+sweep's best blueprint isn't worth the upkeep for at most 20%.
 
 **Correction:** earlier spike runs reported 0.375 s per pass at 1024 tokens on
 ROCm and 1.89 s on Vulkan, timed with the pitfall above. The ROCm figure was
@@ -274,9 +353,12 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 - **Voice preparation and audio decoding run on the CPU** in candle with the
   scalar gemm kernels: 35 s per voice and about 1.3 s per second of audio. Porting
   OmniVoice's audio encoder and decoder to burn would move them to the GPU.
-- **burn's ROCm kernels reach about 1 TFLOP/s** against 7.9 for hipBLAS.
-  Profiling the GPU kernels (rocprofv3) would show whether matmul, attention or
-  the many small elementwise kernels dominate.
+- **burn's matmul reaches 2 to 3 TFLOP/s at 484 tokens and about 1 at 84**,
+  against 7.9 for hipBLAS ([profile](#where-the-gpu-time-goes-rocprofv3)).
+  Ideas not yet tried: run the conditional and unconditional passes' projections
+  as one matmul (M = 568), since only attention needs them apart, which removes
+  the badly occupied M = 84 matmuls; F16 weights (RDNA2 has double-rate F16, if
+  cubek's unit kernel uses it).
 - None of the forks has been offered upstream.
 
 ## Where things are
@@ -284,7 +366,8 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 | What | Where |
 |---|---|
 | audio-berry changes | branch `amd-burn-checker` |
-| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (cc2105b), pinned in `Cargo.toml` |
+| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (ad03f0a), pinned in `Cargo.toml` |
+| Matmul benchmark and blueprint sweep | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`) |
 | Spike, feasibility test, bindgen tool | `~/workspace/omnivoice-burn-spike` (local git repo) |
 | Fork clones | `~/workspace/forks/{gemm,pliron,cubecl-hip}` |
 | Test audio | `~/workspace/test-audio` (LibriVox, public domain) |

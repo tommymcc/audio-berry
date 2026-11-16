@@ -204,7 +204,7 @@ dependencies = [
 [[package]]
 name = "any-tts"
 version = "0.2.0"
-source = "git+https://github.com/tommymcc/any-tts?rev=cc2105b8c47a7300920979c85c5a3be6c39f09cf#cc2105b8c47a7300920979c85c5a3be6c39f09cf"
+source = "git+https://github.com/tommymcc/any-tts?rev=ad03f0a70a44294571d419e0707d41ba2b2bec27#ad03f0a70a44294571d419e0707d41ba2b2bec27"
 dependencies = [
  "base64 0.22.1",
  "burn",
