@@ -15,7 +15,7 @@ agreed to it. To try it on a free book, download
 [Alice's Adventures in Wonderland](https://www.gutenberg.org/ebooks/11.epub3.images)
 from Project Gutenberg.
 
-1. **Build it.** Install Rust 1.85+ and `ffmpeg`, then run one of these in this
+1. **Build it.** Install Rust 1.92+ and `ffmpeg`, then run one of these in this
    folder:
 
    ```sh
@@ -72,10 +72,12 @@ chapters 1 to 13, since chapter 14 is Project Gutenberg's license.
 
 ## Requirements
 
-- Rust 1.85+ and `ffmpeg`
+- Rust 1.92+ and `ffmpeg`
 - An NVIDIA GPU, with `nvidia-smi` working. A 25-second clip peaked at about
   2.9 GB of VRAM on an 8 GB card. The CUDA build fails without a GPU. Build with
-  `--no-default-features` for CPU only, which hasn't been tested with OmniVoice.
+  `--no-default-features` for CPU only. On an AMD FX-8350, which has no AVX2,
+  OmniVoice took 691 s to make 3.4 s of audio on the CPU, and the checker
+  doesn't run there (see [Other GPUs](#other-gpus-vulkan)).
 - For the CUDA build, the CUDA 13 runtime, cuBLAS 13, cuRAND 10 and cuDNN 9
   for CUDA 13, which the checker needs to run on the GPU through ONNX Runtime.
   On Ubuntu these are the `cuda-cudart-13-1`, `libcublas-13-1` and
@@ -94,6 +96,8 @@ chapters 1 to 13, since chapter 14 is Project Gutenberg's license.
   sampled every 0.2 s, and 2.7 GB of RAM. Checking a take took a median of
   191 ms, and 318 ms for the first.
 - Or an Apple Silicon Mac, built with `--no-default-features --features metal`.
+- Or, for checking takes only, any GPU with Vulkan, built with
+  `--no-default-features --features vulkan`. Speech still runs on the CPU.
 
 ### Apple Silicon
 
@@ -117,6 +121,31 @@ To build, narrate a short test and collect the results in one report:
 ```sh
 scripts/metal_check.sh voices/me.wav
 ```
+
+### Other GPUs (Vulkan)
+
+```sh
+cargo build --release --no-default-features --features vulkan
+```
+
+This runs the checker, Parakeet, on the GPU through Vulkan with
+[burn](https://burn.dev) instead of ONNX Runtime, which isn't started at all.
+OmniVoice still runs on the CPU. ONNX Runtime's prebuilt binaries need AVX2, so
+on a CPU without it, such as AMD's FX, the other builds stop with an illegal
+instruction when the checker starts, and this is the only one that checks takes.
+
+It has been tested on an AMD Radeon RX 6600 (8 GB) with an FX-8350, running
+`sections` on 120 s of a LibriVox recording of Alice. It heard all 120 s in
+20 to 26 s, and the words of the 5 stretches it suggested matched the book. The
+encoder used 2.7 GB of VRAM. The decoder runs on burn's CPU backend, as it runs
+once per token. Burn compiles and tunes its kernels on the first run on a machine
+and caches them, so later runs are faster. `book`, `retake` and `speak` haven't
+been tried with this build.
+
+Two dependencies are patched from forks in `Cargo.toml`, as neither fix is
+released: `gemm` 0.19, which candle and burn's CPU backend use, panics on a CPU
+with FMA but not AVX2, and `pliron` 0.19, under burn, can resolve to a `hashbrown`
+too old to build with.
 
 ## Adding a voice
 

@@ -8,6 +8,9 @@ license = "MIT"
 default = ["cuda"]
 cuda = ["any-tts/cuda", "parakeet-rs/cuda"]
 metal = ["any-tts/metal", "parakeet-rs/coreml"]
+# The checker on any GPU through Vulkan, with burn instead of ONNX Runtime.
+# Speech still runs on the CPU.
+vulkan = ["parakeet-rs/vulkan"]
 
 [dependencies]
 # The integration branch of the fork, which has native OmniVoice voice cloning.
@@ -35,3 +38,13 @@ unicode-general-category = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Fixes in forks, not yet sent upstream.
+[patch.crates-io]
+# gemm 0.19 runs its FMA kernels on CPUs with FMA but not AVX2, such as AMD's FX,
+# and panics, as they need AVX2 too. candle and burn's CPU backend both use it.
+gemm-common = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1b4d34e89eee4504b61f605" }
+gemm-f16 = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1b4d34e89eee4504b61f605" }
+# pliron 0.19 (under burn's cubecl, for `vulkan`) asks for any hashbrown 0.x, gets
+# 0.11, and fails to build. 0.20 fixed it, but cubecl 0.11 needs 0.19.
+pliron = { git = "https://github.com/tommymcc/pliron", rev = "ac2cc0c820907013df7d955be7da370a7b8b2c2f" }

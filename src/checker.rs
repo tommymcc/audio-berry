@@ -9,6 +9,7 @@ use crate::audio::resample_as_saved;
 use any_tts::AudioSamples;
 use any_tts::download::download_file;
 use color_eyre::eyre::{Result, WrapErr, eyre};
+#[cfg(not(all(feature = "vulkan", not(any(feature = "cuda", feature = "metal")))))]
 use parakeet_rs::ort::environment::Environment;
 use parakeet_rs::{ExecutionConfig, ExecutionProvider, ParakeetTDT, TimestampMode, TranscriptionResult, Transcriber};
 use std::ops::Range;
@@ -139,13 +140,12 @@ pub struct Checker {
 
 impl Checker {
     /// Downloads the model on first use, and loads it on the GPU the build is for:
-    /// CUDA with the `cuda` feature, CoreML with `metal`, else the CPU. It stops
+    /// CUDA with the `cuda` feature, CoreML with `metal`, burn on Vulkan with
+    /// `vulkan`, else the CPU. It stops
     /// with an error if that GPU's provider can't start, rather than run on the CPU.
     pub fn start() -> Result<Checker> {
         let directory = download_model()?;
-        let environment = parakeet_rs::ort::init().build().wrap_err("couldn't start ONNX Runtime")?;
-        let provider = provider(&environment)?;
-        let config = ExecutionConfig::new().with_environment(environment).with_execution_provider(provider);
+        let config = execution_config()?;
         let model = ParakeetTDT::from_pretrained(&directory, Some(config))
             .map_err(|error| eyre!("{error}"))
             .wrap_err_with(|| format!("couldn't load {MODEL} from {}", directory.display()))?;
@@ -247,7 +247,24 @@ fn provider(environment: &Environment) -> Result<ExecutionProvider> {
     Ok(ExecutionProvider::CoreML)
 }
 
-#[cfg(not(any(feature = "cuda", feature = "metal")))]
+/// How the checker runs: burn on the GPU through wgpu, which uses Vulkan on
+/// Linux. ONNX Runtime isn't started at all, as its prebuilt binaries need AVX2,
+/// and on a CPU without it they stop with an illegal instruction. burn's first
+/// run on a machine compiles and tunes kernels, and caches them.
+#[cfg(all(feature = "vulkan", not(any(feature = "cuda", feature = "metal"))))]
+fn execution_config() -> Result<ExecutionConfig> {
+    Ok(ExecutionConfig::new().with_execution_provider(ExecutionProvider::BurnWgpu))
+}
+
+/// How the checker runs: on ONNX Runtime, with the provider the build is for.
+#[cfg(not(all(feature = "vulkan", not(any(feature = "cuda", feature = "metal")))))]
+fn execution_config() -> Result<ExecutionConfig> {
+    let environment = parakeet_rs::ort::init().build().wrap_err("couldn't start ONNX Runtime")?;
+    let provider = provider(&environment)?;
+    Ok(ExecutionConfig::new().with_environment(environment).with_execution_provider(provider))
+}
+
+#[cfg(not(any(feature = "cuda", feature = "metal", feature = "vulkan")))]
 fn provider(_: &Environment) -> Result<ExecutionProvider> {
     Ok(ExecutionProvider::Cpu)
 }
