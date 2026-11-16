@@ -12,3 +12,7 @@
 
 # Test fixtures, written for the tests rather than taken from a real book.
 !/tests/fixtures/*.epub
+
+# Local secrets.
+.env
+.env.*
