@@ -21,7 +21,11 @@ when upstream changes.
 | default (`cuda`) | NVIDIA only | ONNX Runtime, CUDA |
 | `--no-default-features` | CPU, candle | ONNX Runtime, CPU: **crashes on CPUs without AVX2** ([1](#1-onnx-runtime-needs-avx2)) |
 | `--no-default-features --features vulkan` | CPU, candle | burn on Vulkan (any GPU) |
-| `--no-default-features --features rocm` | transformer backbone and audio decoder on the GPU with burn ROCm; voice preparation, text embeddings (once per chunk) and sampling with a temperature on the CPU with candle | burn on ROCm |
+| `--no-default-features --features rocm` | transformer backbone and audio decoder on the GPU with burn ROCm (F32, or F16 projection weights with `OMNIVOICE_BURN_F16=1`); voice preparation, text embeddings (once per chunk) and sampling with a temperature on the CPU with candle | burn on ROCm |
+
+The `cuda` and `metal` builds don't use burn or CubeCL at all (`cargo tree`
+shows neither), so nothing here changes them; they haven't been built on this
+machine, which has neither toolkit.
 
 ## Setup
 
@@ -38,7 +42,10 @@ What another user on Ubuntu 26.04 with an AMD GPU would do.
    cargo build --release --no-default-features --features rocm
    ```
 4. **Run** as usual. `Model loaded in … on rocm:0` says the backbone is on the
-   GPU. No environment variables are needed.
+   GPU. No environment variables are needed. `OMNIVOICE_BURN_F16=1` stores the
+   backbone's projection weights in F16, which is about 19% faster per step and
+   took steady VRAM on a chapter from 7.26 to 5.8 GB, at the cost of tokens no
+   longer matching F32 exactly ([measurements](#burn-023-f16-and-fixed-shapes)).
 
 The first run downloads OmniVoice (3.1 GB) and Parakeet (2.4 GB) into the Hugging
 Face cache. It also compiles every GPU kernel with LLVM, which makes it much
@@ -99,6 +106,10 @@ Patched in `Cargo.toml`.
 `Cargo.lock` to point pliron at 0.17.1 (worked, but `cargo update` could undo it).
 
 **Better way later:** a CubeCL release that depends on pliron 0.20.
+
+**No longer needed** from branch `amd-burn-0.23`: burn 0.23's CubeCL 0.12 uses
+pliron 0.20 ([10](#10-parakeet-rs-pins-burn-022-fork)), so the patch was
+removed (Cargo had been warning that it was unused).
 
 ### 4. cubecl-hip-sys has no bindings for Ubuntu's HIP (fork)
 
@@ -278,6 +289,100 @@ Longer chunks: 15 s of audio decodes in 0.21 s (candle: 22.9 s). The first
 decode at a new length can take from 0.3 s to 34 s while kernels compile and
 matmul autotune runs for the new shapes; both are cached on disk
 (`~/.cache/cubecl`), so a book run pays this only for lengths it hasn't seen.
+
+### 10. parakeet-rs pins burn 0.22 (fork)
+
+F16 matmuls only launch on RDNA2 from burn 0.23 (CubeCL 0.12, cubek 0.4):
+on 0.22 the F16 `Auto` matmul fails to launch, and on 0.23.0-pre.2 it runs and
+is 10 to 15% faster than F32 ([profile](#where-the-gpu-time-goes-rocprofv3)).
+parakeet-rs 0.4.4 depends on `burn = "0.22"`, and the checker and OmniVoice
+must share one burn: two would mean two copies of CubeCL and its runtimes in
+one binary.
+
+**Done:** [tommymcc/parakeet-rs](https://github.com/tommymcc/parakeet-rs),
+branch `burn-0.23` (33445ef), from tag v0.4.4: `burn` and `burn-store` at
+`=0.23.0-pre.2`, and its generated model code (`src/burn_backend/generated`)
+adapted to 0.23's `attention` signature, which gained a KV-cache argument and
+`AttentionModuleOptions` fields (a script added `None` and
+`..Default::default()` to the 320 calls). Patched in `Cargo.toml` with
+`[patch.crates-io]`, as the fork keeps version 0.4.4. any-tts moved to burn
+0.23 on its branch `rocm-burn-0.23` the same way. The cubecl-hip-sys fork
+([4](#4-cubecl-hip-sys-has-no-bindings-for-ubuntus-hip-fork)) works unchanged
+with CubeCL 0.12.
+
+The checker's output is unchanged: `sections` on the 120 s LibriVox clip gives
+the same transcripts as on 0.22.
+
+**Why a pre-release:** 0.23.0-pre.2 is what has the F16 fix; `=` pins it so a
+later pre-release can't arrive unannounced. **Better way later:** burn 0.23
+final, and a parakeet-rs release on it.
+
+### 11. burn tuned kernels again for nearly every chunk
+
+The F16 chapter ran at about 58 s per 20 s chunk, though one 21 s chunk took
+about 21 s once its kernels were tuned. burn autotunes each operation per
+shape and keeps the results in `~/.cache/cubecl/default.db` (an SQLite table
+keyed by operation and sizes). Several of OmniVoice's shapes depend on a
+chunk's exact length (the sequence, the number of keys, the output window,
+the decoder's frames), and chunks are all different lengths, so nearly every
+chunk paid for tuning.
+
+**Done** (any-tts `9a85c8c`):
+
+- **Passes padded to a multiple of 16 rows.** Padded positions get the
+  codebooks' first embedding row; padded keys repeat the last real key, with
+  V zero there, so they can't change a softmax; padded query rows are thrown
+  away. Each pass's output window (the target audio) is also padded, so the
+  audio head and token picking see few shapes too.
+- **Decoder input padded to a multiple of 32 frames,** with the padding zeroed
+  before every convolution and transposed convolution. That is what the
+  convolutions' own zero padding gives the unpadded input, so the output is
+  the same to 3e-6 against candle over the whole waveform. A first version
+  repeated the last frame instead and changed the last 0.5 s of every chunk
+  (by up to 0.63).
+- **The two passes as one stack of rows,** the conditional pass's rows then
+  the unconditional's, apart only in attention (each segment attends within
+  itself, causally or not). The projections then read each weight once per
+  step instead of twice, and the 521-row unconditional pass no longer runs
+  its own badly occupied matmuls.
+- **q, k and v merged into one weight, and gate and up into another,** so
+  each layer runs 4 projection matmuls instead of 7.
+
+F32 tokens for the test chunk are identical to before (4170 of 4170 with
+`OMNIVOICE_SEED=7`). Bucket size, F32, per step for the 21 s chunk:
+
+| Rows padded to a multiple of | Per step |
+|---|---|
+| (no padding) | 0.699 s |
+| **16** | **0.701 s** |
+| 32 | 0.751 s |
+| 64 | 0.753 s |
+| 128 | 0.830 s |
+
+Before stacking and merging the step took 0.719 s, so those two together
+gained about 3%, much less than hoped: matmul speed here depends more on how
+a shape falls on the tiles than on reading weights once. 64 rows of padding
+added 11% to the rows and lost more than stacking gained.
+
+Measured on the chapter: 94 minutes to 44 ([`book`](#book-one-chapter-metamorphosis-chapter-i)).
+
+### 12. Unexplained: one garbled F16 chunk, and one machine freeze
+
+- **A garbled chunk.** Once, the first F16 run of the new shapes produced
+  0.4 s of audio: the first step tuned kernels (25 s) and every step after it
+  gave wrong tokens. The next run, with the kernels tuned, was right. Three
+  runs from an empty cache (`XDG_CACHE_HOME` pointed at a new directory), with
+  both the new and the previous build, all said the right words, so it hasn't
+  been reproduced. A guess: a candidate kernel tried during tuning wrote out
+  of bounds. In `book` the checker would catch such a take and retry it.
+- **A machine freeze.** The machine hung, with nothing in the kernel log,
+  30 to 60 s into an F16 chapter run, and stayed hung until reset. It was
+  still loading or preparing the voice on the CPU, as far as the logs show.
+  The same evening LLVM segfaulted during an LTO build, and the boot of
+  20 October also ended without a shutdown, before any of this work, so the
+  hardware is as likely a cause as the GPU code. After the reset, F32 and
+  F16 test chunks and the whole chapter ran without a problem. Long runs now
+  `sync` every 2 s so that another freeze leaves its logs.
 
 ## Why burn, and the alternatives considered
 
@@ -509,6 +614,40 @@ wrong by several times; the Vulkan figures were measured the same way and
 haven't been re-measured. The candle CPU figures (87 s per pass at 1024 tokens)
 are unaffected.
 
+### burn 0.23, F16, and fixed shapes
+
+Same 21 s chunk, `speak`, `OMNIVOICE_SEED=7`, kernels tuned (second run):
+
+| Build | Generate tokens | Tokens vs. the row above |
+|---|---|---|
+| any-tts `61b1caf` (burn 0.22, embeddings on the GPU) | 31.7 s | |
+| `672546b`: burn 0.23.0-pre.2, F32 | 23.0 s | identical |
+| `672546b`, `OMNIVOICE_BURN_F16=1` | 18.8 s | 1631 of 4168 differ |
+| `9a85c8c`: fixed shapes, stacked passes, merged weights, F32 | 22.4 s | identical to F32 above |
+| `9a85c8c`, F16 | **18.65 s** | differ (F16 rounding varies with the tuned kernels) |
+
+Decode is 0.25 s either way. burn 0.23 alone took a quarter off F32 (cubek
+0.4's matmuls), F16 about another fifth. F16's differing tokens still say the
+words: three F16 runs from an empty kernel cache, with 1548 to 3849 tokens
+different, all transcribed to the sentence.
+
+Whole chapter, *Metamorphosis* chapter I as [above](#book-one-chapter-metamorphosis-chapter-i):
+
+| | F32, burn 0.22 (`f59fd94`) | F16, exact shapes (`672546b`) | **F16, fixed shapes (`9a85c8c`)** |
+|---|---|---|---|
+| Wall clock for 37.3 min of audio | 87.4 min (0.43× real time) | 94.6 min (0.39×) | **44.5 min (0.84×)** |
+| First takes | 110 of 110 | 110 of 110 | 110 of 110 |
+| Recall | mean 0.995, lowest 0.94 | lowest 0.94 | mean 0.995, lowest 0.94 |
+| VRAM, steady / peak | 7.26 / 8.10 GB | 5.8 / 7.44 GB | 5.8 / 6.97 GB |
+| RAM, peak RSS | 3.7 GB | 4.2 GB | 3.6 GB |
+
+The exact-shape F16 run was slower than F32 despite faster steps because it
+tuned again for nearly every chunk ([11](#11-burn-tuned-kernels-again-for-nearly-every-chunk)).
+With fixed shapes, tuning stops early: chunks 60 to 110 took 17 minutes, about
+20 s each, for a mean of 20.5 s of audio, so a warm cache runs at about real
+time. That run is any-tts at the commit shown with audio-berry branch
+`amd-burn-0.23`.
+
 ### Checker (`sections`, 120 s LibriVox clip)
 
 | Backend | Hearing 120 s | Transcribing 5 stretches |
@@ -528,23 +667,25 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
   would move it to the GPU.
 - **burn's matmul reaches 2 to 3 TFLOP/s at 484 tokens and about 1 at 84**,
   against 7.9 for hipBLAS ([profile](#where-the-gpu-time-goes-rocprofv3)).
-  Ideas not yet tried: run the conditional and unconditional passes' projections
-  as one matmul (M = 568), since only attention needs them apart, which removes
-  the badly occupied M = 84 matmuls. F16 doesn't help on burn 0.22 but gains
-  10 to 15% on 0.23's pre-release ([profile](#where-the-gpu-time-goes-rocprofv3)).
-- **Embeddings are built on the CPU every step**, 10% of a chunk
-  ([per chunk](#per-chunk-after-the-attention-and-sampling-changes)).
-- **VRAM headroom is about 0.5 GB** with both models loaded and 28 s chunks
-  ([`book`](#book-one-chapter-metamorphosis-chapter-i)); longer chunks or a
-  larger voice sample could run out on an 8 GB card.
+  Stacking the passes and merging weights gained only 3%
+  ([11](#11-burn-tuned-kernels-again-for-nearly-every-chunk)); the matmuls
+  themselves are still the limit. A step is now 0.58 s (F16) for a 21 s chunk.
+- **F16 hasn't been checked for likeness to the voice**, only for words.
+  `audition` pairs of F32 and F16 takes would show whether it matters.
+- **burn 0.23 is a pre-release** (`0.23.0-pre.2`), pinned exactly in both forks.
+- **The two unexplained events** ([12](#12-unexplained-one-garbled-f16-chunk-and-one-machine-freeze))
+  haven't recurred.
+- **VRAM:** with F16, 6.97 GB at peak of 8.57 with both models loaded and
+  chunks up to 26 s. F32 left about 0.5 GB.
 - None of the forks has been offered upstream.
 
 ## Where things are
 
 | What | Where |
 |---|---|
-| audio-berry changes | branch `amd-burn-checker` |
-| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (61b1caf), pinned in `Cargo.toml` |
+| audio-berry changes | branch `amd-burn-checker` (burn 0.22); branch `amd-burn-0.23` (burn 0.23, F16, fixed shapes) |
+| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (61b1caf, burn 0.22); branch `rocm-burn-0.23` (9a85c8c), pinned in `Cargo.toml` on `amd-burn-0.23` |
+| parakeet-rs on burn 0.23 | `tommymcc/parakeet-rs`, branch `burn-0.23` (33445ef); clone in `~/workspace/forks/parakeet-rs` (its `origin` is upstream; the fork is the remote `fork`) |
 | Matmul benchmark and blueprint sweep (f32 and f16) | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`); against the next cubek: `omnivoice-burn-spike/matmul-next` |
 | Spike, feasibility test, bindgen tool | `~/workspace/omnivoice-burn-spike` (local git repo) |
 | Fork clones | `~/workspace/forks/{gemm,pliron,cubecl-hip}` |

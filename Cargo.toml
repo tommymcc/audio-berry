@@ -16,9 +16,9 @@ vulkan = ["parakeet-rs/vulkan"]
 rocm = ["any-tts/rocm", "parakeet-rs/burn-rocm"]
 
 [dependencies]
-# The fork's rocm-burn branch: the integration branch, which has native OmniVoice
-# voice cloning, plus the `rocm` feature.
-any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "61b1caf1f3648f4a9ba0ee19279602998a09f9ac", default-features = false, features = ["omnivoice", "download"] }
+# The fork's rocm-burn-0.23 branch: the integration branch, which has native
+# OmniVoice voice cloning, plus the `rocm` feature on burn 0.23.
+any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "9a85c8cc609e4cd86dd9fef03973717dcbabe566", default-features = false, features = ["omnivoice", "download"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
 # Noise cleaning for voice samples: DeepFilterNet 3, built in, run on the CPU with tract.
@@ -49,9 +49,11 @@ libc = "0.2"
 # and panics, as they need AVX2 too. candle and burn's CPU backend both use it.
 gemm-common = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1b4d34e89eee4504b61f605" }
 gemm-f16 = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1b4d34e89eee4504b61f605" }
-# pliron 0.19 (under burn's cubecl, for `vulkan`) asks for any hashbrown 0.x, gets
-# 0.11, and fails to build. 0.20 fixed it, but cubecl 0.11 needs 0.19.
-pliron = { git = "https://github.com/tommymcc/pliron", rev = "ac2cc0c820907013df7d955be7da370a7b8b2c2f" }
 # cubecl-hip-sys (under burn's ROCm backend, for `rocm`) has no bindings for
 # Ubuntu 26.04's own HIP, 7.1.52801, so it builds with none and cubecl-hip fails.
 cubecl-hip-sys = { git = "https://github.com/tommymcc/cubecl-hip-sys", rev = "26e8dea1b9ae2a362f28ed2aadf67f25d2022acb" }
+# parakeet-rs 0.4.4 pins burn 0.22; any-tts's `rocm` needs burn 0.23 (its F16
+# matmuls work on RDNA2), and two burns in one build would mean two copies of
+# CubeCL and its GPU runtimes. The fork's burn-0.23 branch only moves to burn
+# 0.23.0-pre.2 and adapts its generated code to the new attention signature.
+parakeet-rs = { git = "https://github.com/tommymcc/parakeet-rs", rev = "33445ef785f6287050f783296f532cd93d448289" }
