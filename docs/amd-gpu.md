@@ -21,7 +21,7 @@ when upstream changes.
 | default (`cuda`) | NVIDIA only | ONNX Runtime, CUDA |
 | `--no-default-features` | CPU, candle | ONNX Runtime, CPU: **crashes on CPUs without AVX2** ([1](#1-onnx-runtime-needs-avx2)) |
 | `--no-default-features --features vulkan` | CPU, candle | burn on Vulkan (any GPU) |
-| `--no-default-features --features rocm` | transformer backbone and audio decoder on the GPU with burn ROCm (F32, or F16 projection weights with `OMNIVOICE_BURN_F16=1`); voice preparation, text embeddings (once per chunk) and sampling with a temperature on the CPU with candle | burn on ROCm |
+| `--no-default-features --features rocm` | transformer backbone and audio decoder on the GPU with burn ROCm (F32, or F16 projection weights with `OMNIVOICE_BURN_F16=1`), the backbone's matmuls through hipBLAS where it's installed ([13](#13-burns-matmul-is-slow-on-rdna2-so-omnivoices-matmuls-use-hipblas-fork)); voice preparation, text embeddings (once per chunk) and sampling with a temperature on the CPU with candle | burn on ROCm |
 
 The `cuda` and `metal` builds don't use burn or CubeCL at all (`cargo tree`
 shows neither), so nothing here changes them; they haven't been built on this
@@ -41,8 +41,18 @@ What another user on Ubuntu 26.04 with an AMD GPU would do.
    ```sh
    cargo build --release --no-default-features --features rocm
    ```
-4. **Run** as usual. `Model loaded in … on rocm:0` says the backbone is on the
-   GPU. No environment variables are needed. `OMNIVOICE_BURN_F16=1` stores the
+4. **hipBLAS, optional.** With hipBLAS and rocBLAS installed, OmniVoice's
+   matmuls run through them, about a third faster per step
+   ([13](#13-burns-matmul-is-slow-on-rdna2-so-omnivoices-matmuls-use-hipblas-fork)).
+   This machine uses AMD's ROCm 7.1.1 libraries in `/opt/rocm`, which are on
+   the linker's search path (`/etc/ld.so.conf.d`); Ubuntu's `libhipblas3`
+   and `librocblas5` should also do, but haven't been tried. Without them,
+   burn's own matmul runs, as before.
+5. **Run** as usual. `Model loaded in … on rocm:0` says the backbone is on the
+   GPU. No environment variables are needed: on an RX 6600 and other
+   gfx1031 to gfx1036 cards, the commands that run OmniVoice set
+   `HSA_OVERRIDE_GFX_VERSION=10.3.0` themselves and say so
+   ([5](#5-hsa_override_gfx_version-dropped-then-set-automatically-for-hipblas)). `OMNIVOICE_BURN_F16=1` stores the
    backbone's projection weights in F16, which is about 19% faster per step and
    took steady VRAM on a chapter from 7.26 to 5.8 GB, at the cost of tokens no
    longer matching F32 exactly ([measurements](#burn-023-f16-and-fixed-shapes)).
@@ -148,7 +158,7 @@ users.
 **Better way later:** upstream adding 52801, or falling back to the nearest
 bindings within a minor version.
 
-### 5. `HSA_OVERRIDE_GFX_VERSION` isn't needed (tried and removed)
+### 5. `HSA_OVERRIDE_GFX_VERSION`: dropped, then set automatically for hipBLAS
 
 ROCm's BLAS libraries ship kernels for gfx1030 but not gfx1032, so tools that use
 them on an RX 6600 need `HSA_OVERRIDE_GFX_VERSION=10.3.0` (this machine's Ollama
@@ -161,6 +171,40 @@ with and without the override, so it was dropped rather than kept as an
 unexplained environment change. It's still needed for the
 [feasibility test](#why-burn-and-the-alternatives-considered) programs, which use
 hipBLAS.
+
+**Set again, automatically, since OmniVoice's matmuls use hipBLAS**
+([13](#13-burns-matmul-is-slow-on-rdna2-so-omnivoices-matmuls-use-hipblas-fork)).
+Without it rocBLAS stops the program: `Cannot read …/TensileLibrary.dat … for
+GPU arch : gfx1032`. Neither AMD's rocBLAS 7.1.1 nor Ubuntu's 7.1.0
+(`librocblas5`, checked by listing the package) has gfx1032 kernels; both
+have gfx1030's. gfx1031 to gfx1036 share gfx1030's instruction set (they
+differ in size), so the override runs gfx1030's kernels on them; it's what
+Ollama and most RX 6600 users do. Building rocBLAS for gfx1032 would give the
+same kernels for hours of build, again on every ROCm update.
+
+`any_tts::hipblas::apply_gfx_override`, called from `main`, sets it only when
+all of these hold, and prints a line when it does
+(`GPU gfx1032: using gfx1030's rocBLAS kernels (HSA_OVERRIDE_GFX_VERSION=10.3.0)`):
+
+- the build has `rocm`, and the command runs OmniVoice (`speak`, `book`,
+  `retake`, `audition`); not `sections`, `clean`, `play` or `--help`;
+- every GPU's `gfx_target_version` in
+  `/sys/class/kfd/kfd/topology/nodes/*/properties` is 100301 to 100306
+  (gfx1031 to gfx1036). It's read from there because HIP reads the variable
+  once, when it starts, so the decision has to come before anything touches
+  HIP;
+- the variable isn't already set (a user's value wins), and `ANY_TTS_HIPBLAS`
+  isn't `0`;
+- hipBLAS loads. The variable is set just before loading it, because
+  `hipblasCreate` starts HIP, and taken back if loading fails (no HIP call has
+  been made then).
+
+It changes the GPU HIP reports to burn as well, so burn compiles and tunes its
+own kernels for gfx1030 once more, into its cache: the first run after the
+change was slow (decode 56 s, the checker 80 s), later ones not. A first
+version checked for hipBLAS before setting the variable; loading it started
+HIP, rocBLAS still saw gfx1032, and the run aborted. If AMD adds gfx1032 to
+rocBLAS, the range check is the line to remove.
 
 ### 6. Smaller things
 
@@ -383,6 +427,66 @@ Measured on the chapter: 94 minutes to 44 ([`book`](#book-one-chapter-metamorpho
   hardware is as likely a cause as the GPU code. After the reset, F32 and
   F16 test chunks and the whole chapter ran without a problem. Long runs now
   `sync` every 2 s so that another freeze leaves its logs.
+
+### 13. burn's matmul is slow on RDNA2, so OmniVoice's matmuls use hipBLAS (fork)
+
+[Profiled](#where-the-gpu-time-goes-rocprofv3) after fixed shapes, a 21 s
+chunk's step (0.58 s, F16) was 58% projections, at about 3.8 TFLOP/s in
+cubek's register-tiled kernel, and 20% attention matmuls (F32). hipBLAS at the
+same shapes (`omnivoice-burn-spike/feasibility/hipblas-shapes`):
+
+| Per layer | burn | hipBLAS F32 | hipBLAS F16 |
+|---|---|---|---|
+| Projections (q/k/v, o, gate/up, down; 1504 rows) | 12.2 ms (F16) | 7.0 ms | 4.9 ms |
+| Attention matmuls (16 heads, 992 and 528 tokens) | 4.3 ms (F32) | 2.5 ms | 1.3 ms |
+
+Writing a faster kernel in burn was ruled out: the blueprint sweep found at
+most 20%, and F16 accumulation gave no speedup, so CubeCL's code may not be
+using RDNA2's packed F16 instructions at all. Calling hipBLAS from inside burn
+(a fork of burn) would speed up the checker too, but means carrying a fork of
+a fast-moving pre-release.
+
+**Done** (any-tts `627e9da`, `src/hipblas.rs`):
+
+- **A burn backend extension, `BlasMatmul`.** burn 0.23's
+  `#[backend_extension(Cube, Fusion)]` adds an operation that takes its place
+  in burn's lazily fused queue. Its `CubeBackend` implementation gets each
+  buffer's device address from CubeCL (`client.get_resource::<HipServer>`),
+  allocates the output, and calls `hipblasGemmStridedBatchedEx` (F32, or F16
+  in and out with F32 accumulation). A row-major (…, m, k) · (…, k, n) is
+  computed as the column-major Cᵀ = Bᵀ Aᵀ; each operand is taken row- or
+  column-major as it lies (the weights are transposed views), and batch
+  dimensions collapse to one stride or broadcast. Anything else (another
+  dtype, a layout that doesn't fit, another runtime) falls back to burn's
+  `float_matmul`, as does the whole thing with `ANY_TTS_HIPBLAS=0` or no
+  hipBLAS. The backbone's projections, attention matmuls and audio head go
+  through `hipblas::matmul`.
+- **hipBLAS loaded at run time** with `libloading`, as CubeCL loads HIP, so
+  it isn't a build dependency. It loads `libamdhip64.so` by the same name
+  CubeCL does, so both share one HIP runtime (here `/opt/rocm`'s 7.1.1, which
+  is first on the search path).
+- **burn's own HIP stream (fork of cubecl-hip).** The first version ran
+  hipBLAS on HIP's default stream, with burn's queue synchronised before each
+  call and the device after it: 0.507 s per step, only 13% faster, because
+  the GPU sat idle for about 6 of 17.6 s of generation while the CPU caught
+  up at every one of about 170 barriers a step. CubeCL keeps its stream
+  private (`Stream::sys` is `pub(crate)`), so a fork of cubecl-hip
+  0.12.0-pre.2 hands it out: `GpuResource` gains a `stream` field, which
+  `HipServer::get_resource` fills with the stream it has just ordered the
+  buffer on (16 lines; `~/workspace/forks/cubecl-hip-0.12`, a git repo
+  started from the crates.io source). hipBLAS is then set to that stream and
+  runs in order with burn's kernels, with no waiting. A freed buffer that
+  burn reuses is only used by later work on the same stream, so it can't
+  overwrite one hipBLAS hasn't read.
+- **burn's `fusion` and `extension` features** are now on in any-tts's
+  `rocm` (fusion was on already through parakeet-rs). Building any-tts alone
+  then needed tokio 1.53 or later (burn-remote, pulled in by the lock).
+
+Tested against burn's matmul (`hipblas::tests`, with a count of calls that
+actually went through hipBLAS): projections, batched attention, F16, and a
+sliced batch that falls back. The test chunk's words were right.
+
+Measured: see [hipBLAS](#hipblas).
 
 ## Why burn, and the alternatives considered
 
@@ -648,6 +752,39 @@ With fixed shapes, tuning stops early: chunks 60 to 110 took 17 minutes, about
 time. That run is any-tts at the commit shown with audio-berry branch
 `amd-burn-0.23`.
 
+### hipBLAS
+
+Same 21 s chunk, `speak`, F16 (`OMNIVOICE_BURN_F16=1`), `OMNIVOICE_SEED=7`,
+kernels tuned (second run of each build):
+
+| Build | Per step | Generate tokens | GPU busy during generation |
+|---|---|---|---|
+| any-tts `9a85c8c` (burn's matmul) | 0.58 s | 18.7 s | nearly all of it |
+| hipBLAS on the default stream, barriers around each call | 0.507 s | 17.0 s | about two thirds (11.8 of 17.6 s, under `rocprofv3`) |
+| **any-tts `627e9da`, hipBLAS on burn's stream** | **0.381 s** | **13.1 s** | |
+
+Per layer under `rocprofv3` with barriers, hipBLAS's projections took 5.3 ms
+(burn's 12.2) and attention's F32 matmuls 3.3 ms (burn's 4.3). The checker
+heard the take's words right.
+
+Whole chapter, *Metamorphosis* chapter I, as [above](#book-one-chapter-metamorphosis-chapter-i),
+audio-berry `7007d48`:
+
+| | F16, burn's matmul (`9a85c8c`) | **F16, hipBLAS (`627e9da`)** |
+|---|---|---|
+| Wall clock | 44.5 min (0.84× real time) | **36.8 min (1.02×)** |
+| Chunks 60 to 110 | 17 min | 13 min (about 15.6 s per chunk for 20.5 s of audio: 1.3× real time once warm) |
+| First takes | 110 of 110 | 110 of 110 |
+| Recall | mean 0.995, lowest 0.94 | mean 0.995, lowest 0.94; extra words at most 0.05 |
+| VRAM, steady / peak | 5.8 / 6.97 GB | 6.09 / 7.67 GB (of 8.57) |
+| RAM, peak RSS | 3.6 GB | 3.7 GB |
+
+This run also paid for burn tuning its kernels again for gfx1030 (the
+override changes the GPU burn sees, [5](#5-hsa_override_gfx_version-dropped-then-set-automatically-for-hipblas)),
+mostly in the first 20 chunks (12 minutes), so a later run should be quicker
+than 36.8 minutes. hipBLAS and rocBLAS take about 0.3 GB more VRAM at steady
+state and 0.7 GB more at peak, leaving about 0.9 GB.
+
 ### Checker (`sections`, 120 s LibriVox clip)
 
 | Backend | Hearing 120 s | Transcribing 5 stretches |
@@ -665,11 +802,11 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
   35 s per voice (once per `book` run). Porting OmniVoice's audio encoder to
   burn, as the decoder was ([9](#9-burns-convolutions-are-slow-on-rdna2-so-the-audio-decoder-doesnt-use-them)),
   would move it to the GPU.
-- **burn's matmul reaches 2 to 3 TFLOP/s at 484 tokens and about 1 at 84**,
-  against 7.9 for hipBLAS ([profile](#where-the-gpu-time-goes-rocprofv3)).
-  Stacking the passes and merging weights gained only 3%
-  ([11](#11-burn-tuned-kernels-again-for-nearly-every-chunk)); the matmuls
-  themselves are still the limit. A step is now 0.58 s (F16) for a 21 s chunk.
+- **The matmuls now run through hipBLAS** ([13](#13-burns-matmul-is-slow-on-rdna2-so-omnivoices-matmuls-use-hipblas-fork)):
+  a step is 0.38 s (F16) for a 21 s chunk, from 0.58. Attention's matmuls
+  are still F32; hipBLAS runs them about twice as fast in F16 (F16 inputs
+  with F32 scores would keep the softmax precise). The cubecl-hip fork is
+  local only so far.
 - **F16 hasn't been checked for likeness to the voice**, only for words.
   `audition` pairs of F32 and F16 takes would show whether it matters.
 - **burn 0.23 is a pre-release** (`0.23.0-pre.2`), pinned exactly in both forks.
@@ -683,8 +820,10 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 
 | What | Where |
 |---|---|
-| audio-berry changes | branch `amd-burn-checker` (burn 0.22); branch `amd-burn-0.23` (burn 0.23, F16, fixed shapes) |
-| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (61b1caf, burn 0.22); branch `rocm-burn-0.23` (9a85c8c), pinned in `Cargo.toml` on `amd-burn-0.23` |
+| audio-berry changes | branch `amd-burn-checker` (burn 0.22); branch `amd-burn-0.23` (burn 0.23, F16, fixed shapes); branch `amd-hipblas` (hipBLAS; any-tts and cubecl-hip as path dependencies, local only) |
+| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (61b1caf, burn 0.22); branch `rocm-burn-0.23` (9a85c8c), pinned in `Cargo.toml` on `amd-burn-0.23`; branch `rocm-hipblas` (627e9da, local only) |
+| cubecl-hip handing out its stream | `~/workspace/forks/cubecl-hip-0.12` (local git repo from the crates.io source of 0.12.0-pre.2, not yet on GitHub) |
+| hipBLAS benchmarks at OmniVoice's shapes | `omnivoice-burn-spike/feasibility/hipblas-shapes` |
 | parakeet-rs on burn 0.23 | `tommymcc/parakeet-rs`, branch `burn-0.23` (33445ef); clone in `~/workspace/forks/parakeet-rs` (its `origin` is upstream; the fork is the remote `fork`) |
 | Matmul benchmark and blueprint sweep (f32 and f16) | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`); against the next cubek: `omnivoice-burn-spike/matmul-next` |
 | Spike, feasibility test, bindgen tool | `~/workspace/omnivoice-burn-spike` (local git repo) |
