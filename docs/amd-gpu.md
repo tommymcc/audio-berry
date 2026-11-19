@@ -492,6 +492,23 @@ sliced batch that falls back. The test chunk's words were right.
 
 Measured: see [hipBLAS](#hipblas).
 
+**Tried and dropped: attention's matmuls in F16.** hipBLAS runs them about
+twice as fast in F16 as in F32 at these shapes, so with `OMNIVOICE_BURN_F16`
+Q, K, P and V were cast to F16 for the two matmuls:
+
+| Attention matmuls | Per step (21 s chunk) |
+|---|---|
+| F32 (kept) | 0.381 s |
+| F16 inputs, F32 output (`hipblasGemmEx` with an F32 C) | 0.449 s |
+| F16 inputs and output, cast back to F32 before the softmax | 0.37 s |
+
+rocBLAS's kernels for F16 inputs with F32 output (`HSS`) are poorly tuned
+for gfx1030: the 992-token scores matmul took 2.67 ms against 1.59 in F32.
+Its F16-only kernels (`HHS`, which the projections use) are fast, but the
+casts to and from F16 over the (heads × tokens × tokens) scores took most of
+what they saved, for 3% and scores rounded to F16. Not worth the precision.
+
+
 ## Why burn, and the alternatives considered
 
 The question was how to run OmniVoice, written for candle, on an AMD GPU in a way
@@ -808,8 +825,9 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
   would move it to the GPU.
 - **The matmuls now run through hipBLAS** ([13](#13-burns-matmul-is-slow-on-rdna2-so-omnivoices-matmuls-use-hipblas-fork)):
   a step is 0.38 s (F16) for a 21 s chunk, from 0.58. Attention's matmuls
-  are still F32; hipBLAS runs them about twice as fast in F16 (F16 inputs
-  with F32 scores would keep the softmax precise). The cubecl-hip fork is a
+  stay F32: F16 gained 3% at best ([13](#13-burns-matmul-is-slow-on-rdna2-so-omnivoices-matmuls-use-hipblas-fork)).
+  What's left per step is mostly the projections in hipBLAS, attention, and
+  burn's smaller kernels (norms, softmax, RoPE, copies, casts). The cubecl-hip fork is a
   fifth fork to carry to each burn release.
 - **F16 hasn't been checked for likeness to the voice**, only for words.
   `audition` pairs of F32 and F16 takes would show whether it matters.
