@@ -204,14 +204,15 @@ dependencies = [
 [[package]]
 name = "any-tts"
 version = "0.2.0"
-source = "git+https://github.com/tommymcc/any-tts?rev=9a85c8cc609e4cd86dd9fef03973717dcbabe566#9a85c8cc609e4cd86dd9fef03973717dcbabe566"
 dependencies = [
  "base64 0.22.1",
  "burn",
  "burn-core",
+ "burn-cubecl",
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "libloading 0.8.9",
  "nanomp3",
  "reqwest",
  "rustc-hash 1.1.0",
@@ -2239,8 +2240,6 @@ dependencies = [
 [[package]]
 name = "cubecl-hip"
 version = "0.12.0-pre.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41130f9db4663cf86bb2bd909672bb2f9e0dde2ab77387609a1282a300a265ef"
 dependencies = [
  "bytemuck",
  "cubecl-common",

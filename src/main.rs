@@ -341,6 +341,16 @@ fn main() -> Result<()> {
     stop_quietly_when_output_closes();
     install_error_reports()?;
     let command = Cli::parse().command;
+    // Only for the commands that run OmniVoice, whose matmuls use hipBLAS, and
+    // before anything touches the GPU or starts a thread: HIP reads it once,
+    // when it starts. See docs/amd-gpu.md.
+    #[cfg(feature = "rocm")]
+    if command.model_args().is_some() {
+        // SAFETY: no other thread has started yet.
+        if let Some(note) = unsafe { any_tts::hipblas::apply_gfx_override() } {
+            eprintln!("{note}");
+        }
+    }
     // Before loading anything, which can take a while.
     if let Some(missing) = command.input_files().into_iter().find(|file| !file.is_file()) {
         bail!("no such file: {}", missing.display());
