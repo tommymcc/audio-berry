@@ -18,7 +18,7 @@ rocm = ["any-tts/rocm", "parakeet-rs/burn-rocm"]
 [dependencies]
 # The fork's rocm-burn-0.23 branch: the integration branch, which has native
 # OmniVoice voice cloning, plus the `rocm` feature on burn 0.23.
-any-tts = { path = "../any-tts", default-features = false, features = ["omnivoice", "download"] }
+any-tts = { git = "https://github.com/tommymcc/any-tts", rev = "14ecf780f1f125d29421375f441d33b6fd7e7733", default-features = false, features = ["omnivoice", "download"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 color-eyre = { version = "0.6.5", default-features = false, features = ["track-caller"] }
 # Noise cleaning for voice samples: DeepFilterNet 3, built in, run on the CPU with tract.
@@ -52,7 +52,9 @@ gemm-f16 = { git = "https://github.com/tommymcc/gemm", rev = "dbdcb05011089a25f1
 # cubecl-hip-sys (under burn's ROCm backend, for `rocm`) has no bindings for
 # Ubuntu 26.04's own HIP, 7.1.52801, so it builds with none and cubecl-hip fails.
 cubecl-hip-sys = { git = "https://github.com/tommymcc/cubecl-hip-sys", rev = "26e8dea1b9ae2a362f28ed2aadf67f25d2022acb" }
-cubecl-hip = { path = "../forks/cubecl-hip-0.12" }
+# cubecl-hip hands out the HIP stream a buffer is on, so any-tts can queue
+# hipBLAS on it in order with burn (docs/amd-gpu.md, 13).
+cubecl-hip = { git = "https://github.com/tommymcc/cubecl", rev = "a940e2272f3ca545c421f46ba17388fb64fed297" }
 # parakeet-rs 0.4.4 pins burn 0.22; any-tts's `rocm` needs burn 0.23 (its F16
 # matmuls work on RDNA2), and two burns in one build would mean two copies of
 # CubeCL and its GPU runtimes. The fork's burn-0.23 branch only moves to burn

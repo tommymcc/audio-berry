@@ -446,7 +446,7 @@ using RDNA2's packed F16 instructions at all. Calling hipBLAS from inside burn
 (a fork of burn) would speed up the checker too, but means carrying a fork of
 a fast-moving pre-release.
 
-**Done** (any-tts `627e9da`, `src/hipblas.rs`):
+**Done** (any-tts `627e9da` and `14ecf78`, `src/hipblas.rs`):
 
 - **A burn backend extension, `BlasMatmul`.** burn 0.23's
   `#[backend_extension(Cube, Fusion)]` adds an operation that takes its place
@@ -473,8 +473,12 @@ a fast-moving pre-release.
   private (`Stream::sys` is `pub(crate)`), so a fork of cubecl-hip
   0.12.0-pre.2 hands it out: `GpuResource` gains a `stream` field, which
   `HipServer::get_resource` fills with the stream it has just ordered the
-  buffer on (16 lines; `~/workspace/forks/cubecl-hip-0.12`, a git repo
-  started from the crates.io source). hipBLAS is then set to that stream and
+  buffer on (16 lines; `tommymcc/cubecl`, branch `hip-stream`, from tag
+  `v0.12.0-pre.2`, whose `cubecl-hip` source matched the crates.io release
+  exactly). A second commit there makes cubecl-hip take the other cubecl
+  crates from crates.io at `=0.12.0-pre.2` instead of by path, so patching
+  cubecl-hip alone from git doesn't pull a second copy of all of cubecl.
+  hipBLAS is then set to that stream and
   runs in order with burn's kernels, with no waiting. A freed buffer that
   burn reuses is only used by later work on the same stream, so it can't
   overwrite one hipBLAS hasn't read.
@@ -805,8 +809,8 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 - **The matmuls now run through hipBLAS** ([13](#13-burns-matmul-is-slow-on-rdna2-so-omnivoices-matmuls-use-hipblas-fork)):
   a step is 0.38 s (F16) for a 21 s chunk, from 0.58. Attention's matmuls
   are still F32; hipBLAS runs them about twice as fast in F16 (F16 inputs
-  with F32 scores would keep the softmax precise). The cubecl-hip fork is
-  local only so far.
+  with F32 scores would keep the softmax precise). The cubecl-hip fork is a
+  fifth fork to carry to each burn release.
 - **F16 hasn't been checked for likeness to the voice**, only for words.
   `audition` pairs of F32 and F16 takes would show whether it matters.
 - **burn 0.23 is a pre-release** (`0.23.0-pre.2`), pinned exactly in both forks.
@@ -820,9 +824,9 @@ The words of all 5 stretches matched the book on Vulkan and ROCm, identically.
 
 | What | Where |
 |---|---|
-| audio-berry changes | branch `amd-burn-checker` (burn 0.22); branch `amd-burn-0.23` (burn 0.23, F16, fixed shapes); branch `amd-hipblas` (hipBLAS; any-tts and cubecl-hip as path dependencies, local only) |
-| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (61b1caf, burn 0.22); branch `rocm-burn-0.23` (9a85c8c), pinned in `Cargo.toml` on `amd-burn-0.23`; branch `rocm-hipblas` (627e9da, local only) |
-| cubecl-hip handing out its stream | `~/workspace/forks/cubecl-hip-0.12` (local git repo from the crates.io source of 0.12.0-pre.2, not yet on GitHub) |
+| audio-berry changes | branch `amd-burn-checker` (burn 0.22); branch `amd-burn-0.23` (burn 0.23, F16, fixed shapes); branch `amd-hipblas` (hipBLAS) |
+| any-tts `rocm` feature | `tommymcc/any-tts`, branch `rocm-burn` (61b1caf, burn 0.22); branch `rocm-burn-0.23` (9a85c8c), pinned in `Cargo.toml` on `amd-burn-0.23`; branch `rocm-hipblas` (14ecf78), pinned on `amd-hipblas` |
+| cubecl-hip handing out its stream | `tommymcc/cubecl`, branch `hip-stream` (a940e22); clone in `~/workspace/forks/cubecl` |
 | hipBLAS benchmarks at OmniVoice's shapes | `omnivoice-burn-spike/feasibility/hipblas-shapes` |
 | parakeet-rs on burn 0.23 | `tommymcc/parakeet-rs`, branch `burn-0.23` (33445ef); clone in `~/workspace/forks/parakeet-rs` (its `origin` is upstream; the fork is the remote `fork`) |
 | Matmul benchmark and blueprint sweep (f32 and f16) | `omnivoice-burn-spike/src/bin/matmul_{bench,sweep}.rs` (`--features rocm`); against the next cubek: `omnivoice-burn-spike/matmul-next` |
