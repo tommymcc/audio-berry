@@ -100,10 +100,15 @@ chapters 1 to 13, since chapter 14 is Project Gutenberg's license.
   `--no-default-features --features vulkan`. Speech still runs on the CPU.
 - Or an AMD GPU with ROCm, built with `--no-default-features --features rocm`:
   OmniVoice's transformer and audio decoder and the checker on the GPU, and
-  OmniVoice's voice preparation on the CPU. On an RX 6600 with an FX-8350, `book`
-  narrated a 37-minute chapter at 0.43× real time, every take passing first time,
-  using 7.3 to 8.1 GB of VRAM. See [docs/amd-gpu.md](docs/amd-gpu.md) for setup,
-  measurements, and the forks and patches it needs.
+  OmniVoice's voice preparation on the CPU. With hipBLAS installed, OmniVoice's
+  matrix multiplications run through it. On an RX 6600 with an FX-8350, with
+  F16 weights (`OMNIVOICE_BURN_F16=1`) and hipBLAS, `book` narrated a 37-minute
+  chapter in 36.8 minutes (about 1.3× real time once its kernels were tuned),
+  every take passing first time, using 6.1 to 7.7 GB of VRAM. On an RX 6600 and
+  other gfx1031 to gfx1036 cards, the commands that run OmniVoice set
+  `HSA_OVERRIDE_GFX_VERSION=10.3.0` themselves, as rocBLAS has no kernels for
+  them. See [docs/amd-gpu.md](docs/amd-gpu.md) for setup, measurements, and the
+  forks and patches it needs.
 
 ### Apple Silicon
 
