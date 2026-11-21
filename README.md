@@ -322,7 +322,9 @@ See [Adding a voice](#adding-a-voice).
 ./target/release/audio-berry book voices/me.wav book.epub output/book
 ```
 
-Chapter numbers come from `chapters`. Add them to `book` to narrate only those.
+Chapter numbers come from `chapters`. Add them to `book` to narrate only those,
+as single chapters, ranges or both: `2 5-8 10` narrates chapters 2, 5, 6, 7, 8
+and 10.
 The book must be DRM-free, and each spine document becomes one chapter.
 
 Each chapter is narrated in chunks of whole sentences, at most 500 characters

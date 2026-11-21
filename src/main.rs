@@ -31,6 +31,7 @@ use clap::{Parser, Subcommand};
 use color_eyre::config::{HookBuilder, Theme};
 use color_eyre::eyre::{Result, bail};
 use std::io::IsTerminal;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 /// Beyond this, the length checks and the checker haven't been tried.
@@ -79,9 +80,9 @@ enum Command {
         /// The folder holding this book's narration
         #[arg(value_name = "output-dir")]
         output_dir: PathBuf,
-        /// Chapter numbers from `chapters`, such as 2 3 7; all of them if none are given
-        #[arg(value_name = "chapter")]
-        chapters: Vec<usize>,
+        /// Chapter numbers from `chapters`, such as 2 5-8 10; all of them if none are given
+        #[arg(value_name = "chapter", value_parser = parse_chapters)]
+        chapters: Vec<RangeInclusive<usize>>,
         #[command(flatten)]
         speed: Speed,
         #[command(flatten)]
@@ -354,7 +355,7 @@ fn main() -> Result<()> {
         }
         Command::Chapters { book } => book::list_chapters(&book),
         Command::Book { voice_sample, book, output_dir, chapters, speed, takes, model } => {
-            let chapters = (!chapters.is_empty()).then_some(chapters);
+            let chapters = (!chapters.is_empty()).then(|| chapter_numbers(&chapters));
             book::narrate(&voice_sample, &book, &output_dir, chapters, speed.factor, takes.keep(model.noise_limit))
         }
         Command::Retake { voice_sample, book, output_dir, targets, takes, model, .. } => {
@@ -387,6 +388,20 @@ fn parse_speed(value: &str) -> Result<f64, String> {
 
 fn refuse_retake_speed(_: &str) -> Result<String, String> {
     Err("retake uses the speed saved in the output directory".to_string())
+}
+
+fn parse_chapters(value: &str) -> Result<RangeInclusive<usize>, String> {
+    let (first, last) = value.split_once('-').unwrap_or((value, value));
+    let number = |text: &str| text.parse::<usize>().ok().filter(|&number| number > 0);
+    match (number(first), number(last)) {
+        (Some(first), Some(last)) if first <= last => Ok(first..=last),
+        _ => Err("must be a chapter number from 1, such as 3, or a range such as 3-7".to_string()),
+    }
+}
+
+/// Each chapter number named, in the order given.
+fn chapter_numbers(chapters: &[RangeInclusive<usize>]) -> Vec<usize> {
+    chapters.iter().cloned().flatten().collect()
 }
 
 fn parse_count(value: &str) -> Result<usize, String> {
@@ -429,8 +444,32 @@ mod tests {
     fn speed_is_taken_from_any_position() {
         for words in [["book", "--speed", "0.9", "v", "b", "o", "3"], ["book", "v", "b", "o", "3", "--speed", "0.9"]] {
             let Ok(Command::Book { chapters, speed, .. }) = parse(&words) else { panic!("{words:?}") };
-            assert_eq!(chapters, [3]);
+            assert_eq!(chapter_numbers(&chapters), [3]);
             assert_eq!(speed.factor, Some(0.9));
+        }
+    }
+
+    /// The chapter numbers `book` narrates when given `words` after its three paths.
+    fn book_chapters(words: &[&str]) -> Result<Vec<usize>, clap::Error> {
+        let words: Vec<&str> = ["book", "v", "b", "o"].into_iter().chain(words.iter().copied()).collect();
+        let Command::Book { chapters, .. } = parse(&words)? else { panic!("{words:?}") };
+        Ok(chapter_numbers(&chapters))
+    }
+
+    #[test]
+    fn a_range_of_chapters_names_each_chapter_in_it() {
+        assert_eq!(book_chapters(&["5-8"]).unwrap(), [5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn ranges_and_single_chapters_mix() {
+        assert_eq!(book_chapters(&["2", "5-7", "10"]).unwrap(), [2, 5, 6, 7, 10]);
+    }
+
+    #[test]
+    fn a_range_must_run_forwards_from_chapter_1() {
+        for range in ["8-5", "0-3", "3-", "-3", "a-b"] {
+            assert!(book_chapters(&[range]).is_err(), "{range}");
         }
     }
 
